@@ -2608,6 +2608,7 @@ class WatchlistScreen(Screen):
 
         # Get team list for selection
         teams = self.api.get_team_season_stats(self.league.league_key)
+        self._team_names = {t.team_key: t.name for t in teams}
         options = [(t.team_key, t.name) for t in teams]
         self.app.push_screen(
             TeamSelectModal(options),
@@ -2618,10 +2619,11 @@ class WatchlistScreen(Screen):
         if team_key is None or not hasattr(self, "_compare_player"):
             return
         p = self._compare_player
+        team_name = self._team_names.get(team_key, team_key)
         self.app.push_screen(
             ComparisonScreen(
                 self.api, self.league, self.categories,
-                p, team_key, self._sgp_calc,
+                p, team_key, team_name, self._sgp_calc,
             )
         )
 
@@ -2675,6 +2677,7 @@ class ComparisonScreen(Screen):
                  categories: list[StatCategory],
                  watchlist_player: PlayerStats,
                  team_key: str,
+                 team_name: str,
                  sgp_calc: SGPCalculator | None) -> None:
         super().__init__()
         self.api = api
@@ -2682,6 +2685,7 @@ class ComparisonScreen(Screen):
         self.categories = categories
         self._wl_player = watchlist_player
         self._team_key = team_key
+        self._team_name = team_name
         self._sgp_calc = sgp_calc
 
     @property
@@ -2707,7 +2711,8 @@ class ComparisonScreen(Screen):
         sub.append(f"\n Comparing ", style="dim")
         sub.append(f"{self._wl_player.name}", style="bold #E8A735")
         sub.append(f" ({self._wl_player.position})", style="dim")
-        sub.append(f" vs roster\n", style="dim")
+        sub.append(f" vs ", style="dim")
+        sub.append(f"{self._team_name}\n", style="bold")
         self.query_one("#cmp-subheader", Static).update(sub)
         self.run_worker(self._load_comparison)
 
