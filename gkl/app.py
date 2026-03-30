@@ -2684,6 +2684,11 @@ class ComparisonScreen(Screen):
         self._team_key = team_key
         self._sgp_calc = sgp_calc
 
+    @property
+    def _is_batter(self) -> bool:
+        batting = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "OF", "Util", "DH"}
+        return any(p in batting for p in self._wl_player.position.split(","))
+
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("", id="cmp-header")
@@ -2733,6 +2738,28 @@ class ComparisonScreen(Screen):
             if wl_positions & rp_positions:
                 matched.append(rp)
 
+        # Fetch Statcast for all players in comparison
+        try:
+            self.query_one("#cmp-loading-status", Static).update(
+                "Loading Statcast data..."
+            )
+        except Exception:
+            pass
+        all_players = [self._wl_player] + matched
+        batter_sc: dict[str, StatcastBatter] = {}
+        pitcher_sc: dict[str, StatcastPitcher] = {}
+        for p in all_players:
+            mlbam_id = await asyncio.to_thread(lookup_mlbam_id, p.name)
+            if mlbam_id is not None:
+                if self._is_batter:
+                    sc = await asyncio.to_thread(get_batter_statcast, mlbam_id)
+                    if sc is not None:
+                        batter_sc[p.name] = sc
+                else:
+                    sc = await asyncio.to_thread(get_pitcher_statcast, mlbam_id)
+                    if sc is not None:
+                        pitcher_sc[p.name] = sc
+
         # Build comparison table
         scroll = self.query_one("#cmp-scroll", VerticalScroll)
         await scroll.remove_children()
@@ -2744,7 +2771,10 @@ class ComparisonScreen(Screen):
         else:
             table = DataTable(classes="cmp-table")
             await scroll.mount(table)
-            self._render_comparison(table, matched)
+            if self._is_batter:
+                self._render_comparison(table, matched, batter_sc=batter_sc)
+            else:
+                self._render_comparison(table, matched, pitcher_sc=pitcher_sc)
 
         try:
             self.query_one("#cmp-loading-container").display = False
@@ -2754,17 +2784,11 @@ class ComparisonScreen(Screen):
 
     def _render_comparison(
         self, table: DataTable, roster_players: list[PlayerStats],
+        batter_sc: dict[str, StatcastBatter] | None = None,
+        pitcher_sc: dict[str, StatcastPitcher] | None = None,
     ) -> None:
         scored = [c for c in self.categories if not c.is_only_display]
-        # Determine if batter or pitcher based on watchlist player
-        batting_positions = {
-            "C", "1B", "2B", "3B", "SS", "LF", "CF", "RF",
-            "OF", "Util", "DH",
-        }
-        is_batter = any(
-            pos in batting_positions
-            for pos in self._wl_player.position.split(",")
-        )
+        is_batter = self._is_batter
         cats = [c for c in scored if c.position_type == ("B" if is_batter else "P")]
 
         table.clear(columns=True)
@@ -2774,7 +2798,42 @@ class ComparisonScreen(Screen):
         cols = ["Player".ljust(20), "Pos".ljust(15), "Team", "SGP"]
         for cat in cats:
             cols.append(cat.display_name)
+        cols.append("│")
+        if is_batter:
+            sc_cols = ["EV", "MaxEV", "LA", "Barrel%", "HardHit%",
+                       "K%", "BB%", "Whiff%", "xBA", "xSLG", "xwOBA"]
+        else:
+            sc_cols = ["EV Alw", "Barrel%", "HardHit%",
+                       "xBA", "xSLG", "xwOBA", "xERA",
+                       "K%p", "BB%p", "Whiff%p"]
+        cols.extend(sc_cols)
         table.add_columns(*cols)
+
+        def _f(v, fmt=".1f"):
+            return f"{v:{fmt}}" if v is not None else "-"
+        def _rate(v):
+            return f"{v:.1f}" if v is not None else "-"
+
+        def _get_sc_vals(name: str) -> list[str]:
+            """Get Statcast values as strings for a player."""
+            if is_batter and batter_sc:
+                sc = batter_sc.get(name)
+                if sc:
+                    return [_f(sc.avg_exit_velo), _f(sc.max_exit_velo),
+                            _f(sc.avg_launch_angle), _f(sc.barrel_pct),
+                            _f(sc.hard_hit_pct), _rate(sc.k_pct),
+                            _rate(sc.bb_pct), _rate(sc.whiff_pct),
+                            _f(sc.xba, ".3f"), _f(sc.xslg, ".3f"),
+                            _f(sc.xwoba, ".3f")]
+            elif not is_batter and pitcher_sc:
+                sc = pitcher_sc.get(name)
+                if sc:
+                    return [_f(sc.avg_exit_velo), _f(sc.barrel_pct),
+                            _f(sc.hard_hit_pct), _f(sc.xba, ".3f"),
+                            _f(sc.xslg, ".3f"), _f(sc.xwoba, ".3f"),
+                            _f(sc.xera, ".2f"), _rate(sc.k_pct),
+                            _rate(sc.bb_pct), _rate(sc.whiff_pct)]
+            return ["-"] * len(sc_cols)
 
         # Watchlist player row (highlighted)
         wl_sgp = self._sgp_calc.player_sgp(self._wl_player) if self._sgp_calc else None
@@ -2790,6 +2849,10 @@ class ComparisonScreen(Screen):
                 self._wl_player.stats.get(cat.stat_id, "-"),
                 justify="right", style="#E8A735",
             ))
+        wl_row.append(Text("│", style="dim"))
+        wl_sc_vals = _get_sc_vals(self._wl_player.name)
+        for v in wl_sc_vals:
+            wl_row.append(Text(v, justify="right", style="#E8A735"))
         table.add_row(*wl_row)
 
         # For each roster player: their stats + delta row
@@ -2806,6 +2869,10 @@ class ComparisonScreen(Screen):
             ]
             for cat in cats:
                 rp_row.append(Text(rp.stats.get(cat.stat_id, "-"), justify="right"))
+            rp_row.append(Text("│", style="dim"))
+            rp_sc_vals = _get_sc_vals(rp.name)
+            for v in rp_sc_vals:
+                rp_row.append(Text(v, justify="right"))
             table.add_row(*rp_row)
 
             # Delta row
@@ -2827,6 +2894,38 @@ class ComparisonScreen(Screen):
                 rp_val = rp.stats.get(cat.stat_id, "")
                 delta_text = self._compute_delta(wl_val, rp_val, cat)
                 delta_row.append(delta_text)
+
+            # Statcast deltas
+            delta_row.append(Text("│", style="dim"))
+            # For batters: higher EV/MaxEV/LA/Barrel/HardHit/BB%/xBA/xSLG/xwOBA = better
+            #              lower K%/Whiff% = better
+            # For pitchers: lower EV/Barrel/HardHit/xBA/xSLG/xwOBA/xERA = better
+            #               higher K%/Whiff% = better, lower BB% = better
+            if is_batter:
+                sc_higher_better = [True, True, True, True, True, False, True, False,
+                                    True, True, True]
+            else:
+                sc_higher_better = [False, False, False, False, False, False, False,
+                                    True, False, True]
+
+            for i, sc_col in enumerate(sc_cols):
+                wv = wl_sc_vals[i]
+                rv = rp_sc_vals[i]
+                try:
+                    wf = float(wv)
+                    rf = float(rv)
+                    d = wf - rf
+                    higher = sc_higher_better[i] if i < len(sc_higher_better) else True
+                    favorable = (d > 0) if higher else (d < 0)
+                    if d == 0:
+                        delta_row.append(Text("0", style="dim", justify="right"))
+                    else:
+                        style = "bold green" if favorable else "bold red"
+                        delta_row.append(Text(f"{d:+.1f}" if abs(d) >= 1 else f"{d:+.3f}",
+                                              style=style, justify="right"))
+                except (ValueError, TypeError):
+                    delta_row.append(Text("-", style="dim", justify="right"))
+
             table.add_row(*delta_row)
 
     def _compute_delta(
@@ -3020,6 +3119,12 @@ class PlayerExplorerScreen(Screen):
     #pe-spinner {
         height: 3;
     }
+    #pe-loading-info {
+        height: auto;
+        content-align: center middle;
+        color: $text-muted;
+        margin: 1 0 0 0;
+    }
     #pe-scroll {
         height: 1fr;
     }
@@ -3064,6 +3169,12 @@ class PlayerExplorerScreen(Screen):
         with Vertical(id="pe-loading-container"):
             yield LoadingIndicator(id="pe-spinner")
             yield Static("Loading player data...", id="pe-loading-status")
+            yield Static(
+                "Roster data is synced daily from Yahoo and cached locally.\n"
+                "The first search may take a few minutes while all roster\n"
+                "history is downloaded. Subsequent searches load instantly.",
+                id="pe-loading-info",
+            )
         yield VerticalScroll(id="pe-scroll")
         yield Footer()
 
