@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 
@@ -1212,16 +1213,21 @@ class RosterAnalysisScreen(Screen):
 
     async def _initial_load(self) -> None:
         await self._show_loading("Fetching league data...")
-        self._all_teams = self.api.get_team_season_stats(self.league.league_key)
+        self._all_teams = await asyncio.to_thread(
+            self.api.get_team_season_stats, self.league.league_key,
+        )
         self._team_keys = [t.team_key for t in self._all_teams]
         self._team_names = {t.team_key: t.name for t in self._all_teams}
-        self._draft_results = self.api.get_draft_results(self.league.league_key)
+        self._draft_results = await asyncio.to_thread(
+            self.api.get_draft_results, self.league.league_key,
+        )
 
         # Fetch free agents per position for SGP replacement baselines
-        await self._show_loading("Computing SGP baselines...")
         replacement_by_pos: dict[str, list[PlayerStats]] = {}
         for pos in ("C", "1B", "2B", "3B", "SS", "OF", "SP", "RP"):
-            players, _ = self.api.get_free_agents(
+            await self._show_loading(f"Computing SGP baselines ({pos})...")
+            players, _ = await asyncio.to_thread(
+                self.api.get_free_agents,
                 self.league.league_key, stat_type="season",
                 position=pos, sort="AR", sort_type="season", count=25,
             )
@@ -1232,9 +1238,13 @@ class RosterAnalysisScreen(Screen):
 
         # Build rank lookups (no status filter = all players = true overall rank)
         await self._show_loading("Fetching Yahoo rankings...")
-        self._rank_lookup = self.api.build_rank_lookup(self.league.league_key, sort="AR")
+        self._rank_lookup = await asyncio.to_thread(
+            self.api.build_rank_lookup, self.league.league_key, "AR",
+        )
         await self._show_loading("Loading pre-season rankings...")
-        self._preseason_rank_lookup = self.api.get_preseason_ranks(self.league.league_key)
+        self._preseason_rank_lookup = await asyncio.to_thread(
+            self.api.get_preseason_ranks, self.league.league_key,
+        )
 
         # Prompt user to select a team
         options = [(k, self._team_names.get(k, k)) for k in self._team_keys]
@@ -1740,27 +1750,29 @@ class FreeAgentScreen(Screen):
     async def _initial_load(self) -> None:
         """One-time setup: fetch league data, draft results, and SGP baselines."""
         await self._show_loading("Fetching league data for SGP baselines...")
-        all_teams = self.api.get_team_season_stats(self.league.league_key)
-        self._draft_results = self.api.get_draft_results(self.league.league_key)
+        all_teams = await asyncio.to_thread(
+            self.api.get_team_season_stats, self.league.league_key)
+        self._draft_results = await asyncio.to_thread(
+            self.api.get_draft_results, self.league.league_key)
 
-        await self._show_loading("Computing SGP baselines...")
         replacement_by_pos: dict[str, list[PlayerStats]] = {}
         for pos in ("C", "1B", "2B", "3B", "SS", "OF", "SP", "RP"):
-            players, _ = self.api.get_free_agents(
+            await self._show_loading(f"Computing SGP baselines ({pos})...")
+            players, _ = await asyncio.to_thread(
+                self.api.get_free_agents,
                 self.league.league_key, stat_type="season",
-                position=pos, sort="AR", sort_type="season", count=25,
-            )
+                position=pos, sort="AR", sort_type="season", count=25)
             replacement_by_pos[pos] = players
         self._sgp_calc = SGPCalculator(
-            all_teams, self.categories, replacement_by_pos,
-        )
+            all_teams, self.categories, replacement_by_pos)
         self._baselines_loaded = True
 
-        # Build rank lookups (no status filter = all players = true overall rank)
         await self._show_loading("Fetching Yahoo rankings...")
-        self._rank_lookup = self.api.build_rank_lookup(self.league.league_key, sort="AR")
+        self._rank_lookup = await asyncio.to_thread(
+            self.api.build_rank_lookup, self.league.league_key, "AR")
         await self._show_loading("Loading pre-season rankings...")
-        self._preseason_rank_lookup = self.api.get_preseason_ranks(self.league.league_key)
+        self._preseason_rank_lookup = await asyncio.to_thread(
+            self.api.get_preseason_ranks, self.league.league_key)
 
         # Now load the first page of free agents
         await self._load_free_agents()
@@ -2316,10 +2328,14 @@ class WatchlistScreen(Screen):
 
     async def _initial_load(self) -> None:
         await self._show_loading("Loading SGP baselines...")
-        all_teams = self.api.get_team_season_stats(self.league.league_key)
+        all_teams = await asyncio.to_thread(
+            self.api.get_team_season_stats, self.league.league_key,
+        )
         replacement_by_pos: dict[str, list[PlayerStats]] = {}
         for pos in ("C", "1B", "2B", "3B", "SS", "OF", "SP", "RP"):
-            players, _ = self.api.get_free_agents(
+            await self._show_loading(f"Loading SGP baselines ({pos})...")
+            players, _ = await asyncio.to_thread(
+                self.api.get_free_agents,
                 self.league.league_key, stat_type="season",
                 position=pos, sort="AR", sort_type="season", count=25,
             )
@@ -2329,11 +2345,12 @@ class WatchlistScreen(Screen):
         )
 
         await self._show_loading("Fetching Yahoo rankings...")
-        self._rank_lookup = self.api.build_rank_lookup(
-            self.league.league_key, sort="AR",
+        self._rank_lookup = await asyncio.to_thread(
+            self.api.build_rank_lookup, self.league.league_key, "AR",
         )
-        self._preseason_rank_lookup = self.api.get_preseason_ranks(
-            self.league.league_key,
+        await self._show_loading("Loading pre-season rankings...")
+        self._preseason_rank_lookup = await asyncio.to_thread(
+            self.api.get_preseason_ranks, self.league.league_key,
         )
 
         await self._load_watchlist()
@@ -2353,17 +2370,20 @@ class WatchlistScreen(Screen):
 
         # Fetch current stats for each watchlisted player
         self._watchlist_players = []
-        for entry in watchlist:
+        for i, entry in enumerate(watchlist):
+            await self._show_loading(
+                f"Fetching player stats ({i + 1}/{len(watchlist)})..."
+            )
             try:
-                results = self.api.search_players(
-                    self.league.league_key, entry["player_name"], count=5,
+                results = await asyncio.to_thread(
+                    self.api.search_players,
+                    self.league.league_key, entry["player_name"], 5,
                 )
                 for r in results:
                     if r.player_key == entry["player_key"]:
                         self._watchlist_players.append(r)
                         break
                 else:
-                    # Player not found via search, use cached info
                     self._watchlist_players.append(PlayerStats(
                         player_key=entry["player_key"],
                         name=entry["player_name"],
@@ -2691,13 +2711,17 @@ class ComparisonScreen(Screen):
 
     async def _load_comparison(self) -> None:
         try:
+            self.query_one("#cmp-loading-status", Static).update(
+                "Loading roster for comparison..."
+            )
             self.query_one("#cmp-loading-container").display = True
             self.query_one("#cmp-scroll").display = False
         except Exception:
             pass
 
         # Fetch the team's roster
-        roster = self.api.get_roster_stats_season(
+        roster = await asyncio.to_thread(
+            self.api.get_roster_stats_season,
             self._team_key, self.league.current_week,
         )
 
@@ -2854,7 +2878,8 @@ class PlayerSearchModal(Screen):
     #ps-container {
         align: center middle;
         width: 60;
-        height: 20;
+        height: auto;
+        max-height: 28;
         background: $surface;
         border: solid $primary;
         padding: 1 2;
@@ -2864,6 +2889,11 @@ class PlayerSearchModal(Screen):
     }
     #ps-results {
         height: 1fr;
+    }
+    #ps-info {
+        height: auto;
+        margin: 1 0 0 0;
+        color: $text-muted;
     }
     """
 
@@ -2878,6 +2908,12 @@ class PlayerSearchModal(Screen):
             yield Static("Search for a player:", id="ps-label")
             yield Input(placeholder="Player name...", id="ps-input")
             yield ListView(id="ps-results")
+            yield Static(
+                "Roster data is synced daily from Yahoo and cached locally.\n"
+                "The first search may take a few minutes while all roster\n"
+                "history is downloaded. Subsequent searches load instantly.",
+                id="ps-info",
+            )
 
     def on_mount(self) -> None:
         self.query_one("#ps-input", Input).focus()
@@ -3091,26 +3127,27 @@ class PlayerExplorerScreen(Screen):
                 pass
 
         await self._show_loading("Syncing roster data from Yahoo...")
-        synced = self._store.sync_all_weeks(
+        synced = await asyncio.to_thread(
+            self._store.sync_all_days,
             self.api, self.league,
             progress_callback=_progress,
         )
         if synced > 0:
-            await self._show_loading(f"Synced {synced} week(s) of roster data.")
+            await self._show_loading(f"Synced {synced} day(s) of roster data.")
 
         # 2. Query the cache for this player
         await self._show_loading("Analyzing player data...")
 
-        total_weeks = self.league.current_week
+        total_days = self._store.get_total_days(self.league.league_key)
 
         stints = self._store.get_player_stints(
             self.league.league_key, p.player_key,
         )
         usage = self._store.get_player_usage_summary(
-            self.league.league_key, p.player_key, total_weeks,
+            self.league.league_key, p.player_key, total_days,
         )
         timeline = self._store.get_player_timeline(
-            self.league.league_key, p.player_key, total_weeks,
+            self.league.league_key, p.player_key,
         )
 
         # 3. Render all sections
@@ -3124,7 +3161,7 @@ class PlayerExplorerScreen(Screen):
         )
         usage_widget = Static("", classes="pe-usage-bar")
         await scroll.mount(label1, usage_widget)
-        self._render_usage_summary(usage_widget, usage, total_weeks)
+        self._render_usage_summary(usage_widget, usage, total_days)
 
         # --- Roster Breakdown by Team ---
         label2 = Static(
@@ -3147,7 +3184,7 @@ class PlayerExplorerScreen(Screen):
         self._hide_loading()
 
     def _render_usage_summary(
-        self, widget: Static, usage: dict, total_weeks: int,
+        self, widget: Static, usage: dict, total_days: int,
     ) -> None:
         """Render the usage summary with per-category stat breakdowns."""
         scored = [c for c in self.categories if not c.is_only_display]
@@ -3169,19 +3206,19 @@ class PlayerExplorerScreen(Screen):
         text = Text()
         text.append("\n")
 
-        # Header line: percentage + label + weeks for each section
+        # Header line: percentage + label + days for each section
         col_width = 28
         for label, data, style in sections:
-            weeks = data["weeks"]
-            pct = round(weeks / max(1, total_weeks) * 100)
+            days = data["days"]
+            pct = round(days / max(1, total_days) * 100)
             cell = f"  {pct}% {label}"
             text.append(cell.ljust(col_width), style=style)
         text.append("\n")
 
-        # Sub-header: weeks count
+        # Sub-header: days count
         for label, data, style in sections:
-            weeks = data["weeks"]
-            cell = f"  {weeks} of {total_weeks} total weeks"
+            days = data["days"]
+            cell = f"  {days} of {total_days} total days"
             text.append(cell.ljust(col_width), style="dim")
         text.append("\n\n")
 
@@ -3210,7 +3247,7 @@ class PlayerExplorerScreen(Screen):
         table.cursor_type = "row"
         table.zebra_stripes = True
 
-        cols = ["Team".ljust(24), "Status", "Dates", "Weeks"]
+        cols = ["Team".ljust(24), "Status", "Dates", "Days"]
         for cat in bat_cats:
             cols.append(cat.display_name)
         table.add_columns(*cols)
@@ -3222,21 +3259,21 @@ class PlayerExplorerScreen(Screen):
         il_positions = {"IL", "IL+", "DL", "NA"}
 
         grand_total_stats: dict[str, str] = {}
-        grand_total_weeks = 0
+        grand_total_days = 0
 
         for stint in stints:
-            weeks = stint["weeks"]
+            days = stint["days"]
             team_name = stint["team_name"]
-            if not weeks:
+            if not days:
                 continue
 
             # Compute date range
-            first_start = weeks[0].get("week_start", "")
-            last_end = weeks[-1].get("week_end", "")
+            first_date = days[0].get("date", "")
+            last_date = days[-1].get("date", "")
             from datetime import datetime
             try:
-                ds = datetime.strptime(first_start, "%Y-%m-%d").strftime("%b %d")
-                de = datetime.strptime(last_end, "%Y-%m-%d").strftime("%b %d")
+                ds = datetime.strptime(first_date, "%Y-%m-%d").strftime("%b %d")
+                de = datetime.strptime(last_date, "%Y-%m-%d").strftime("%b %d")
                 date_range = f"{ds} - {de}"
             except (ValueError, TypeError):
                 date_range = ""
@@ -3245,18 +3282,18 @@ class PlayerExplorerScreen(Screen):
             total_stats: dict[str, str] = {}
             started_stats: dict[str, str] = {}
             benched_stats: dict[str, str] = {}
-            started_weeks = 0
-            benched_weeks = 0
+            started_days = 0
+            benched_days = 0
 
-            for wd in weeks:
-                sel_pos = wd.get("selected_position", "BN")
-                stats = wd.get("stats", {})
+            for dd in days:
+                sel_pos = dd.get("selected_position", "BN")
+                stats = dd.get("stats", {})
 
                 if sel_pos in active_positions:
-                    started_weeks += 1
+                    started_days += 1
                     _acc(started_stats, stats)
                 elif sel_pos == "BN":
-                    benched_weeks += 1
+                    benched_days += 1
                     _acc(benched_stats, stats)
                 _acc(total_stats, stats)
 
@@ -3265,8 +3302,8 @@ class PlayerExplorerScreen(Screen):
             _compute_rates(started_stats)
             _compute_rates(benched_stats)
 
-            num_weeks = len(weeks)
-            grand_total_weeks += num_weeks
+            num_days = len(days)
+            grand_total_days += num_days
             _acc(grand_total_stats, total_stats)
 
             # Team total row
@@ -3274,7 +3311,7 @@ class PlayerExplorerScreen(Screen):
                 Text(team_name[:24].ljust(24), style="bold"),
                 Text("Total", style="bold"),
                 Text(date_range, style="dim"),
-                Text(str(num_weeks), justify="right"),
+                Text(str(num_days), justify="right"),
             ]
             for cat in bat_cats:
                 row.append(Text(total_stats.get(cat.stat_id, "-"),
@@ -3282,12 +3319,12 @@ class PlayerExplorerScreen(Screen):
             table.add_row(*row)
 
             # Started sub-row
-            if started_weeks > 0:
+            if started_days > 0:
                 row_s: list[Text] = [
                     Text(""),
                     Text("  Started", style="dim"),
                     Text(""),
-                    Text(str(started_weeks), justify="right", style="dim"),
+                    Text(str(started_days), justify="right", style="dim"),
                 ]
                 for cat in bat_cats:
                     row_s.append(Text(
@@ -3297,12 +3334,12 @@ class PlayerExplorerScreen(Screen):
                 table.add_row(*row_s)
 
             # Benched sub-row
-            if benched_weeks > 0:
+            if benched_days > 0:
                 row_b: list[Text] = [
                     Text(""),
                     Text("  Benched", style="dim"),
                     Text(""),
-                    Text(str(benched_weeks), justify="right", style="dim"),
+                    Text(str(benched_days), justify="right", style="dim"),
                 ]
                 for cat in bat_cats:
                     row_b.append(Text(
@@ -3318,7 +3355,7 @@ class PlayerExplorerScreen(Screen):
                 Text("TOT".ljust(24), style="bold"),
                 Text("Total", style="bold"),
                 Text(""),
-                Text(str(grand_total_weeks), justify="right", style="bold"),
+                Text(str(grand_total_days), justify="right", style="bold"),
             ]
             for cat in bat_cats:
                 row_t.append(Text(
@@ -3333,8 +3370,8 @@ class PlayerExplorerScreen(Screen):
         """Render daily season timeline colored by fantasy team ownership.
 
         One block per calendar day, colored by the fantasy team that owns
-        the player. Weeks spanning month boundaries split across months.
-        Shows stats and usage summary per month.
+        the player. Each day has its own status and stats from the daily
+        roster snapshot. Shows stats and usage summary per month.
         """
         from datetime import datetime, timedelta
 
@@ -3349,41 +3386,21 @@ class PlayerExplorerScreen(Screen):
         team_color_map: dict[str, str] = {}
         color_idx = 0
 
-        # Build day-by-day data from weekly timeline entries
-        # Each day stores: status, team_name, week (for stat dedup), stats
-        day_data: dict[str, dict] = {}  # date_str -> {status, team_name, week, stats}
+        # Build day-by-day lookup from daily timeline entries
+        day_data: dict[str, dict] = {}
 
         for entry in timeline:
-            ws = entry.get("week_start", "")
-            we = entry.get("week_end", "")
+            date_str = entry.get("date", "")
+            if not date_str:
+                continue
             status = entry.get("status", "not_owned")
             team_name = entry.get("team_name", "")
-            stats = entry.get("stats", {})
-            week_num = entry.get("week", 0)
 
-            if not ws or not we:
-                continue
-
-            try:
-                start = datetime.strptime(ws, "%Y-%m-%d")
-                end = datetime.strptime(we, "%Y-%m-%d")
-            except ValueError:
-                continue
-
-            # Assign color to team
             if team_name and team_name not in team_color_map:
                 team_color_map[team_name] = team_colors[color_idx % len(team_colors)]
                 color_idx += 1
 
-            d = start
-            while d <= end:
-                day_data[d.strftime("%Y-%m-%d")] = {
-                    "status": status,
-                    "team_name": team_name,
-                    "week": week_num,
-                    "stats": stats,
-                }
-                d += timedelta(days=1)
+            day_data[date_str] = entry
 
         if not day_data:
             widget.update(Text("  No timeline data available.\n", style="dim"))
@@ -3392,10 +3409,8 @@ class PlayerExplorerScreen(Screen):
         scored = [c for c in self.categories
                   if not c.is_only_display and c.position_type == "B"]
 
-        # Determine full season date range (use week_dates for future weeks)
         all_dates = sorted(day_data.keys())
         first_date = datetime.strptime(all_dates[0], "%Y-%m-%d")
-        # Extend to end of last known week or season
         last_date = datetime.strptime(all_dates[-1], "%Y-%m-%d")
 
         text = Text()
@@ -3414,16 +3429,13 @@ class PlayerExplorerScreen(Screen):
             started_count = 0
             benched_count = 0
             il_count = 0
-            other_roster_count = 0
             not_owned_count = 0
-            weeks_seen: set[str] = set()  # track week_start to avoid double-counting stats
 
             for day in range(1, days_in_month + 1):
                 d = current.replace(day=day)
                 ds = d.strftime("%Y-%m-%d")
 
                 if d > last_date:
-                    # Future day
                     text.append("░░", style="dim")
                     continue
 
@@ -3444,12 +3456,10 @@ class PlayerExplorerScreen(Screen):
                     elif status == "il":
                         il_count += 1
 
-                # Accumulate stats once per fantasy week (deduplicate by week number)
-                if info and info.get("stats") and info["status"] != "not_owned":
-                    week_key = str(info.get("week", 0))
-                    if week_key != "0" and week_key not in weeks_seen:
-                        weeks_seen.add(week_key)
-                        _acc(month_stats, info["stats"])
+                    # Accumulate daily stats directly
+                    day_stats = info.get("stats", {})
+                    if day_stats:
+                        _acc(month_stats, day_stats)
 
             text.append("\n")
 
