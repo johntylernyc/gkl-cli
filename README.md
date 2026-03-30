@@ -12,7 +12,7 @@ The main screen shows head-to-head matchups for the current week with live scori
 
 **Key bindings:** `w` weekly | `d` daily | `n` season | `←→` change week | `e` select week
 
-![Matchup Scoreboard](docs/screenshots/scoreboard.png)
+![Matchup Scoreboard](docs/screenshots/scoreboard.svg)
 
 ### Roto Standings
 
@@ -20,7 +20,7 @@ Full roto standings with per-category rankings and point totals across all teams
 
 **Key binding:** `s` from main screen
 
-![Roto Standings](docs/screenshots/roto-standings.png)
+![Roto Standings](docs/screenshots/roto-standings.svg)
 
 ### Head-to-Head Simulator
 
@@ -28,7 +28,7 @@ Simulates your roster against every other team in the league for any given week.
 
 **Key binding:** `h` from main screen
 
-![H2H Simulator](docs/screenshots/h2h-simulator.png)
+![H2H Simulator](docs/screenshots/h2h-simulator.svg)
 
 ### Roster Analysis
 
@@ -44,7 +44,7 @@ Switch between season, last 14 days, and last 30 days. View any team in the leag
 
 **Key binding:** `t` from main screen
 
-![Roster Analysis](docs/screenshots/roster-analysis.png)
+![Roster Analysis](docs/screenshots/roster-analysis.svg)
 
 ### Free Agent Browser
 
@@ -58,7 +58,7 @@ Browse available free agents with the same stats + Statcast data as the roster v
 
 **Key binding:** `f` from main screen
 
-![Free Agents](docs/screenshots/free-agents.png)
+![Free Agents](docs/screenshots/free-agents.svg)
 
 ### League Transactions
 
@@ -70,7 +70,7 @@ Explore transaction activity across the league with three views:
 
 **Key binding:** `x` from main screen
 
-![Transactions](docs/screenshots/transactions.png)
+![Transactions](docs/screenshots/transactions.svg)
 
 ### MLB Live Scoreboard
 
@@ -78,7 +78,7 @@ Real-time MLB game scores and linescore data pulled from the MLB Stats API. Show
 
 **Key binding:** `g` from main screen
 
-![MLB Scoreboard](docs/screenshots/mlb-scoreboard.png)
+![MLB Scoreboard](docs/screenshots/mlb-scoreboard.svg)
 
 ## Installation
 
