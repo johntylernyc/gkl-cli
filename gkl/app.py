@@ -1,0 +1,3296 @@
+"""GKL CLI — Fantasy Baseball Command Center."""
+
+from __future__ import annotations
+
+import os
+import sys
+
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import Screen
+from textual.theme import Theme
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    LoadingIndicator,
+    Static,
+)
+
+from gkl.yahoo_api import (
+    League, Matchup, PlayerStats, StatCategory, TeamStats, Transaction,
+    YahooFantasyAPI,
+)
+from gkl.yahoo_auth import YahooAuth, load_credentials, save_credentials
+from gkl.stats import (
+    who_wins, simulate_h2h, compute_power_rankings, aggregate_h2h_season,
+    H2HResult, TeamH2HSummary, SGPCalculator,
+)
+from gkl.mlb_api import MLBGame, get_mlb_scoreboard
+from gkl.statcast import (
+    get_batter_statcast, get_pitcher_statcast, lookup_mlbam_id,
+    StatcastBatter, StatcastPitcher,
+)
+
+# Consistent team colors used across the entire app
+TEAM_A_COLOR = "#E8A735"  # warm amber/gold
+TEAM_B_COLOR = "#5BA4CF"  # cool sky blue
+TEAM_A_BG = "#332B1A"     # subtle warm row background
+TEAM_B_BG = "#1A2A38"     # subtle cool row background
+TIED_BG = "#252525"       # neutral for ties
+
+BASEBALL_THEME = Theme(
+    name="baseball",
+    primary="#4A7C59",
+    secondary="#6B5B4E",
+    accent="#D4A84B",
+    foreground="#E8E4DF",
+    background="#181818",
+    surface="#222222",
+    panel="#1E1E1E",
+    success="#6AAF6E",
+    warning="#D4A84B",
+    error="#C75D5D",
+    dark=True,
+    variables={
+        "block-cursor-foreground": "#E8E4DF",
+        "block-cursor-background": "#4A7C59",
+        "footer-key-foreground": "#D4A84B",
+    },
+)
+
+
+# who_wins imported from gkl.stats
+
+
+# --- Roto Standings Calculation ---
+
+
+def _compute_roto(
+    teams: list[TeamStats],
+    categories: list[StatCategory],
+) -> list[dict]:
+    """Compute roto points for each team across the given categories."""
+    results: list[dict] = []
+    for t in teams:
+        results.append({
+            "name": t.name,
+            "manager": t.manager,
+            "team_key": t.team_key,
+            "total": 0.0,
+        })
+
+    for cat in categories:
+        vals: list[tuple[int, float]] = []
+        for i, t in enumerate(teams):
+            raw = t.stats.get(cat.stat_id, "0")
+            results[i][f"raw_{cat.stat_id}"] = raw
+            try:
+                vals.append((i, float(raw)))
+            except (ValueError, TypeError):
+                vals.append((i, 0.0))
+
+        higher_is_better = cat.sort_order == "1"
+        vals.sort(key=lambda x: x[1], reverse=not higher_is_better)
+
+        rank = 1
+        i = 0
+        while i < len(vals):
+            j = i
+            while j < len(vals) and vals[j][1] == vals[i][1]:
+                j += 1
+            avg_rank = sum(range(rank, rank + j - i)) / (j - i)
+            for k in range(i, j):
+                idx = vals[k][0]
+                results[idx][cat.stat_id] = avg_rank
+                results[idx]["total"] += avg_rank
+            rank += j - i
+            i = j
+
+    results.sort(key=lambda r: r["total"], reverse=True)
+    return results
+
+
+# --- Roto Standings Screen ---
+
+
+CHART_COLORS = [
+    (232, 167, 53), (91, 164, 207), (106, 175, 110), (199, 93, 93),
+    (180, 140, 200), (220, 180, 100), (100, 200, 200), (200, 130, 80),
+    (150, 180, 100), (180, 100, 150), (100, 150, 200), (200, 200, 100),
+    (130, 130, 200), (200, 150, 150), (100, 200, 150), (200, 100, 200),
+    (150, 200, 200), (200, 180, 150),
+]
+
+
+class RotoStandingsScreen(Screen):
+    BINDINGS = [("escape", "go_back", "Back"), ("q", "go_back", "Back"),
+                ("1", "show_overall", "Overall"), ("2", "show_batting", "Batting"),
+                ("3", "show_pitching", "Pitching"),
+                ("left", "dec_start", "Start -1"), ("right", "inc_start", "Start +1"),
+                ("down", "dec_end", "End -1"), ("up", "inc_end", "End +1"),
+                ("a", "select_all", "All Weeks")]
+    CSS = """
+    #roto-header {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #roto-controls {
+        height: 1;
+        content-align: center middle;
+        background: $surface;
+        color: $text-muted;
+    }
+    #roto-view-label {
+        height: 1;
+        content-align: center middle;
+        background: #3A4A3A;
+        color: $foreground;
+        text-style: bold;
+    }
+    #roto-table {
+        height: 1fr;
+        background: $panel;
+    }
+    DataTable > .datatable--cursor {
+        background: #3A5A3A;
+        color: #E8E4DF;
+    }
+    #roto-loading {
+        height: 3;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    #roto-chart {
+        height: 40%;
+        border-top: solid $primary;
+    }
+    """
+
+    def __init__(self, api: YahooFantasyAPI, league: League,
+                 categories: list[StatCategory]) -> None:
+        super().__init__()
+        self.api = api
+        self.league = league
+        self.categories = categories
+        self.teams: list[TeamStats] = []
+        self._current_view = "overall"
+        self._week_start = 1
+        self._week_end = max(1, league.current_week)
+        self._max_week = max(1, league.current_week)
+        # Cache: week -> list[TeamStats]
+        self._week_cache: dict[int, list[TeamStats]] = {}
+        # Per-week roto ranks for chart: {team_name: [rank_wk1, rank_wk2, ...]}
+        self._weekly_ranks: dict[str, list[float]] = {}
+
+    def compose(self) -> ComposeResult:
+        from textual_plotext import PlotextPlot
+        yield Header()
+        yield Static("", id="roto-header")
+        yield Static("", id="roto-controls")
+        yield Static("", id="roto-view-label")
+        yield Static("Loading standings...", id="roto-loading")
+        yield DataTable(id="roto-table")
+        yield PlotextPlot(id="roto-chart")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#roto-header", Static).update(
+            f" {self.league.name} — Roto Standings "
+        )
+        self.query_one("#roto-table", DataTable).display = False
+        self.query_one("#roto-chart").display = False
+        self._update_controls()
+        self.run_worker(self._load)
+
+    def _update_controls(self) -> None:
+        ctrl = Text()
+        ctrl.append("[1] Overall  [2] Batting  [3] Pitching", style="dim")
+        ctrl.append("  |  ")
+        ctrl.append(f"Weeks {self._week_start}-{self._week_end}", style="bold")
+        ctrl.append(f"  (←→ start, ↑↓ end, [a] all)", style="dim")
+        self.query_one("#roto-controls", Static).update(ctrl)
+
+    async def _load(self) -> None:
+        await self._fetch_and_render()
+
+    async def _fetch_and_render(self) -> None:
+        from gkl.stats import aggregate_weekly_stats
+
+        scored = [c for c in self.categories if not c.is_only_display]
+
+        # Fetch all weeks we need (use cache)
+        weekly_data: list[list[TeamStats]] = []
+        for w in range(self._week_start, self._week_end + 1):
+            if w not in self._week_cache:
+                self._week_cache[w] = self.api.get_team_week_stats(
+                    self.league.league_key, w)
+            weekly_data.append(self._week_cache[w])
+
+        # Aggregate for the selected range
+        if self._week_start == 1 and self._week_end == self._max_week:
+            # Full season — use the faster season endpoint
+            self.teams = self.api.get_team_season_stats(self.league.league_key)
+        else:
+            self.teams = aggregate_weekly_stats(weekly_data, self.categories)
+
+        # Compute per-week cumulative roto ranks for chart
+        self._compute_weekly_ranks(scored)
+
+        loading = self.query("#roto-loading")
+        if loading:
+            loading.first().remove()
+        self.query_one("#roto-table", DataTable).display = True
+        self.query_one("#roto-chart").display = True
+        self._render_table()
+        self._render_chart()
+
+    def _compute_weekly_ranks(self, cats: list[StatCategory]) -> None:
+        """Compute cumulative roto rank at each week for the chart."""
+        from gkl.stats import aggregate_weekly_stats
+
+        self._weekly_ranks = {}
+        weeks = list(range(1, self._max_week + 1))
+
+        for end_week in weeks:
+            # Get cumulative stats 1..end_week
+            week_data = []
+            for w in range(1, end_week + 1):
+                if w not in self._week_cache:
+                    self._week_cache[w] = self.api.get_team_week_stats(
+                        self.league.league_key, w)
+                week_data.append(self._week_cache[w])
+
+            cum_teams = aggregate_weekly_stats(week_data, self.categories)
+            standings = _compute_roto(cum_teams, cats)
+
+            for rank, entry in enumerate(standings, 1):
+                name = entry["name"]
+                if name not in self._weekly_ranks:
+                    self._weekly_ranks[name] = []
+                self._weekly_ranks[name].append(rank)
+
+    def _render_table(self) -> None:
+        scored = [c for c in self.categories if not c.is_only_display]
+        batting_cats = [c for c in scored if c.position_type == "B"]
+        pitching_cats = [c for c in scored if c.position_type == "P"]
+
+        if self._current_view == "batting":
+            cats = batting_cats
+            label = f" BATTING ROTO — Weeks {self._week_start}-{self._week_end} "
+        elif self._current_view == "pitching":
+            cats = pitching_cats
+            label = f" PITCHING ROTO — Weeks {self._week_start}-{self._week_end} "
+        else:
+            cats = batting_cats + pitching_cats
+            label = f" OVERALL ROTO — Weeks {self._week_start}-{self._week_end} "
+
+        self.query_one("#roto-view-label", Static).update(label)
+
+        standings = _compute_roto(self.teams, cats)
+        table = self.query_one("#roto-table", DataTable)
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+
+        col_keys = ["Rank", "Team", "Manager"]
+        for cat in cats:
+            col_keys.append(cat.display_name)
+        col_keys.append("Total")
+        table.add_columns(*col_keys)
+
+        for rank, entry in enumerate(standings, 1):
+            row: list[str | Text] = [
+                Text(str(rank), justify="right"),
+                Text(entry["name"], style="bold"),
+                Text(entry["manager"], style="dim"),
+            ]
+            for cat in cats:
+                pts = entry.get(cat.stat_id, 0)
+                raw = entry.get(f"raw_{cat.stat_id}", "-")
+                cell = Text(f"{pts:.1f}", justify="right")
+                cell.append(f" ({raw})", style="dim")
+                row.append(cell)
+            row.append(Text(f"{entry['total']:.1f}", style="bold", justify="right"))
+            table.add_row(*row)
+
+    def _render_chart(self) -> None:
+        from textual_plotext import PlotextPlot
+
+        plot_widget = self.query_one("#roto-chart", PlotextPlot)
+        plt = plot_widget.plt
+        plt.clear_data()
+        plt.clear_figure()
+
+        weeks = list(range(1, self._max_week + 1))
+        if not weeks or not self._weekly_ranks:
+            return
+
+        num_teams = len(self._weekly_ranks)
+        # Build stable name->color mapping
+        team_colors: dict[str, tuple] = {}
+        for i, team in enumerate(self._weekly_ranks):
+            team_colors[team] = CHART_COLORS[i % len(CHART_COLORS)]
+
+        for team, ranks in self._weekly_ranks.items():
+            color = team_colors[team]
+            inverted = [-r for r in ranks]
+            plt.plot(weeks, inverted, color=color, marker="braille",
+                     label=team)
+
+        plt.yticks([])
+
+        plt.title("Roto Rank by Week (cumulative)")
+        plt.xlabel("Week")
+        plt.xticks(weeks, [str(w) for w in weeks])
+        plt.theme("dark")
+
+        plot_widget.refresh()
+
+    def action_show_overall(self) -> None:
+        self._current_view = "overall"
+        self._render_table()
+
+    def action_show_batting(self) -> None:
+        self._current_view = "batting"
+        self._render_table()
+
+    def action_show_pitching(self) -> None:
+        self._current_view = "pitching"
+        self._render_table()
+
+    def action_dec_start(self) -> None:
+        if self._week_start > 1:
+            self._week_start -= 1
+            self._update_controls()
+            self.run_worker(self._fetch_and_render, group="roto-fetch", exclusive=True)
+
+    def action_inc_start(self) -> None:
+        if self._week_start < self._week_end:
+            self._week_start += 1
+            self._update_controls()
+            self.run_worker(self._fetch_and_render, group="roto-fetch", exclusive=True)
+
+    def action_dec_end(self) -> None:
+        if self._week_end > self._week_start:
+            self._week_end -= 1
+            self._update_controls()
+            self.run_worker(self._fetch_and_render, group="roto-fetch", exclusive=True)
+
+    def action_inc_end(self) -> None:
+        if self._week_end < self._max_week:
+            self._week_end += 1
+            self._update_controls()
+            self.run_worker(self._fetch_and_render, group="roto-fetch", exclusive=True)
+
+    def action_select_all(self) -> None:
+        self._week_start = 1
+        self._week_end = self._max_week
+        self._update_controls()
+        self.run_worker(self._fetch_and_render, group="roto-fetch", exclusive=True)
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
+
+
+# --- H2H Simulator Screen ---
+
+
+class H2HSimulatorScreen(Screen):
+    BINDINGS = [("escape", "go_back", "Back"), ("q", "go_back", "Back"),
+                ("left", "prev_week", "Prev Week"), ("right", "next_week", "Next Week"),
+                ("a", "toggle_season", "Season")]
+    CSS = """
+    #h2h-header {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #h2h-controls {
+        height: 1;
+        content-align: center middle;
+        background: $surface;
+        color: $text-muted;
+    }
+    #h2h-top {
+        height: 55%;
+    }
+    #h2h-top-label {
+        height: 1;
+        content-align: center middle;
+        background: #3A4A3A;
+        color: $foreground;
+        text-style: bold;
+    }
+    #h2h-actual {
+        height: 1;
+        content-align: center middle;
+        background: #2A2A2A;
+        text-style: bold;
+    }
+    #matchups-table {
+        height: 1fr;
+        background: $panel;
+    }
+    #h2h-bottom {
+        height: 45%;
+        border-top: solid $primary;
+    }
+    #h2h-bottom-label {
+        height: 1;
+        content-align: center middle;
+        background: #3A4A3A;
+        color: $foreground;
+        text-style: bold;
+    }
+    #rankings-table {
+        height: 1fr;
+        background: $panel;
+    }
+    DataTable > .datatable--cursor {
+        background: #3A5A3A;
+        color: #E8E4DF;
+    }
+    #h2h-loading {
+        height: 3;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    """
+
+    def __init__(self, api: YahooFantasyAPI, league: League,
+                 categories: list[StatCategory]) -> None:
+        super().__init__()
+        self.api = api
+        self.league = league
+        self.categories = categories
+        self._week = league.current_week
+        self._max_week = league.current_week
+        self._season_mode = False
+        self._team_keys: list[str] = []
+        self._team_idx = 0
+        self._week_cache: dict[int, list[TeamStats]] = {}
+        self._matchup_cache: dict[int, list[Matchup]] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("", id="h2h-header")
+        yield Static("", id="h2h-controls")
+        with Vertical(id="h2h-top"):
+            yield Static("", id="h2h-top-label")
+            yield Static("", id="h2h-actual")
+            yield Static("Loading...", id="h2h-loading")
+            yield DataTable(id="matchups-table")
+        with Vertical(id="h2h-bottom"):
+            yield Static("", id="h2h-bottom-label")
+            yield DataTable(id="rankings-table")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#h2h-header", Static).update(
+            f" {self.league.name} — H2H Simulator "
+        )
+        self.query_one("#matchups-table", DataTable).display = False
+        self.run_worker(self._load)
+
+    async def _load(self) -> None:
+        teams = self._get_week_teams(self._week)
+        self._team_keys = [t.team_key for t in teams]
+        if not self._team_keys:
+            return
+
+        # Default to first team
+        if self._team_idx >= len(self._team_keys):
+            self._team_idx = 0
+
+        await self._render_all()
+
+    def _get_week_teams(self, week: int) -> list[TeamStats]:
+        if week not in self._week_cache:
+            self._week_cache[week] = self.api.get_team_week_stats(
+                self.league.league_key, week)
+        return self._week_cache[week]
+
+    def _get_week_matchups(self, week: int) -> list[Matchup]:
+        if week not in self._matchup_cache:
+            self._matchup_cache[week] = self.api.get_scoreboard(
+                self.league.league_key, week)
+        return self._matchup_cache[week]
+
+    def _find_actual_opponent(self, team_key: str, matchups: list[Matchup]) -> tuple[str, str]:
+        """Find the actual opponent and result for a team in a week's matchups.
+        Returns (opponent_team_key, result_str like 'W 9-7' or 'L 3-12').
+        """
+        for m in matchups:
+            if m.team_a.team_key == team_key:
+                opp = m.team_b
+                pts_a, pts_b = m.team_a.points, m.team_b.points
+                if pts_a > pts_b:
+                    res = f"W {pts_a:.0f}-{pts_b:.0f}"
+                elif pts_b > pts_a:
+                    res = f"L {pts_a:.0f}-{pts_b:.0f}"
+                else:
+                    res = f"T {pts_a:.0f}-{pts_b:.0f}"
+                return opp.team_key, res
+            elif m.team_b.team_key == team_key:
+                opp = m.team_a
+                pts_a, pts_b = m.team_b.points, m.team_a.points
+                if pts_a > pts_b:
+                    res = f"W {pts_a:.0f}-{pts_b:.0f}"
+                elif pts_b > pts_a:
+                    res = f"L {pts_a:.0f}-{pts_b:.0f}"
+                else:
+                    res = f"T {pts_a:.0f}-{pts_b:.0f}"
+                return opp.team_key, res
+        return "", ""
+
+    async def _render_all(self) -> None:
+        teams = self._get_week_teams(self._week)
+        selected_key = self._team_keys[self._team_idx]
+        selected_team = next((t for t in teams if t.team_key == selected_key), None)
+        if not selected_team:
+            return
+
+        if self._season_mode:
+            await self._render_season(teams, selected_key, selected_team)
+        else:
+            await self._render_week(teams, selected_key, selected_team)
+
+    @staticmethod
+    def _week_is_preevent(matchups: list[Matchup]) -> bool:
+        """Check if all matchups for a week are preevent (no games started)."""
+        return bool(matchups) and all(m.status == "preevent" for m in matchups)
+
+    async def _render_week(self, teams: list[TeamStats], selected_key: str,
+                           selected_team: TeamStats) -> None:
+        matchups = self._get_week_matchups(self._week)
+        preevent = self._week_is_preevent(matchups)
+        actual_opp_key, actual_result = self._find_actual_opponent(selected_key, matchups)
+
+        # Controls
+        ctrl = Text()
+        ctrl.append(f"Week {self._week}", style="bold")
+        ctrl.append(f"  (←→ week)  |  ", style="dim")
+        ctrl.append(f"Manager: {selected_team.name}", style=f"bold {TEAM_A_COLOR}")
+        ctrl.append(f"  (Enter on rankings to select)  |  [a] Season View", style="dim")
+        self.query_one("#h2h-controls", Static).update(ctrl)
+
+        # Actual matchup result
+        if preevent:
+            notice = Text()
+            notice.append(" This week's games have not yet started ", style="bold on #3A3A3A")
+            self.query_one("#h2h-actual", Static).update(notice)
+        elif actual_result:
+            actual_text = Text()
+            actual_text.append(" Actual Matchup: ", style="dim")
+            actual_text.append(f" {actual_result} ", style="bold")
+            opp_name = next((t.name for t in teams if t.team_key == actual_opp_key), "?")
+            actual_text.append(f" vs {opp_name}", style="dim")
+            self.query_one("#h2h-actual", Static).update(actual_text)
+        else:
+            self.query_one("#h2h-actual", Static).update("")
+
+        if preevent:
+            # Build empty results — all 0-0-0 records
+            h2h: dict[str, dict[str, H2HResult]] = {}
+            for a in teams:
+                h2h[a.team_key] = {}
+                for b in teams:
+                    if a.team_key != b.team_key:
+                        h2h[a.team_key][b.team_key] = H2HResult()
+            rankings = compute_power_rankings(h2h, teams)
+        else:
+            h2h = simulate_h2h(teams, self.categories)
+            rankings = compute_power_rankings(h2h, teams)
+
+        self.query_one("#h2h-top-label", Static).update(
+            f" Hypothetical Matchups — {selected_team.name} vs All — Week {self._week} "
+        )
+        self.query_one("#h2h-bottom-label", Static).update(
+            f" League Power Rankings — Week {self._week} "
+        )
+
+        loading = self.query("#h2h-loading")
+        if loading:
+            loading.first().remove()
+        self.query_one("#matchups-table", DataTable).display = True
+
+        self._render_matchups_table(h2h, teams, selected_key, actual_opp_key)
+        self._render_rankings_table(rankings, matchups)
+
+    async def _render_season(self, teams: list[TeamStats], selected_key: str,
+                             selected_team: TeamStats) -> None:
+        ctrl = Text()
+        ctrl.append(f"SEASON", style="bold")
+        ctrl.append(f"  (←→ week)  |  ", style="dim")
+        ctrl.append(f"Manager: {selected_team.name}", style=f"bold {TEAM_A_COLOR}")
+        ctrl.append(f"  (Enter on rankings to select)  |  [a] Week View", style="dim")
+        self.query_one("#h2h-controls", Static).update(ctrl)
+        self.query_one("#h2h-actual", Static).update("")
+
+        # Aggregate across all weeks (skip preevent weeks)
+        all_rankings: list[list[TeamH2HSummary]] = []
+        all_h2h: dict[str, dict[str, H2HResult]] = {}
+        for w in range(1, self._max_week + 1):
+            w_matchups = self._get_week_matchups(w)
+            if self._week_is_preevent(w_matchups):
+                continue
+            w_teams = self._get_week_teams(w)
+            h2h = simulate_h2h(w_teams, self.categories)
+            rankings = compute_power_rankings(h2h, w_teams)
+            all_rankings.append(rankings)
+            # Aggregate per-opponent results for selected team
+            for opp_key, result in h2h.get(selected_key, {}).items():
+                if opp_key not in all_h2h:
+                    all_h2h[opp_key] = {}
+                if "agg" not in all_h2h[opp_key]:
+                    all_h2h[opp_key]["agg"] = H2HResult()
+                a = all_h2h[opp_key]["agg"]
+                if result.result == "WIN":
+                    a.wins += 1
+                elif result.result == "LOSS":
+                    a.losses += 1
+                else:
+                    a.ties += 1
+
+        season_rankings = aggregate_h2h_season(all_rankings)
+
+        self.query_one("#h2h-top-label", Static).update(
+            f" Season H2H — {selected_team.name} — Matchup W/L vs Each Opponent "
+        )
+        self.query_one("#h2h-bottom-label", Static).update(
+            " Season Power Rankings — All Weeks Combined "
+        )
+
+        loading = self.query("#h2h-loading")
+        if loading:
+            loading.first().remove()
+        self.query_one("#matchups-table", DataTable).display = True
+
+        # Season matchups table (W/L per opponent across weeks)
+        table = self.query_one("#matchups-table", DataTable)
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_columns("Opponent", "Matchup W-L-T", "Win %")
+
+        opp_rows = []
+        for opp_key, data in all_h2h.items():
+            a = data["agg"]
+            opp_name = next((t.name for t in teams if t.team_key == opp_key),
+                            opp_key)
+            total = a.wins + a.losses + a.ties
+            pct = a.wins / total if total > 0 else 0
+            opp_rows.append((opp_key, opp_name, a, pct))
+        opp_rows.sort(key=lambda x: x[3], reverse=True)
+
+        self._matchups_keys = [opp_key for opp_key, _, _, _ in opp_rows]
+
+        for _opp_key, opp_name, a, pct in opp_rows:
+            pct_style = "bold green" if pct > 0.5 else "bold red" if pct < 0.5 else ""
+            table.add_row(
+                Text(opp_name, style="bold"),
+                Text(f"{a.wins}-{a.losses}-{a.ties}", justify="center"),
+                Text(f"{pct:.1%}", style=pct_style, justify="right"),
+            )
+
+        # Season rankings table
+        self._render_season_rankings_table(season_rankings)
+
+    def _render_matchups_table(self, h2h: dict, teams: list[TeamStats],
+                               selected_key: str, actual_opp_key: str) -> None:
+        table = self.query_one("#matchups-table", DataTable)
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+
+        scored = [c for c in self.categories if not c.is_only_display]
+        cat_names = [c.display_name for c in scored]
+        table.add_columns("Opponent", "Record", "Result", *cat_names)
+
+        my_results = h2h.get(selected_key, {})
+        rows: list[tuple[bool, str, str, H2HResult]] = []
+        for opp_key, result in my_results.items():
+            opp_name = next((t.name for t in teams if t.team_key == opp_key), opp_key)
+            is_actual = opp_key == actual_opp_key
+            rows.append((is_actual, opp_key, opp_name, result))
+
+        # Sort: actual first, then by opponent wins descending (easiest matchups first)
+        rows.sort(key=lambda r: (not r[0], -r[3].wins))
+
+        self._matchups_keys = [opp_key for _, opp_key, _, _ in rows]
+
+        for is_actual, _opp_key, opp_name, result in rows:
+            name_text = Text()
+            if is_actual:
+                name_text.append("ACTUAL ", style="bold on #4A7C59")
+            name_text.append(opp_name, style="bold")
+
+            if result.result == "WIN":
+                result_text = Text(" WIN ", style="bold on #2D4A2D")
+            elif result.result == "LOSS":
+                result_text = Text(" LOSS ", style="bold on #4A2D2D")
+            else:
+                result_text = Text(" TIE ", style="bold on #3A3A3A")
+
+            row: list[Text] = [
+                name_text,
+                Text(result.record_str, justify="center"),
+                result_text,
+            ]
+            for cat_name, cat_result in result.cat_results:
+                if cat_result == "w":
+                    row.append(Text(f" W ", style="bold on #2D4A2D"))
+                elif cat_result == "l":
+                    row.append(Text(f" L ", style="bold on #4A2D2D"))
+                else:
+                    row.append(Text(f" T ", style="on #3A3A3A"))
+            table.add_row(*row)
+
+    def _render_rankings_table(self, rankings: list[TeamH2HSummary],
+                               matchups: list[Matchup]) -> None:
+        self._rankings_keys = [s.team_key for s in rankings]
+        table = self.query_one("#rankings-table", DataTable)
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_columns("#", "Team", "Manager", "H2H Record", "Win %",
+                          "Actual", "Luck")
+
+        # Build actual results map
+        actual: dict[str, str] = {}
+        for m in matchups:
+            pa, pb = m.team_a.points, m.team_b.points
+            if pa > pb:
+                actual[m.team_a.team_key] = "W"
+                actual[m.team_b.team_key] = "L"
+            elif pb > pa:
+                actual[m.team_a.team_key] = "L"
+                actual[m.team_b.team_key] = "W"
+            else:
+                actual[m.team_a.team_key] = "T"
+                actual[m.team_b.team_key] = "T"
+
+        for rank, s in enumerate(rankings, 1):
+            pct = s.win_pct
+            pct_style = "bold green" if pct >= 0.6 else "bold red" if pct < 0.4 else ""
+
+            actual_result = actual.get(s.team_key, "-")
+            if actual_result == "W":
+                actual_text = Text(" W ", style="bold on #2D4A2D")
+            elif actual_result == "L":
+                actual_text = Text(" L ", style="bold on #4A2D2D")
+            else:
+                actual_text = Text(f" {actual_result} ", style="on #3A3A3A")
+
+            # Luck: if you had high win% but lost, unlucky
+            if actual_result == "W" and pct < 0.5:
+                luck = Text(" Lucky ", style="bold green")
+            elif actual_result == "L" and pct >= 0.5:
+                luck = Text(" Unlucky ", style="bold red")
+            else:
+                luck = Text("")
+
+            table.add_row(
+                Text(str(rank), justify="right"),
+                Text(s.name, style="bold"),
+                Text(s.manager, style="dim"),
+                Text(s.record_str, justify="center"),
+                Text(f"{pct:.1%}", style=pct_style, justify="right"),
+                actual_text,
+                luck,
+            )
+
+    def _render_season_rankings_table(self, rankings: list[TeamH2HSummary]) -> None:
+        self._rankings_keys = [s.team_key for s in rankings]
+        table = self.query_one("#rankings-table", DataTable)
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_columns("#", "Team", "Manager", "H2H Record", "Win %")
+
+        for rank, s in enumerate(rankings, 1):
+            pct = s.win_pct
+            pct_style = "bold green" if pct >= 0.6 else "bold red" if pct < 0.4 else ""
+            table.add_row(
+                Text(str(rank), justify="right"),
+                Text(s.name, style="bold"),
+                Text(s.manager, style="dim"),
+                Text(s.record_str, justify="center"),
+                Text(f"{pct:.1%}", style=pct_style, justify="right"),
+            )
+
+    def action_prev_week(self) -> None:
+        if self._season_mode:
+            self._season_mode = False
+        if self._week > 1:
+            self._week -= 1
+            self.run_worker(self._render_all, group="h2h-load", exclusive=True)
+
+    def action_next_week(self) -> None:
+        if self._season_mode:
+            self._season_mode = False
+        if self._week < self._max_week:
+            self._week += 1
+            self.run_worker(self._render_all, group="h2h-load", exclusive=True)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Select a manager from either table."""
+        table = event.data_table
+        row_idx = event.cursor_row
+
+        if table.id == "rankings-table" and hasattr(self, "_rankings_keys"):
+            if 0 <= row_idx < len(self._rankings_keys):
+                key = self._rankings_keys[row_idx]
+                if key in self._team_keys:
+                    self._team_idx = self._team_keys.index(key)
+                    self.run_worker(self._render_all, group="h2h-load", exclusive=True)
+        elif table.id == "matchups-table" and hasattr(self, "_matchups_keys"):
+            if 0 <= row_idx < len(self._matchups_keys):
+                key = self._matchups_keys[row_idx]
+                if key in self._team_keys:
+                    self._team_idx = self._team_keys.index(key)
+                    self.run_worker(self._render_all, group="h2h-load", exclusive=True)
+
+    def action_toggle_season(self) -> None:
+        self._season_mode = not self._season_mode
+        self.run_worker(self._render_all, group="h2h-load", exclusive=True)
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
+
+
+# --- Team Selection Modal ---
+
+
+class WeekSelectModal(Screen):
+    """Modal for selecting a scoring week."""
+    BINDINGS = [("escape", "cancel", "Cancel")]
+    CSS = """
+    WeekSelectModal {
+        align: center middle;
+    }
+    #week-select-container {
+        width: 40;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #week-select-title {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #week-select-list {
+        height: auto;
+        max-height: 70%;
+    }
+    #week-select-list > ListItem {
+        height: 1;
+        padding: 0 1;
+    }
+    #week-select-list > ListItem.--highlight {
+        background: #3A5A3A;
+    }
+    """
+
+    def __init__(self, max_week: int, current_week: int) -> None:
+        super().__init__()
+        self.max_week = max_week
+        self.current_week = current_week
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="week-select-container"):
+            yield Static("Select Week", id="week-select-title")
+            yield ListView(id="week-select-list")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#week-select-list", ListView)
+        for w in range(1, self.max_week + 1):
+            label = f"Week {w}"
+            if w == self.current_week:
+                label += "  (current)"
+            item = ListItem(Label(label))
+            item._week = w
+            lv.mount(item)
+        lv.index = self.current_week - 1
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        week = getattr(event.item, "_week", None)
+        self.dismiss(week)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class TeamSelectModal(Screen):
+    """Modal for selecting a team from a list."""
+    BINDINGS = [("escape", "cancel", "Cancel")]
+    CSS = """
+    TeamSelectModal {
+        align: center middle;
+    }
+    #team-select-container {
+        width: 50;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #team-select-title {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #team-select-list {
+        height: auto;
+        max-height: 70%;
+    }
+    #team-select-list > ListItem {
+        height: 1;
+        padding: 0 1;
+    }
+    #team-select-list > ListItem.--highlight {
+        background: #3A5A3A;
+    }
+    """
+
+    def __init__(self, options: list[tuple[str, str]]) -> None:
+        super().__init__()
+        self.options = options  # [(team_key, team_name), ...]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="team-select-container"):
+            yield Static("Select Team", id="team-select-title")
+            yield ListView(id="team-select-list")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#team-select-list", ListView)
+        for key, name in self.options:
+            item = ListItem(Label(name))
+            item._team_key = key
+            lv.mount(item)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        key = getattr(event.item, "_team_key", None)
+        self.dismiss(key)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+
+# --- Position Selection Modal ---
+
+
+class PositionSelectModal(Screen):
+    """Modal for selecting a fantasy position to browse free agents."""
+    BINDINGS = [("escape", "cancel", "Cancel")]
+    CSS = """
+    PositionSelectModal {
+        align: center middle;
+    }
+    #pos-select-container {
+        width: 40;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #pos-select-title {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #pos-select-list {
+        height: auto;
+        max-height: 70%;
+    }
+    #pos-select-list > ListItem {
+        height: 1;
+        padding: 0 1;
+    }
+    #pos-select-list > ListItem.--highlight {
+        background: #3A5A3A;
+    }
+    """
+
+    POSITIONS = [
+        ("C", "C — Catcher"),
+        ("1B", "1B — First Base"),
+        ("2B", "2B — Second Base"),
+        ("3B", "3B — Third Base"),
+        ("SS", "SS — Shortstop"),
+        ("LF", "LF — Left Field"),
+        ("CF", "CF — Center Field"),
+        ("RF", "RF — Right Field"),
+        ("SP", "SP — Starting Pitcher"),
+        ("RP", "RP — Relief Pitcher"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="pos-select-container"):
+            yield Static("Select Position", id="pos-select-title")
+            yield ListView(id="pos-select-list")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#pos-select-list", ListView)
+        for key, label in self.POSITIONS:
+            item = ListItem(Label(label))
+            item._pos_key = key
+            lv.mount(item)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        key = getattr(event.item, "_pos_key", None)
+        self.dismiss(key)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# --- Roster Analysis Screen ---
+
+
+class RosterAnalysisScreen(Screen):
+    BINDINGS = [("escape", "go_back", "Back"), ("q", "go_back", "Back"),
+                ("m", "cycle_team", "Next Team"),
+                ("1", "view_season", "Season"), ("2", "view_l14", "L14"),
+                ("3", "view_l30", "L30")]
+    CSS = """
+    #roster-header {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #roster-controls {
+        height: 1;
+        content-align: center middle;
+        background: $surface;
+        color: $text-muted;
+    }
+    #roto-rank-bar {
+        height: 2;
+        background: #2A2A2A;
+        padding: 0 1;
+    }
+    #roster-view-label {
+        height: 1;
+        content-align: center middle;
+        background: #3A4A3A;
+        color: $foreground;
+        text-style: bold;
+    }
+    #roster-loading {
+        height: 3;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    .roster-table-section {
+        height: 1;
+        content-align: left middle;
+        background: #2A2A2A;
+        color: $text-muted;
+        text-style: bold;
+        padding: 0 1;
+    }
+    #batters-table {
+        height: auto;
+        max-height: 50%;
+        background: $panel;
+    }
+    #pitchers-table {
+        height: auto;
+        max-height: 50%;
+        background: $panel;
+    }
+    #roster-loading-container {
+        height: auto;
+        content-align: center middle;
+        padding: 1 0;
+    }
+    #roster-loading-status {
+        height: 1;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    #roster-spinner {
+        height: 3;
+    }
+    #roster-scroll {
+        height: 1fr;
+    }
+    DataTable > .datatable--cursor {
+        background: #3A5A3A;
+        color: #E8E4DF;
+    }
+    """
+
+    def __init__(self, api: YahooFantasyAPI, league: League,
+                 categories: list[StatCategory]) -> None:
+        super().__init__()
+        self.api = api
+        self.league = league
+        self.categories = categories
+        self._team_keys: list[str] = []
+        self._team_names: dict[str, str] = {}
+        self._team_idx = 0
+        self._view = "season"  # "season", "l14", "l30"
+        self._all_teams: list[TeamStats] = []
+        self._draft_results: dict[str, str] = {}  # player_key -> actual cost
+        self._sgp_calc: SGPCalculator | None = None
+        self._rank_lookup: dict[str, int] = {}
+        self._preseason_rank_lookup: dict[str, int] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("", id="roster-header")
+        yield Static("", id="roster-controls")
+        yield Static("", id="roto-rank-bar")
+        yield Static("", id="roster-view-label")
+        with Vertical(id="roster-loading-container"):
+            yield LoadingIndicator(id="roster-spinner")
+            yield Static("Loading team data...", id="roster-loading-status")
+        with VerticalScroll(id="roster-scroll"):
+            yield Static(" Batters", classes="roster-table-section")
+            yield DataTable(id="batters-table")
+            yield Static(" Pitchers", classes="roster-table-section")
+            yield DataTable(id="pitchers-table")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#roster-header", Static).update(
+            f" {self.league.name} — Roster Analysis "
+        )
+        self.query_one("#roster-scroll").display = False
+        # Pre-fetch team list, then prompt user to select
+        self.run_worker(self._initial_load)
+
+    async def _show_loading(self, message: str = "Loading...") -> None:
+        import asyncio
+        container = self.query("#roster-loading-container")
+        if container:
+            container.first().display = True
+        status = self.query("#roster-loading-status")
+        if status:
+            status.first().update(message)
+        scroll = self.query("#roster-scroll")
+        if scroll:
+            scroll.first().display = False
+        # Yield to let the UI repaint before blocking work
+        await asyncio.sleep(0)
+
+    def _hide_loading(self) -> None:
+        container = self.query("#roster-loading-container")
+        if container:
+            container.first().display = False
+        scroll = self.query("#roster-scroll")
+        if scroll:
+            scroll.first().display = True
+
+    async def _initial_load(self) -> None:
+        await self._show_loading("Fetching league data...")
+        self._all_teams = self.api.get_team_season_stats(self.league.league_key)
+        self._team_keys = [t.team_key for t in self._all_teams]
+        self._team_names = {t.team_key: t.name for t in self._all_teams}
+        self._draft_results = self.api.get_draft_results(self.league.league_key)
+
+        # Fetch free agents per position for SGP replacement baselines
+        await self._show_loading("Computing SGP baselines...")
+        replacement_by_pos: dict[str, list[PlayerStats]] = {}
+        for pos in ("C", "1B", "2B", "3B", "SS", "OF", "SP", "RP"):
+            players, _ = self.api.get_free_agents(
+                self.league.league_key, stat_type="season",
+                position=pos, sort="AR", sort_type="season", count=25,
+            )
+            replacement_by_pos[pos] = players
+        self._sgp_calc = SGPCalculator(
+            self._all_teams, self.categories, replacement_by_pos,
+        )
+
+        # Build rank lookups (no status filter = all players = true overall rank)
+        await self._show_loading("Fetching Yahoo rankings...")
+        self._rank_lookup = self.api.build_rank_lookup(self.league.league_key, sort="AR")
+        await self._show_loading("Loading pre-season rankings...")
+        self._preseason_rank_lookup = self.api.get_preseason_ranks(self.league.league_key)
+
+        # Prompt user to select a team
+        options = [(k, self._team_names.get(k, k)) for k in self._team_keys]
+        self.app.push_screen(
+            TeamSelectModal(options),
+            callback=self._on_initial_team_selected,
+        )
+
+    def _on_initial_team_selected(self, team_key: str | None) -> None:
+        if team_key and team_key in self._team_keys:
+            self._team_idx = self._team_keys.index(team_key)
+            self.run_worker(self._render_roster, group="roster-load", exclusive=True)
+        elif self._team_keys:
+            # User cancelled — load first team
+            self._team_idx = 0
+            self.run_worker(self._render_roster, group="roster-load", exclusive=True)
+
+    async def _render_roster(self) -> None:
+        if not self._team_keys:
+            return
+
+        team_key = self._team_keys[self._team_idx]
+        team_name = self._team_names.get(team_key, "?")
+        week = self.league.current_week
+
+        # Show loading with team name
+        await self._show_loading(f"Loading roster for {team_name}...")
+
+        # Controls
+        ctrl = Text()
+        ctrl.append(f"[1] Season  [2] L14  [3] L30", style="dim")
+        ctrl.append(f"  |  ", style="dim")
+        ctrl.append(f"{team_name}", style=f"bold {TEAM_A_COLOR}")
+        ctrl.append(f"  ([m] select team)", style="dim")
+        self.query_one("#roster-controls", Static).update(ctrl)
+
+        # View label
+        view_labels = {"season": "SEASON", "l14": "LAST 14 DAYS", "l30": "LAST 30 DAYS"}
+        self.query_one("#roster-view-label", Static).update(
+            f" {view_labels[self._view]} STATS — {team_name} "
+        )
+
+        # Roto rank bar
+        self._render_roto_ranks(team_key)
+
+        # Fetch roster stats based on view
+        await self._show_loading(f"Fetching {view_labels[self._view].lower()} stats for {team_name}...")
+        if self._view == "l14":
+            players = self.api.get_roster_stats_last7(team_key, week)
+        elif self._view == "l30":
+            players = self.api.get_roster_stats_last30(team_key, week)
+        else:
+            players = self.api.get_roster_stats_season(team_key, week)
+
+        scored = [c for c in self.categories if not c.is_only_display]
+        batting_cats = [c for c in scored if c.position_type == "B"]
+        pitching_cats = [c for c in scored if c.position_type == "P"]
+
+        batting_positions = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF",
+                             "OF", "Util", "DH", "IF", "BN"}
+        batters = [p for p in players if
+                   any(pos in batting_positions for pos in p.position.split(","))]
+        pitchers = [p for p in players if p not in batters]
+
+        await self._show_loading(f"Loading Statcast data from Baseball Savant...")
+
+        # Pre-fetch statcast data so we can merge it into the main tables
+        batter_statcast: dict[str, StatcastBatter] = {}
+        for p in batters:
+            mlbam_id = lookup_mlbam_id(p.name)
+            if mlbam_id is not None:
+                sc = get_batter_statcast(mlbam_id)
+                if sc is not None:
+                    batter_statcast[p.name] = sc
+
+        pitcher_statcast: dict[str, StatcastPitcher] = {}
+        for p in pitchers:
+            mlbam_id = lookup_mlbam_id(p.name)
+            if mlbam_id is not None:
+                sc = get_pitcher_statcast(mlbam_id)
+                if sc is not None:
+                    pitcher_statcast[p.name] = sc
+
+        await self._show_loading(f"Rendering roster tables...")
+
+        def _f(v: float | None, fmt: str = ".1f") -> str:
+            return f"{v:{fmt}}" if v is not None else "-"
+
+        def _rate(v: float | None) -> str:
+            return f"{v:.1f}" if v is not None else "-"
+
+        # --- Batters table (league stats + statcast) ---
+        bat_table = self.query_one("#batters-table", DataTable)
+        bat_table.clear(columns=True)
+        bat_table.cursor_type = "row"
+        bat_table.zebra_stripes = True
+        bat_cols: list[str] = ["Player", "Pos".ljust(15), "Team", "Paid", "Avg$", "SGP", "Y!", "Pre"]
+        for cat in batting_cats:
+            bat_cols.append(cat.display_name)
+        bat_cols.append("│")  # visual divider between league and statcast
+        bat_cols.extend([
+            "EV", "MaxEV", "LA", "Barrel%", "HardHit%",
+            "K%", "BB%", "Whiff%", "xBA", "xSLG", "xwOBA",
+        ])
+        bat_table.add_columns(*bat_cols)
+        for p in batters:
+            actual_cost = self._draft_results.get(p.player_key, "")
+            sgp_val = self._sgp_calc.player_sgp(p) if self._sgp_calc else None
+            if sgp_val is not None:
+                sgp_style = "bold green" if sgp_val > 0 else "bold red" if sgp_val < 0 else ""
+                sgp_text = Text(f"{sgp_val:+.1f}", style=sgp_style, justify="right")
+            else:
+                sgp_text = Text("N/A", style="dim", justify="right")
+            y_rank = self._rank_lookup.get(p.player_key)
+            pre_rank = self._preseason_rank_lookup.get(p.player_key)
+            row: list[Text] = [
+                Text(p.name[:20].ljust(20), style="bold"),
+                Text(p.position.ljust(15), style="dim"),
+                Text(p.team_abbr, style="dim"),
+                Text(f"${actual_cost}" if actual_cost else "-",
+                     justify="right"),
+                Text(f"${p.draft_cost}" if p.draft_cost else "-", style="dim",
+                     justify="right"),
+                sgp_text,
+                Text(str(y_rank) if y_rank else "-", style="dim", justify="right"),
+                Text(str(pre_rank) if pre_rank else "-", style="dim", justify="right"),
+            ]
+            for cat in batting_cats:
+                row.append(Text(p.stats.get(cat.stat_id, "-"), justify="right"))
+            # Divider
+            row.append(Text("│", style="dim"))
+            # Statcast columns
+            sc = batter_statcast.get(p.name)
+            if sc:
+                row.extend([
+                    Text(_f(sc.avg_exit_velo), justify="right"),
+                    Text(_f(sc.max_exit_velo), justify="right"),
+                    Text(_f(sc.avg_launch_angle), justify="right"),
+                    Text(_f(sc.barrel_pct), justify="right"),
+                    Text(_f(sc.hard_hit_pct), justify="right"),
+                    Text(_rate(sc.k_pct), justify="right"),
+                    Text(_rate(sc.bb_pct), justify="right"),
+                    Text(_rate(sc.whiff_pct), justify="right"),
+                    Text(_f(sc.xba, ".3f"), justify="right"),
+                    Text(_f(sc.xslg, ".3f"), justify="right"),
+                    Text(_f(sc.xwoba, ".3f"), justify="right"),
+                ])
+            else:
+                row.extend([Text("-", style="dim", justify="right")] * 11)
+            bat_table.add_row(*row)
+
+        # --- Pitchers table (league stats + statcast) ---
+        pitch_table = self.query_one("#pitchers-table", DataTable)
+        pitch_table.clear(columns=True)
+        pitch_table.cursor_type = "row"
+        pitch_table.zebra_stripes = True
+        pitch_cols: list[str] = ["Player", "Pos".ljust(15), "Team", "Paid", "Avg$", "SGP", "Y!", "Pre"]
+        for cat in pitching_cats:
+            pitch_cols.append(cat.display_name)
+        pitch_cols.append("│")  # visual divider
+        pitch_cols.extend([
+            "EV Alw", "Barrel%", "HardHit%",
+            "xBA", "xSLG", "xwOBA", "xERA",
+            "K%p", "BB%p", "Whiff%p",
+        ])
+        pitch_table.add_columns(*pitch_cols)
+        for p in pitchers:
+            actual_cost = self._draft_results.get(p.player_key, "")
+            sgp_val = self._sgp_calc.player_sgp(p) if self._sgp_calc else None
+            if sgp_val is not None:
+                sgp_style = "bold green" if sgp_val > 0 else "bold red" if sgp_val < 0 else ""
+                sgp_text = Text(f"{sgp_val:+.1f}", style=sgp_style, justify="right")
+            else:
+                sgp_text = Text("N/A", style="dim", justify="right")
+            y_rank = self._rank_lookup.get(p.player_key)
+            pre_rank = self._preseason_rank_lookup.get(p.player_key)
+            row = [
+                Text(p.name[:20].ljust(20), style="bold"),
+                Text(p.position.ljust(15), style="dim"),
+                Text(p.team_abbr, style="dim"),
+                Text(f"${actual_cost}" if actual_cost else "-",
+                     justify="right"),
+                Text(f"${p.draft_cost}" if p.draft_cost else "-", style="dim",
+                     justify="right"),
+                sgp_text,
+                Text(str(y_rank) if y_rank else "-", style="dim", justify="right"),
+                Text(str(pre_rank) if pre_rank else "-", style="dim", justify="right"),
+            ]
+            for cat in pitching_cats:
+                row.append(Text(p.stats.get(cat.stat_id, "-"), justify="right"))
+            # Divider
+            row.append(Text("│", style="dim"))
+            # Statcast columns
+            sc = pitcher_statcast.get(p.name)
+            if sc:
+                row.extend([
+                    Text(_f(sc.avg_exit_velo), justify="right"),
+                    Text(_f(sc.barrel_pct), justify="right"),
+                    Text(_f(sc.hard_hit_pct), justify="right"),
+                    Text(_f(sc.xba, ".3f"), justify="right"),
+                    Text(_f(sc.xslg, ".3f"), justify="right"),
+                    Text(_f(sc.xwoba, ".3f"), justify="right"),
+                    Text(_f(sc.xera, ".2f"), justify="right"),
+                    Text(_rate(sc.k_pct), justify="right"),
+                    Text(_rate(sc.bb_pct), justify="right"),
+                    Text(_rate(sc.whiff_pct), justify="right"),
+                ])
+            else:
+                row.extend([Text("-", style="dim", justify="right")] * 10)
+            pitch_table.add_row(*row)
+
+        self._hide_loading()
+
+    def _render_roto_ranks(self, team_key: str) -> None:
+        """Show roto ranking for the selected team in each scored category."""
+        scored = [c for c in self.categories if not c.is_only_display]
+        num_teams = len(self._all_teams)
+        team = next((t for t in self._all_teams if t.team_key == team_key), None)
+        if not team:
+            return
+
+        rank_text = Text()
+        rank_text.append(" Roto Rank:  ", style="bold")
+
+        for cat in scored:
+            # Rank this team in this category
+            vals = []
+            for t in self._all_teams:
+                try:
+                    vals.append((t.team_key, float(t.stats.get(cat.stat_id, "0"))))
+                except ValueError:
+                    vals.append((t.team_key, 0.0))
+
+            higher_is_better = cat.sort_order == "1"
+            vals.sort(key=lambda x: x[1], reverse=higher_is_better)
+            rank = next((i + 1 for i, (k, _) in enumerate(vals) if k == team_key), 0)
+
+            # Color based on rank
+            if rank <= num_teams * 0.25:
+                style = "bold green"
+            elif rank <= num_teams * 0.5:
+                style = "bold"
+            elif rank <= num_teams * 0.75:
+                style = "bold yellow"
+            else:
+                style = "bold red"
+
+            rank_text.append(f" {cat.display_name}:", style="dim")
+            rank_text.append(f"{rank}", style=style)
+
+        self.query_one("#roto-rank-bar", Static).update(rank_text)
+
+    def action_cycle_team(self) -> None:
+        """Open a team selection modal."""
+        if not self._team_keys:
+            return
+        options = [(k, self._team_names.get(k, k)) for k in self._team_keys]
+        self.app.push_screen(
+            TeamSelectModal(options),
+            callback=self._on_team_selected,
+        )
+
+    def _on_team_selected(self, team_key: str | None) -> None:
+        if team_key and team_key in self._team_keys:
+            self._team_idx = self._team_keys.index(team_key)
+            self.run_worker(self._render_roster, group="roster-load", exclusive=True)
+
+    def action_view_season(self) -> None:
+        self._view = "season"
+        self.run_worker(self._render_roster, group="roster-load", exclusive=True)
+
+    def action_view_l14(self) -> None:
+        self._view = "l14"
+        self.run_worker(self._render_roster, group="roster-load", exclusive=True)
+
+    def action_view_l30(self) -> None:
+        self._view = "l30"
+        self.run_worker(self._render_roster, group="roster-load", exclusive=True)
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
+
+
+# --- Free Agent Browser Screen ---
+
+
+class FreeAgentScreen(Screen):
+    BINDINGS = [
+        ("escape", "go_back", "Back"),
+        ("q", "go_back", "Back"),
+        ("1", "view_season", "Season"),
+        ("2", "view_last7", "Last 7"),
+        ("3", "view_last30", "Last 30"),
+        ("p", "select_position", "Position"),
+        ("a", "view_all", "All"),
+        ("slash", "focus_search", "Search"),
+        ("right", "next_page", "Next Page"),
+        ("left", "prev_page", "Prev Page"),
+    ]
+    CSS = """
+    #fa-header {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #fa-controls {
+        height: 1;
+        content-align: center middle;
+        background: $surface;
+        color: $text-muted;
+    }
+    #fa-view-label {
+        height: 1;
+        content-align: center middle;
+        background: #3A4A3A;
+        color: $foreground;
+        text-style: bold;
+    }
+    #fa-search {
+        height: 3;
+        display: none;
+        margin: 0 1;
+    }
+    #fa-loading-container {
+        height: auto;
+        content-align: center middle;
+        padding: 1 0;
+    }
+    #fa-loading-status {
+        height: 1;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    #fa-spinner {
+        height: 3;
+    }
+    #fa-scroll {
+        height: 1fr;
+    }
+    #fa-pagination {
+        height: 1;
+        content-align: center middle;
+        background: $surface;
+        color: $text-muted;
+    }
+    .roster-table-section {
+        height: 1;
+        content-align: left middle;
+        background: #2A2A2A;
+        color: $text-muted;
+        text-style: bold;
+        padding: 0 1;
+    }
+    DataTable > .datatable--cursor {
+        background: #3A5A3A;
+        color: #E8E4DF;
+    }
+    #fa-batters-table, #fa-pitchers-table {
+        height: auto;
+        max-height: 50%;
+        background: $panel;
+    }
+    .fa-pos-table {
+        height: auto;
+        max-height: 30%;
+        background: $panel;
+    }
+    """
+
+    STAT_TYPES = {
+        "season": ("Season", "SEASON STATS"),
+        "lastweek": ("Last 7", "LAST 7 DAYS"),
+        "lastmonth": ("Last 30", "LAST 30 DAYS"),
+    }
+
+    def __init__(self, api: YahooFantasyAPI, league: League,
+                 categories: list[StatCategory]) -> None:
+        super().__init__()
+        self.api = api
+        self.league = league
+        self.categories = categories
+        self._stat_type = "season"
+        self._position: str | None = None
+        self._search: str | None = None
+        self._page_start = 0
+        self._page_size = 25
+        self._current_players: list[PlayerStats] = []
+        self._has_next_page = False
+        self._draft_results: dict[str, str] = {}
+        self._sgp_calc: SGPCalculator | None = None
+        self._baselines_loaded = False
+        self._rank_lookup: dict[str, int] = {}
+        self._preseason_rank_lookup: dict[str, int] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("", id="fa-header")
+        yield Static("", id="fa-controls")
+        yield Static("", id="fa-view-label")
+        yield Input(placeholder="Search player name... (Enter to search, Escape to cancel)", id="fa-search")
+        with Vertical(id="fa-loading-container"):
+            yield LoadingIndicator(id="fa-spinner")
+            yield Static("Loading free agents...", id="fa-loading-status")
+        yield VerticalScroll(id="fa-scroll")
+        yield Static("", id="fa-pagination")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#fa-header", Static).update(
+            f" {self.league.name} — Free Agents "
+        )
+        self.query_one("#fa-scroll").display = False
+        self.query_one("#fa-pagination").display = False
+        self._update_controls()
+        self.run_worker(self._initial_load)
+
+    # --- Loading helpers ---
+
+    async def _show_loading(self, message: str = "Loading...") -> None:
+        import asyncio
+        container = self.query("#fa-loading-container")
+        if container:
+            container.first().display = True
+        status = self.query("#fa-loading-status")
+        if status:
+            status.first().update(message)
+        scroll = self.query("#fa-scroll")
+        if scroll:
+            scroll.first().display = False
+        await asyncio.sleep(0)
+
+    def _hide_loading(self) -> None:
+        container = self.query("#fa-loading-container")
+        if container:
+            container.first().display = False
+        scroll = self.query("#fa-scroll")
+        if scroll:
+            scroll.first().display = True
+        pagination = self.query("#fa-pagination")
+        if pagination:
+            pagination.first().display = True
+
+    # --- Controls and labels ---
+
+    def _update_controls(self) -> None:
+        ctrl = Text()
+        for key, (label, _) in self.STAT_TYPES.items():
+            num = {"season": "1", "lastweek": "2", "lastmonth": "3"}[key]
+            if key == self._stat_type:
+                ctrl.append(f" [{num}] {label} ", style="bold on #4A7C59")
+            else:
+                ctrl.append(f" [{num}] {label} ", style="dim")
+
+        ctrl.append("  |  ", style="dim")
+        pos_label = self._position or "ALL"
+        ctrl.append("Pos: ", style="dim")
+        ctrl.append(pos_label, style="bold")
+        ctrl.append(" [p]", style="dim")
+
+        ctrl.append("  |  ", style="dim")
+        if self._search:
+            ctrl.append(f'Search: "{self._search}"', style="bold")
+            ctrl.append(" [/]", style="dim")
+        else:
+            ctrl.append("[/] Search", style="dim")
+
+        self.query_one("#fa-controls", Static).update(ctrl)
+
+    def _update_view_label(self) -> None:
+        _, desc = self.STAT_TYPES[self._stat_type]
+        pos_label = self._position or "ALL POSITIONS"
+        label = f" {desc} — {pos_label} "
+        if self._search:
+            label = f' {desc} — Search: "{self._search}" '
+        self.query_one("#fa-view-label", Static).update(label)
+
+    def _update_pagination(self) -> None:
+        is_default = self._position is None and self._search is None
+        pag = Text()
+        if is_default:
+            pag.append("  Top 15 overall + Top 5 per position  ", style="dim")
+            pag.append("  [p] Filter by position  [/] Search", style="dim")
+        else:
+            page_num = (self._page_start // self._page_size) + 1
+            range_start = self._page_start + 1
+            range_end = self._page_start + len(self._current_players)
+            if self._page_start > 0:
+                pag.append(" \u2190 Prev ", style="bold")
+            pag.append(f"  Page {page_num}  ({range_start}-{range_end})", style="bold")
+            if self._has_next_page:
+                pag.append("  Next \u2192 ", style="bold")
+            if not self._has_next_page and self._page_start == 0:
+                pag.append(f"  ({len(self._current_players)} results)", style="dim")
+        self.query_one("#fa-pagination", Static).update(pag)
+
+    # --- Data loading ---
+
+    async def _initial_load(self) -> None:
+        """One-time setup: fetch league data, draft results, and SGP baselines."""
+        await self._show_loading("Fetching league data for SGP baselines...")
+        all_teams = self.api.get_team_season_stats(self.league.league_key)
+        self._draft_results = self.api.get_draft_results(self.league.league_key)
+
+        await self._show_loading("Computing SGP baselines...")
+        replacement_by_pos: dict[str, list[PlayerStats]] = {}
+        for pos in ("C", "1B", "2B", "3B", "SS", "OF", "SP", "RP"):
+            players, _ = self.api.get_free_agents(
+                self.league.league_key, stat_type="season",
+                position=pos, sort="AR", sort_type="season", count=25,
+            )
+            replacement_by_pos[pos] = players
+        self._sgp_calc = SGPCalculator(
+            all_teams, self.categories, replacement_by_pos,
+        )
+        self._baselines_loaded = True
+
+        # Build rank lookups (no status filter = all players = true overall rank)
+        await self._show_loading("Fetching Yahoo rankings...")
+        self._rank_lookup = self.api.build_rank_lookup(self.league.league_key, sort="AR")
+        await self._show_loading("Loading pre-season rankings...")
+        self._preseason_rank_lookup = self.api.get_preseason_ranks(self.league.league_key)
+
+        # Now load the first page of free agents
+        await self._load_free_agents()
+
+    def _is_batter(self, p: PlayerStats) -> bool:
+        batting_positions = {
+            "C", "1B", "2B", "3B", "SS", "LF", "CF", "RF",
+            "OF", "Util", "DH", "IF", "BN",
+        }
+        return any(pos in batting_positions for pos in p.position.split(","))
+
+    def _fetch_statcast(
+        self, players: list[PlayerStats],
+    ) -> tuple[dict[str, StatcastBatter], dict[str, StatcastPitcher]]:
+        batter_sc: dict[str, StatcastBatter] = {}
+        pitcher_sc: dict[str, StatcastPitcher] = {}
+        for p in players:
+            mlbam_id = lookup_mlbam_id(p.name)
+            if mlbam_id is None:
+                continue
+            if self._is_batter(p):
+                sc = get_batter_statcast(mlbam_id)
+                if sc is not None:
+                    batter_sc[p.name] = sc
+            else:
+                sc = get_pitcher_statcast(mlbam_id)
+                if sc is not None:
+                    pitcher_sc[p.name] = sc
+        return batter_sc, pitcher_sc
+
+    async def _load_free_agents(self) -> None:
+        _, desc = self.STAT_TYPES[self._stat_type]
+
+        # Clear the scroll container
+        scroll = self.query_one("#fa-scroll", VerticalScroll)
+        await scroll.remove_children()
+
+        is_default_view = self._position is None and self._search is None
+
+        if is_default_view:
+            await self._load_default_view(desc)
+        else:
+            await self._load_filtered_view(desc)
+
+        self._update_controls()
+        self._update_view_label()
+        self._update_pagination()
+        self._hide_loading()
+
+    async def _load_default_view(self, desc: str) -> None:
+        """Default view: top 15 overall + top 5 per position."""
+        scroll = self.query_one("#fa-scroll", VerticalScroll)
+
+        # Fetch top 15 overall (mixed batters and pitchers)
+        await self._show_loading(f"Fetching top free agents ({desc.lower()})...")
+        top_players, _ = self.api.get_free_agents(
+            self.league.league_key,
+            stat_type=self._stat_type,
+            sort="AR", sort_type=self._stat_type,
+            count=15,
+        )
+        self._current_players = top_players
+        self._has_next_page = False  # no pagination in default view
+
+        # Fetch top 5 per position
+        bat_positions = ["C", "1B", "2B", "3B", "SS", "LF", "CF", "RF"]
+        pitch_positions = ["SP", "RP"]
+        pos_players: dict[str, list[PlayerStats]] = {}
+        for pos in bat_positions + pitch_positions:
+            await self._show_loading(f"Fetching top {pos} free agents...")
+            players, _ = self.api.get_free_agents(
+                self.league.league_key,
+                stat_type=self._stat_type,
+                position=pos, sort="AR", sort_type=self._stat_type,
+                count=5,
+            )
+            pos_players[pos] = players
+
+        # Collect all unique players for statcast lookup
+        all_players_set: dict[str, PlayerStats] = {}
+        for p in top_players:
+            all_players_set[p.player_key] = p
+        for plist in pos_players.values():
+            for p in plist:
+                all_players_set[p.player_key] = p
+
+        await self._show_loading("Loading Statcast data from Baseball Savant...")
+        batter_sc, pitcher_sc = self._fetch_statcast(list(all_players_set.values()))
+
+        await self._show_loading("Rendering tables...")
+
+        # --- Top 15 overall: single unified table ---
+        if top_players:
+            label = Static(" Top 15 Free Agents", classes="roster-table-section")
+            table = DataTable(id="fa-top-table")
+            await scroll.mount(label, table)
+            self._populate_overview_table(table, top_players)
+
+        # --- Per-position batter tables ---
+        for pos in bat_positions:
+            players = pos_players.get(pos, [])
+            if not players:
+                continue
+            label = Static(f" Top {pos}", classes="roster-table-section")
+            table = DataTable(classes="fa-pos-table")
+            await scroll.mount(label, table)
+            self._populate_batter_table(table, players, batter_sc)
+
+        # --- Per-position pitcher tables ---
+        for pos in pitch_positions:
+            players = pos_players.get(pos, [])
+            if not players:
+                continue
+            label = Static(f" Top {pos}", classes="roster-table-section")
+            table = DataTable(classes="fa-pos-table")
+            await scroll.mount(label, table)
+            self._populate_pitcher_table(table, players, pitcher_sc)
+
+    async def _load_filtered_view(self, desc: str) -> None:
+        """Position-filtered or search view with pagination."""
+        scroll = self.query_one("#fa-scroll", VerticalScroll)
+
+        await self._show_loading(f"Fetching free agents ({desc.lower()})...")
+        players, total = self.api.get_free_agents(
+            self.league.league_key,
+            stat_type=self._stat_type,
+            position=self._position,
+            search=self._search,
+            sort="AR",
+            sort_type=self._stat_type,
+            start=self._page_start,
+            count=self._page_size,
+        )
+        self._current_players = players
+        self._has_next_page = len(players) == self._page_size
+
+        batters = [p for p in players if self._is_batter(p)]
+        pitchers = [p for p in players if not self._is_batter(p)]
+
+        await self._show_loading("Loading Statcast data from Baseball Savant...")
+        batter_sc, pitcher_sc = self._fetch_statcast(players)
+
+        await self._show_loading("Rendering tables...")
+
+        if batters:
+            label = Static(" Batters", classes="roster-table-section")
+            table = DataTable(id="fa-batters-table")
+            await scroll.mount(label, table)
+            self._populate_batter_table(table, batters, batter_sc)
+
+        if pitchers:
+            label = Static(" Pitchers", classes="roster-table-section")
+            table = DataTable(id="fa-pitchers-table")
+            await scroll.mount(label, table)
+            self._populate_pitcher_table(table, pitchers, pitcher_sc)
+
+    # --- Table rendering ---
+
+    def _populate_overview_table(
+        self,
+        table: DataTable,
+        players: list[PlayerStats],
+    ) -> None:
+        """Compact overview table for the top-15 mixed batter/pitcher list."""
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_columns("Player", "Pos".ljust(15), "Team", "Avg$", "SGP", "Y!", "Pre")
+
+        for p in players:
+            sgp_val = self._sgp_calc.player_sgp(p) if self._sgp_calc else None
+            if sgp_val is not None:
+                sgp_style = "bold green" if sgp_val > 0 else "bold red" if sgp_val < 0 else ""
+                sgp_text = Text(f"{sgp_val:+.1f}", style=sgp_style, justify="right")
+            else:
+                sgp_text = Text("N/A", style="dim", justify="right")
+            y_rank = self._rank_lookup.get(p.player_key)
+            pre_rank = self._preseason_rank_lookup.get(p.player_key)
+            table.add_row(
+                Text(p.name[:20].ljust(20), style="bold"),
+                Text(p.position.ljust(15), style="dim"),
+                Text(p.team_abbr, style="dim"),
+                Text(f"${p.draft_cost}" if p.draft_cost else "-", style="dim",
+                     justify="right"),
+                sgp_text,
+                Text(str(y_rank) if y_rank else "-", style="dim", justify="right"),
+                Text(str(pre_rank) if pre_rank else "-", style="dim", justify="right"),
+            )
+
+    def _populate_batter_table(
+        self,
+        table: DataTable,
+        batters: list[PlayerStats],
+        batter_statcast: dict[str, StatcastBatter],
+    ) -> None:
+        scored = [c for c in self.categories if not c.is_only_display]
+        batting_cats = [c for c in scored if c.position_type == "B"]
+
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        cols: list[str] = ["Player", "Pos".ljust(15), "Team", "Avg$", "SGP", "Y!", "Pre"]
+        for cat in batting_cats:
+            cols.append(cat.display_name)
+        cols.append("│")
+        cols.extend([
+            "EV", "MaxEV", "LA", "Barrel%", "HardHit%",
+            "K%", "BB%", "Whiff%", "xBA", "xSLG", "xwOBA",
+        ])
+        table.add_columns(*cols)
+
+        def _f(v: float | None, fmt: str = ".1f") -> str:
+            return f"{v:{fmt}}" if v is not None else "-"
+
+        def _rate(v: float | None) -> str:
+            return f"{v:.1f}" if v is not None else "-"
+
+        for p in batters:
+            sgp_val = self._sgp_calc.player_sgp(p) if self._sgp_calc else None
+            if sgp_val is not None:
+                sgp_style = "bold green" if sgp_val > 0 else "bold red" if sgp_val < 0 else ""
+                sgp_text = Text(f"{sgp_val:+.1f}", style=sgp_style, justify="right")
+            else:
+                sgp_text = Text("N/A", style="dim", justify="right")
+            y_rank = self._rank_lookup.get(p.player_key)
+            pre_rank = self._preseason_rank_lookup.get(p.player_key)
+            row: list[Text] = [
+                Text(p.name[:20].ljust(20), style="bold"),
+                Text(p.position.ljust(15), style="dim"),
+                Text(p.team_abbr, style="dim"),
+                Text(f"${p.draft_cost}" if p.draft_cost else "-", style="dim",
+                     justify="right"),
+                sgp_text,
+                Text(str(y_rank) if y_rank else "-", style="dim", justify="right"),
+                Text(str(pre_rank) if pre_rank else "-", style="dim", justify="right"),
+            ]
+            for cat in batting_cats:
+                row.append(Text(p.stats.get(cat.stat_id, "-"), justify="right"))
+            # Divider
+            row.append(Text("│", style="dim"))
+            # Statcast columns
+            sc = batter_statcast.get(p.name)
+            if sc:
+                row.extend([
+                    Text(_f(sc.avg_exit_velo), justify="right"),
+                    Text(_f(sc.max_exit_velo), justify="right"),
+                    Text(_f(sc.avg_launch_angle), justify="right"),
+                    Text(_f(sc.barrel_pct), justify="right"),
+                    Text(_f(sc.hard_hit_pct), justify="right"),
+                    Text(_rate(sc.k_pct), justify="right"),
+                    Text(_rate(sc.bb_pct), justify="right"),
+                    Text(_rate(sc.whiff_pct), justify="right"),
+                    Text(_f(sc.xba, ".3f"), justify="right"),
+                    Text(_f(sc.xslg, ".3f"), justify="right"),
+                    Text(_f(sc.xwoba, ".3f"), justify="right"),
+                ])
+            else:
+                row.extend([Text("-", style="dim", justify="right")] * 11)
+            table.add_row(*row)
+
+    def _populate_pitcher_table(
+        self,
+        table: DataTable,
+        pitchers: list[PlayerStats],
+        pitcher_statcast: dict[str, StatcastPitcher],
+    ) -> None:
+        scored = [c for c in self.categories if not c.is_only_display]
+        pitching_cats = [c for c in scored if c.position_type == "P"]
+
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        cols: list[str] = ["Player", "Pos".ljust(15), "Team", "Avg$", "SGP", "Y!", "Pre"]
+        for cat in pitching_cats:
+            cols.append(cat.display_name)
+        cols.append("│")
+        cols.extend([
+            "EV Alw", "Barrel%", "HardHit%",
+            "xBA", "xSLG", "xwOBA", "xERA",
+            "K%p", "BB%p", "Whiff%p",
+        ])
+        table.add_columns(*cols)
+
+        def _f(v: float | None, fmt: str = ".1f") -> str:
+            return f"{v:{fmt}}" if v is not None else "-"
+
+        def _rate(v: float | None) -> str:
+            return f"{v:.1f}" if v is not None else "-"
+
+        for p in pitchers:
+            sgp_val = self._sgp_calc.player_sgp(p) if self._sgp_calc else None
+            if sgp_val is not None:
+                sgp_style = "bold green" if sgp_val > 0 else "bold red" if sgp_val < 0 else ""
+                sgp_text = Text(f"{sgp_val:+.1f}", style=sgp_style, justify="right")
+            else:
+                sgp_text = Text("N/A", style="dim", justify="right")
+            y_rank = self._rank_lookup.get(p.player_key)
+            pre_rank = self._preseason_rank_lookup.get(p.player_key)
+            row: list[Text] = [
+                Text(p.name[:20].ljust(20), style="bold"),
+                Text(p.position.ljust(15), style="dim"),
+                Text(p.team_abbr, style="dim"),
+                Text(f"${p.draft_cost}" if p.draft_cost else "-", style="dim",
+                     justify="right"),
+                sgp_text,
+                Text(str(y_rank) if y_rank else "-", style="dim", justify="right"),
+                Text(str(pre_rank) if pre_rank else "-", style="dim", justify="right"),
+            ]
+            for cat in pitching_cats:
+                row.append(Text(p.stats.get(cat.stat_id, "-"), justify="right"))
+            # Divider
+            row.append(Text("│", style="dim"))
+            # Statcast columns
+            sc = pitcher_statcast.get(p.name)
+            if sc:
+                row.extend([
+                    Text(_f(sc.avg_exit_velo), justify="right"),
+                    Text(_f(sc.barrel_pct), justify="right"),
+                    Text(_f(sc.hard_hit_pct), justify="right"),
+                    Text(_f(sc.xba, ".3f"), justify="right"),
+                    Text(_f(sc.xslg, ".3f"), justify="right"),
+                    Text(_f(sc.xwoba, ".3f"), justify="right"),
+                    Text(_f(sc.xera, ".2f"), justify="right"),
+                    Text(_rate(sc.k_pct), justify="right"),
+                    Text(_rate(sc.bb_pct), justify="right"),
+                    Text(_rate(sc.whiff_pct), justify="right"),
+                ])
+            else:
+                row.extend([Text("-", style="dim", justify="right")] * 10)
+            table.add_row(*row)
+
+    # --- Actions ---
+
+    def action_view_season(self) -> None:
+        self._stat_type = "season"
+        self._page_start = 0
+        self.run_worker(self._load_free_agents, group="fa-load", exclusive=True)
+
+    def action_view_last7(self) -> None:
+        self._stat_type = "lastweek"
+        self._page_start = 0
+        self.run_worker(self._load_free_agents, group="fa-load", exclusive=True)
+
+    def action_view_last30(self) -> None:
+        self._stat_type = "lastmonth"
+        self._page_start = 0
+        self.run_worker(self._load_free_agents, group="fa-load", exclusive=True)
+
+    def action_view_all(self) -> None:
+        self._position = None
+        self._search = None
+        self._page_start = 0
+        search_input = self.query_one("#fa-search", Input)
+        search_input.value = ""
+        search_input.display = False
+        self.run_worker(self._load_free_agents, group="fa-load", exclusive=True)
+
+    def action_select_position(self) -> None:
+        self.app.push_screen(
+            PositionSelectModal(),
+            callback=self._on_position_selected,
+        )
+
+    def _on_position_selected(self, position: str | None) -> None:
+        if position is None:
+            return
+        self._position = position
+        self._page_start = 0
+        self._search = None
+        search_input = self.query_one("#fa-search", Input)
+        search_input.value = ""
+        search_input.display = False
+        self.run_worker(self._load_free_agents, group="fa-load", exclusive=True)
+
+    def action_focus_search(self) -> None:
+        search_input = self.query_one("#fa-search", Input)
+        search_input.display = True
+        search_input.focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        query = event.value.strip()
+        if query:
+            self._search = query
+            self._position = None
+        else:
+            self._search = None
+        self._page_start = 0
+        event.input.display = False
+        self.set_focus(None)
+        self.run_worker(self._load_free_agents, group="fa-load", exclusive=True)
+
+    def on_key(self, event) -> None:
+        search_input = self.query_one("#fa-search", Input)
+        if search_input.has_focus and event.key == "escape":
+            search_input.value = ""
+            search_input.display = False
+            self.set_focus(None)
+            event.prevent_default()
+
+    def action_next_page(self) -> None:
+        if self._has_next_page:
+            self._page_start += self._page_size
+            self.run_worker(self._load_free_agents, group="fa-load", exclusive=True)
+
+    def action_prev_page(self) -> None:
+        if self._page_start > 0:
+            self._page_start = max(0, self._page_start - self._page_size)
+            self.run_worker(self._load_free_agents, group="fa-load", exclusive=True)
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
+
+
+# --- Transactions Screen ---
+
+
+class TransactionsScreen(Screen):
+    BINDINGS = [
+        ("escape", "go_back", "Back"),
+        ("q", "go_back", "Back"),
+    ]
+    CSS = """
+    #tx-header {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #tx-loading-container {
+        height: auto;
+        content-align: center middle;
+        padding: 1 0;
+    }
+    #tx-loading-status {
+        height: 1;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    #tx-spinner {
+        height: 3;
+    }
+    #tx-scroll {
+        height: 1fr;
+    }
+    .tx-section-header {
+        height: 1;
+        content-align: left middle;
+        background: #2A2A2A;
+        color: $text-muted;
+        text-style: bold;
+        padding: 0 1;
+    }
+    .tx-table {
+        height: auto;
+        max-height: 40%;
+        background: $panel;
+    }
+    DataTable > .datatable--cursor {
+        background: #3A5A3A;
+        color: #E8E4DF;
+    }
+    """
+
+    def __init__(self, api: YahooFantasyAPI, league: League,
+                 categories: list[StatCategory]) -> None:
+        super().__init__()
+        self.api = api
+        self.league = league
+        self.categories = categories
+        self._transactions: list[Transaction] = []
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("", id="tx-header")
+        with Vertical(id="tx-loading-container"):
+            yield LoadingIndicator(id="tx-spinner")
+            yield Static("Loading transactions...", id="tx-loading-status")
+        yield VerticalScroll(id="tx-scroll")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        header = self.query_one("#tx-header", Static)
+        header.update(f" {self.league.name} — League Transactions ")
+        self.run_worker(self._load)
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
+
+    async def _show_loading(self, msg: str) -> None:
+        try:
+            self.query_one("#tx-loading-status", Static).update(msg)
+            container = self.query_one("#tx-loading-container")
+            container.display = True
+            scroll = self.query_one("#tx-scroll")
+            scroll.display = False
+        except Exception:
+            pass
+
+    def _hide_loading(self) -> None:
+        try:
+            container = self.query_one("#tx-loading-container")
+            container.display = False
+            scroll = self.query_one("#tx-scroll")
+            scroll.display = True
+        except Exception:
+            pass
+
+    async def _load(self) -> None:
+        await self._show_loading("Fetching league transactions...")
+        self._transactions = self.api.get_transactions(
+            self.league.league_key, count=100,
+        )
+
+        scroll = self.query_one("#tx-scroll", VerticalScroll)
+        await scroll.remove_children()
+
+        await self._show_loading("Rendering transactions...")
+
+        # --- Section 1: 10 Most Recent Transactions ---
+        label = Static(" 10 Most Recent Transactions", classes="tx-section-header")
+        table = DataTable(classes="tx-table")
+        await scroll.mount(label, table)
+        self._render_recent_transactions(table)
+
+        # --- Section 2: Top 10 Most-Added Players ---
+        label2 = Static(" Top 10 Most-Added Players", classes="tx-section-header")
+        table2 = DataTable(classes="tx-table")
+        await scroll.mount(label2, table2)
+        self._render_most_added(table2)
+
+        # --- Section 3: Adds by Position per Team ---
+        label3 = Static(" Adds by Position per Team", classes="tx-section-header")
+        table3 = DataTable(classes="tx-table")
+        await scroll.mount(label3, table3)
+        self._render_position_adds(table3)
+
+        self._hide_loading()
+
+    def _render_recent_transactions(self, table: DataTable) -> None:
+        """Show the 10 most recent transactions."""
+        from datetime import datetime
+
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_columns("Date", "Type", "Player".ljust(20), "Pos".ljust(15),
+                          "Team", "Action", "From", "To")
+
+        recent = self._transactions[:10]
+        for tx in recent:
+            ts = datetime.fromtimestamp(tx.timestamp).strftime("%m/%d %H:%M")
+            for p in tx.players:
+                table.add_row(
+                    Text(ts, style="dim"),
+                    Text(tx.type, style="bold"),
+                    Text(p.name[:20].ljust(20)),
+                    Text(p.position.ljust(15), style="dim"),
+                    Text(p.team_abbr, style="dim"),
+                    Text(p.action, style="bold green" if p.action == "add" else
+                         "bold red" if p.action == "drop" else ""),
+                    Text(p.from_team[:20] if p.from_team else "-", style="dim"),
+                    Text(p.to_team[:20] if p.to_team else "-", style="dim"),
+                )
+
+    def _render_most_added(self, table: DataTable) -> None:
+        """Show top 10 players added the most times, with all teams they appeared on."""
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_columns("Player".ljust(20), "Pos".ljust(15), "Team",
+                          "Adds", "Fantasy Teams")
+
+        # Count adds per player and track which fantasy teams
+        add_counts: dict[str, int] = {}
+        add_teams: dict[str, set[str]] = {}
+        player_info: dict[str, tuple[str, str, str]] = {}  # key -> (name, pos, team)
+
+        for tx in self._transactions:
+            for p in tx.players:
+                if p.action == "add" and p.to_team:
+                    add_counts[p.player_key] = add_counts.get(p.player_key, 0) + 1
+                    if p.player_key not in add_teams:
+                        add_teams[p.player_key] = set()
+                    add_teams[p.player_key].add(p.to_team)
+                    player_info[p.player_key] = (p.name, p.position, p.team_abbr)
+
+        top_added = sorted(add_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+        for pkey, count in top_added:
+            name, pos, team = player_info[pkey]
+            teams = ", ".join(sorted(add_teams[pkey]))
+            table.add_row(
+                Text(name[:20].ljust(20), style="bold"),
+                Text(pos.ljust(15), style="dim"),
+                Text(team, style="dim"),
+                Text(str(count), justify="right"),
+                Text(teams, style="dim"),
+            )
+
+    def _render_position_adds(self, table: DataTable) -> None:
+        """Show per-team count of adds at each league position."""
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+
+        # Get scored positions from league categories
+        bat_positions = ["C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "OF", "Util"]
+        pitch_positions = ["SP", "RP"]
+        all_positions = bat_positions + pitch_positions
+
+        # Count adds per team per position
+        team_pos_adds: dict[str, dict[str, int]] = {}
+        team_totals: dict[str, int] = {}
+
+        for tx in self._transactions:
+            for p in tx.players:
+                if p.action == "add" and p.to_team:
+                    team = p.to_team
+                    if team not in team_pos_adds:
+                        team_pos_adds[team] = {}
+                        team_totals[team] = 0
+                    team_totals[team] += 1
+                    # Count at each eligible position (total only counts once)
+                    player_positions = [pos.strip() for pos in p.position.split(",")]
+                    matched = False
+                    for pos in player_positions:
+                        if pos in all_positions:
+                            team_pos_adds[team][pos] = team_pos_adds[team].get(pos, 0) + 1
+                            matched = True
+                    if not matched and player_positions:
+                        pp = player_positions[0]
+                        team_pos_adds[team][pp] = team_pos_adds[team].get(pp, 0) + 1
+
+        cols = ["Team".ljust(20)] + all_positions + ["Total"]
+        table.add_columns(*cols)
+
+        # Sort teams by total adds descending
+        sorted_teams = sorted(team_pos_adds.keys(),
+                              key=lambda t: team_totals.get(t, 0), reverse=True)
+
+        for team in sorted_teams:
+            pos_counts = team_pos_adds[team]
+            total = team_totals[team]
+            row: list[Text] = [Text(team[:20].ljust(20), style="bold")]
+            for pos in all_positions:
+                cnt = pos_counts.get(pos, 0)
+                row.append(Text(str(cnt) if cnt else "-", justify="right",
+                                style="" if cnt else "dim"))
+            row.append(Text(str(total), justify="right", style="bold"))
+            table.add_row(*row)
+
+
+# --- MLB Scoreboard Screen ---
+
+
+class MLBScoreboardScreen(Screen):
+    BINDINGS = [("escape", "go_back", "Back"), ("q", "go_back", "Back"),
+                ("r", "refresh", "Refresh"),
+                ("comma", "prev_day", "< Prev Day"),
+                ("full_stop", "next_day", "> Next Day"),
+                ("t", "today", "Today")]
+    CSS = """
+    #mlb-header {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #mlb-controls {
+        height: 1;
+        content-align: center middle;
+        background: $surface;
+        color: $text-muted;
+    }
+    #mlb-loading {
+        height: 3;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    #mlb-games {
+        height: 1fr;
+        background: $background;
+    }
+    .game-row {
+        height: auto;
+        width: 100%;
+    }
+    .game-card {
+        height: 5;
+        width: 1fr;
+        margin: 0 0 1 1;
+        padding: 0 1;
+        background: $surface;
+        border: solid $primary-lighten-3;
+    }
+    .game-card-live {
+        height: 5;
+        width: 1fr;
+        margin: 0 0 1 1;
+        padding: 0 1;
+        background: #1E2E1E;
+        border: solid #4A7C59;
+    }
+    .game-card-final {
+        height: 5;
+        width: 1fr;
+        margin: 0 0 1 1;
+        padding: 0 1;
+        background: #252525;
+        border: solid #444444;
+    }
+    .game-line {
+        height: 1;
+        width: 100%;
+    }
+    .game-status {
+        height: 1;
+        width: 100%;
+        color: $text-muted;
+    }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        from datetime import date as date_cls
+        self._date = date_cls.today()
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("MLB Scoreboard", id="mlb-header")
+        yield Static("", id="mlb-controls")
+        yield Static("Loading...", id="mlb-loading")
+        yield VerticalScroll(id="mlb-games")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#mlb-games").display = False
+        self._update_controls()
+        self.run_worker(self._load)
+
+    def _update_controls(self) -> None:
+        from datetime import date as date_cls
+        today = date_cls.today()
+        ctrl = Text()
+        ctrl.append(f"{self._date.strftime('%A, %B %d, %Y')}", style="bold")
+        if self._date == today:
+            ctrl.append("  (today)", style="dim")
+        ctrl.append("  |  <,> change day  [t] today  [r] refresh", style="dim")
+        self.query_one("#mlb-controls", Static).update(ctrl)
+
+    async def _load(self) -> None:
+        games = get_mlb_scoreboard(self._date)
+
+        loading = self.query("#mlb-loading")
+        if loading:
+            loading.first().remove()
+
+        container = self.query_one("#mlb-games", VerticalScroll)
+        container.display = True
+        await container.remove_children()
+
+        if not games:
+            await container.mount(Static("  No games scheduled.", classes="game-line"))
+            return
+
+        # Sort: live first, then scheduled, then final
+        order = {"Live": 0, "Preview": 1, "Final": 2}
+        games.sort(key=lambda g: order.get(g.status, 1))
+
+        # Batch into rows of 4
+        cards_per_row = 4
+        for i in range(0, len(games), cards_per_row):
+            row = Horizontal(classes="game-row")
+            await container.mount(row)
+            for game in games[i:i + cards_per_row]:
+                card = Vertical(classes=self._card_class(game))
+                await row.mount(card)
+                await card.mount(Static(self._format_status(game), classes="game-status"))
+                await card.mount(Static(self._format_away(game), classes="game-line"))
+                await card.mount(Static(self._format_home(game), classes="game-line"))
+
+    @staticmethod
+    def _card_class(game: MLBGame) -> str:
+        if game.status == "Live":
+            return "game-card-live"
+        elif game.status == "Final":
+            return "game-card-final"
+        return "game-card"
+
+    @staticmethod
+    def _format_away(game: MLBGame) -> Text:
+        line = Text()
+        winning = game.away_score > game.home_score
+        style = "bold" if winning else ""
+        line.append(f" {game.away_abbr:<4}", style=style)
+        if game.status != "Preview":
+            line.append(f" {game.away_score:>2}", style=style)
+        return line
+
+    @staticmethod
+    def _format_home(game: MLBGame) -> Text:
+        line = Text()
+        winning = game.home_score > game.away_score
+        style = "bold" if winning else ""
+        line.append(f" {game.home_abbr:<4}", style=style)
+        if game.status != "Preview":
+            line.append(f" {game.home_score:>2}", style=style)
+            if game.status == "Live":
+                r1, r2, r3 = game.runners
+                d = f" {'◆' if r3 else '◇'}{'◆' if r2 else '◇'}{'◆' if r1 else '◇'} {game.outs}o"
+                line.append(d, style="dim")
+        else:
+            from datetime import datetime
+            try:
+                dt = datetime.fromisoformat(game.start_time.replace("Z", "+00:00"))
+                local = dt.astimezone()
+                line.append(f" {local.strftime('%-I:%M %p')}", style="dim")
+            except (ValueError, TypeError):
+                pass
+        return line
+
+    def _format_status(self, game: MLBGame) -> Text:
+        status = Text()
+        if game.status == "Live":
+            status.append(" LIVE ", style="bold on #4A7C59")
+            status.append(f"  {game.inning_half} {game.inning_ordinal}")
+        elif game.status == "Final":
+            status.append(" FINAL ", style="bold on #444444")
+            if game.inning > 9:
+                status.append(f"  ({game.inning})")
+        else:
+            status.append(f" {game.detail_status}", style="dim")
+        return status
+
+    @staticmethod
+    def _format_start_time(utc_iso: str) -> str:
+        """Convert UTC ISO time to local time display."""
+        from datetime import datetime, timezone
+        try:
+            dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
+            local = dt.astimezone()
+            return local.strftime("%-I:%M %p")
+        except (ValueError, TypeError):
+            return ""
+
+    def action_refresh(self) -> None:
+        self.run_worker(self._load, group="mlb-load", exclusive=True)
+
+    def action_prev_day(self) -> None:
+        from datetime import timedelta
+        self._date -= timedelta(days=1)
+        self._update_controls()
+        self.run_worker(self._load, group="mlb-load", exclusive=True)
+
+    def action_next_day(self) -> None:
+        from datetime import timedelta
+        self._date += timedelta(days=1)
+        self._update_controls()
+        self.run_worker(self._load, group="mlb-load", exclusive=True)
+
+    def action_today(self) -> None:
+        from datetime import date as date_cls
+        self._date = date_cls.today()
+        self._update_controls()
+        self.run_worker(self._load, group="mlb-load", exclusive=True)
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
+
+
+# --- Scoreboard Screen (3-pane layout) ---
+
+
+class ScoreboardScreen(Screen):
+    BINDINGS = [("q", "quit", "Quit"), ("r", "refresh", "Refresh"),
+                ("s", "standings", "Roto Standings"),
+                ("h", "h2h_sim", "H2H Sim"),
+                ("g", "mlb_scores", "MLB Scores"),
+                ("t", "roster", "Roster"),
+                ("f", "free_agents", "Free Agents"),
+                ("x", "transactions", "Transactions"),
+                ("w", "view_weekly", "Weekly"), ("d", "view_daily", "Daily"),
+                ("n", "view_season", "Season"),
+                ("comma", "prev_date", "< Prev Day"),
+                ("full_stop", "next_date", "> Next Day"),
+                ("left", "prev_week", "Prev Week"),
+                ("right", "next_week", "Next Week"),
+                ("e", "select_week", "Select Week")]
+    CSS = """
+    #board-header {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #board-subheader {
+        height: 1;
+        content-align: center middle;
+        background: $surface;
+        color: $text-muted;
+    }
+    #main-split {
+        height: 60%;
+    }
+    #left-pane {
+        width: 1fr;
+        min-width: 40;
+        max-width: 50%;
+    }
+    #right-pane {
+        width: 1fr;
+        border-left: solid $primary;
+    }
+    #right-pane-inner {
+        height: 1fr;
+    }
+    ListView {
+        height: 1fr;
+        background: $background;
+    }
+    ListView > ListItem {
+        height: 3;
+        padding: 0 1;
+        background: $surface;
+    }
+    ListView > ListItem.--highlight {
+        background: #2E3E2E;
+    }
+    .matchup-row {
+        height: 1;
+        width: 100%;
+    }
+    .matchup-divider {
+        height: 1;
+        color: $primary-lighten-2;
+    }
+    #loading-msg {
+        height: 3;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    .stat-header {
+        height: 1;
+        content-align: center middle;
+        background: #2A2A2A;
+        text-style: bold;
+    }
+    .stat-score {
+        height: 1;
+        content-align: center middle;
+        background: #1E1E1E;
+        text-style: bold;
+    }
+    .stat-tally {
+        height: 1;
+        content-align: center middle;
+        background: $surface;
+        text-style: bold;
+    }
+    .section-label {
+        height: 1;
+        content-align: center middle;
+        background: #3A4A3A;
+        color: $foreground;
+        text-style: bold;
+    }
+    #stat-empty {
+        height: 1fr;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    #right-pane-inner DataTable {
+        height: auto;
+        max-height: 50%;
+        background: $panel;
+    }
+    #bottom-pane {
+        height: 40%;
+        border-top: solid $primary;
+    }
+    #player-view-header {
+        height: 1;
+        content-align: center middle;
+        background: #3A4A3A;
+        color: $foreground;
+        text-style: bold;
+        dock: top;
+    }
+    #player-scroll-a {
+        width: 1fr;
+        height: 1fr;
+    }
+    #player-scroll-b {
+        width: 1fr;
+        height: 1fr;
+        border-left: solid $primary;
+    }
+    .team-roster-label {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+    }
+    .roster-section-label {
+        height: 1;
+        content-align: left middle;
+        background: #2A2A2A;
+        color: $text-muted;
+        text-style: bold;
+        padding: 0 1;
+    }
+    #bottom-pane DataTable {
+        height: auto;
+        background: $panel;
+    }
+    DataTable > .datatable--cursor {
+        background: #3A5A3A;
+        color: #E8E4DF;
+    }
+    """
+
+    def __init__(self, api: YahooFantasyAPI) -> None:
+        super().__init__()
+        self.api = api
+        self.league: League | None = None
+        self.matchups: list[Matchup] = []
+        self.categories: list[StatCategory] = []
+        self._selected_idx: int | None = None
+        self._viewing_week: int | None = None  # None = current week
+        self._player_view = "weekly"  # "weekly", "daily", "season"
+        self._daily_date: str = ""  # current date for daily view
+        self._matchup_dates: list[str] = []  # available dates for current matchup
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("", id="board-header")
+        yield Static("", id="board-subheader")
+        with Horizontal(id="main-split"):
+            with Vertical(id="left-pane"):
+                yield Static("Loading...", id="loading-msg")
+                yield ListView(id="matchup-list")
+            with Vertical(id="right-pane"):
+                yield VerticalScroll(id="right-pane-inner")
+        with Vertical(id="bottom-pane"):
+            yield Static("", id="player-view-header")
+            with Horizontal():
+                yield VerticalScroll(id="player-scroll-a")
+                yield VerticalScroll(id="player-scroll-b")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#matchup-list", ListView).display = False
+        self.query_one("#bottom-pane").display = False
+        self.run_worker(self._load)
+        self._auto_refresh_timer = self.set_interval(60, self._auto_refresh)
+
+    def _auto_refresh(self) -> None:
+        if self.league:
+            self.run_worker(self._refresh_data)
+
+    async def _load(self) -> None:
+        leagues = self.api.get_user_leagues()
+        if not leagues:
+            loading = self.query("#loading-msg")
+            if loading:
+                loading.first().update("No MLB leagues found.")
+            return
+
+        self.league = leagues[0]
+        self.categories = self.api.get_stat_categories(self.league.league_key)
+        week = self._viewing_week if self._viewing_week is not None else None
+        self.matchups = self.api.get_scoreboard(self.league.league_key, week=week)
+
+        self._update_header()
+        loading = self.query("#loading-msg")
+        if loading:
+            loading.first().remove()
+        self._populate_matchups()
+
+    async def _refresh_data(self) -> None:
+        if not self.league:
+            return
+        week = self._viewing_week if self._viewing_week is not None else None
+        self.matchups = self.api.get_scoreboard(self.league.league_key, week=week)
+        self._update_header()
+        self._populate_matchups()
+        if self._selected_idx is not None and self._selected_idx < len(self.matchups):
+            await self._show_matchup_detail(self._selected_idx)
+
+    def _update_header(self) -> None:
+        if not self.league:
+            return
+        self.query_one("#board-header", Static).update(
+            f" {self.league.name} "
+        )
+        display_week = self._viewing_week if self._viewing_week is not None else self.league.current_week
+        sub = Text()
+        sub.append(f"Week {display_week}", style="bold")
+        if self._viewing_week is not None and self._viewing_week != self.league.current_week:
+            sub.append(f"  (←→ week, [e] select)", style="dim")
+        else:
+            sub.append(f"  (←→ week, [e] select)", style="dim")
+        sub.append(f"  |  {self.league.season} Season  |  {self.league.num_teams} Teams")
+        self.query_one("#board-subheader", Static).update(sub)
+
+    def _populate_matchups(self) -> None:
+        lv = self.query_one("#matchup-list", ListView)
+        lv.clear()
+        lv.display = True
+        for i, m in enumerate(self.matchups):
+            num = str(i + 1) if i < 9 else "0" if i == 9 else ""
+            score_line = Text()
+            score_line.append(f"{num:>2} ", style="bold dim")
+            score_line.append(f"{m.team_a.name[:18]:<18}", style=f"bold {TEAM_A_COLOR}")
+            score_line.append(f"{m.team_a.points:>5.0f}", style=f"{TEAM_A_COLOR}")
+            score_line.append("  ")
+            score_line.append(f"{m.team_b.name[:18]:<18}", style=f"bold {TEAM_B_COLOR}")
+            score_line.append(f"{m.team_b.points:>5.0f}", style=f"{TEAM_B_COLOR}")
+
+            mgr_line = Text()
+            mgr_line.append(f"   {m.team_a.manager[:18]:<23}", style="dim")
+            mgr_line.append(f"{m.team_b.manager[:18]:<18}", style="dim")
+
+            item = ListItem(
+                Label(score_line, classes="matchup-row"),
+                Label(mgr_line, classes="matchup-row"),
+                Label("─" * 52, classes="matchup-divider"),
+            )
+            item._matchup_index = i
+            lv.mount(item)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        """Load matchup detail + player stats when Enter is pressed."""
+        idx = getattr(event.item, "_matchup_index", None)
+        if idx is not None and idx < len(self.matchups):
+            self._select_matchup(idx)
+
+    def _select_matchup(self, idx: int) -> None:
+        """Select a matchup by index and load its details."""
+        if idx < 0 or idx >= len(self.matchups):
+            return
+        self._selected_idx = idx
+        async def _update(i: int = idx) -> None:
+            await self._show_matchup_detail(i)
+            await self._load_player_stats(i)
+        self.run_worker(_update, group="matchup-detail", exclusive=True)
+
+    def on_key(self, event) -> None:
+        """Handle numeric keys 1-9,0 for quick matchup selection."""
+        if event.character and event.character in "1234567890":
+            idx = int(event.character) - 1
+            if event.character == "0":
+                idx = 9
+            if 0 <= idx < len(self.matchups):
+                self._select_matchup(idx)
+                event.prevent_default()
+
+    async def _show_matchup_detail(self, idx: int) -> None:
+        """Populate the right pane with matchup stat comparison."""
+        self._selected_idx = idx
+        m = self.matchups[idx]
+        a = m.team_a
+        b = m.team_b
+
+        container = self.query_one("#right-pane-inner", VerticalScroll)
+        await container.remove_children()
+
+        # Header
+        header = Text()
+        header.append(f" {a.name} ", style=f"bold {TEAM_A_COLOR}")
+        header.append("  vs  ")
+        header.append(f" {b.name} ", style=f"bold {TEAM_B_COLOR}")
+        await container.mount(Static(header, classes="stat-header"))
+
+        score = Text()
+        score.append(f" {a.points:.0f} ", style=f"bold {TEAM_A_COLOR}")
+        score.append(" - ")
+        score.append(f" {b.points:.0f} ", style=f"bold {TEAM_B_COLOR}")
+        await container.mount(Static(score, classes="stat-score"))
+
+        scored_cats = [c for c in self.categories if not c.is_only_display]
+        batting_cats = [c for c in scored_cats if c.position_type == "B"]
+        pitching_cats = [c for c in scored_cats if c.position_type == "P"]
+
+        a_wins = 0
+        b_wins = 0
+        ties = 0
+
+        if batting_cats:
+            await container.mount(Static(" BATTING ", classes="section-label"))
+            bat_table = DataTable()
+            await container.mount(bat_table)
+            aw, bw, t = self._fill_stat_table(bat_table, batting_cats, a, b)
+            a_wins += aw
+            b_wins += bw
+            ties += t
+
+        if pitching_cats:
+            await container.mount(Static(" PITCHING ", classes="section-label"))
+            pitch_table = DataTable()
+            await container.mount(pitch_table)
+            aw, bw, t = self._fill_stat_table(pitch_table, pitching_cats, a, b)
+            a_wins += aw
+            b_wins += bw
+            ties += t
+
+        tally = Text()
+        tally.append(f" {a.name[:15]}: {a_wins} ", style=f"bold {TEAM_A_COLOR}")
+        tally.append(f"  Tied: {ties}  ", style="dim")
+        tally.append(f" {b.name[:15]}: {b_wins} ", style=f"bold {TEAM_B_COLOR}")
+        await container.mount(Static(tally, classes="stat-tally"))
+
+    def _fill_stat_table(
+        self, table: DataTable, cats: list[StatCategory],
+        a: TeamStats, b: TeamStats,
+    ) -> tuple[int, int, int]:
+        table.cursor_type = "none"
+        table.zebra_stripes = False
+        a_label = Text(a.name[:14], style=f"bold {TEAM_A_COLOR}")
+        b_label = Text(b.name[:14], style=f"bold {TEAM_B_COLOR}")
+        table.add_columns("Stat", a_label, b_label)
+
+        a_wins = b_wins = ties = 0
+        for cat in cats:
+            a_val = a.stats.get(cat.stat_id, "-")
+            b_val = b.stats.get(cat.stat_id, "-")
+            winner = who_wins(a_val, b_val, cat.sort_order)
+            if winner == "a":
+                bg = TEAM_A_BG
+                a_wins += 1
+            elif winner == "b":
+                bg = TEAM_B_BG
+                b_wins += 1
+            else:
+                bg = TIED_BG
+                ties += 1
+            table.add_row(
+                Text(f" {cat.display_name}", style=f"bold on {bg}"),
+                Text(f"{a_val} ", justify="right", style=f"on {bg}"),
+                Text(f"{b_val} ", justify="right", style=f"on {bg}"),
+            )
+        return a_wins, b_wins, ties
+
+    def _compute_matchup_dates(self, matchup: Matchup) -> list[str]:
+        """Generate the list of dates within a matchup's week."""
+        from datetime import date, timedelta
+        try:
+            start = date.fromisoformat(matchup.week_start)
+            end = date.fromisoformat(matchup.week_end)
+            # Don't go past today
+            today = date.today()
+            if end > today:
+                end = today
+            dates = []
+            d = start
+            while d <= end:
+                dates.append(d.isoformat())
+                d += timedelta(days=1)
+            return dates
+        except (ValueError, TypeError):
+            return []
+
+    def _update_player_view_header(self, matchup: Matchup) -> None:
+        """Update the player view header with current view mode."""
+        header = Text()
+        if self._player_view == "weekly":
+            header.append(f" WEEKLY ", style="bold on #4A7C59")
+            header.append(f"  [d] Daily  [n] Season", style="dim")
+            header.append(f"  |  Week {matchup.week}", style="bold")
+        elif self._player_view == "daily":
+            header.append(f"  [w] Weekly  ", style="dim")
+            header.append(f" DAILY ", style="bold on #4A7C59")
+            header.append(f"  [n] Season", style="dim")
+            header.append(f"  |  {self._daily_date}", style="bold")
+            if len(self._matchup_dates) > 1:
+                header.append(f"  (<,> to cycle days)", style="dim")
+        else:
+            header.append(f"  [w] Weekly  [d] Daily  ", style="dim")
+            header.append(f" SEASON ", style="bold on #4A7C59")
+        self.query_one("#player-view-header", Static).update(header)
+
+    async def _load_player_stats(self, idx: int) -> None:
+        """Load player-level stats for both teams in a matchup."""
+        if not self.league:
+            return
+        m = self.matchups[idx]
+        week = m.week or self.league.current_week
+
+        # Compute available dates for this matchup
+        self._matchup_dates = self._compute_matchup_dates(m)
+        if self._daily_date not in self._matchup_dates and self._matchup_dates:
+            self._daily_date = self._matchup_dates[-1]  # default to most recent
+
+        # Fetch based on current view
+        if self._player_view == "daily" and self._daily_date:
+            players_a = self.api.get_roster_stats_daily(
+                m.team_a.team_key, week, self._daily_date)
+            players_b = self.api.get_roster_stats_daily(
+                m.team_b.team_key, week, self._daily_date)
+        elif self._player_view == "season":
+            players_a = self.api.get_roster_stats_season(m.team_a.team_key, week)
+            players_b = self.api.get_roster_stats_season(m.team_b.team_key, week)
+        else:
+            players_a = self.api.get_roster_stats(m.team_a.team_key, week)
+            players_b = self.api.get_roster_stats(m.team_b.team_key, week)
+
+        self.query_one("#bottom-pane").display = True
+        self._update_player_view_header(m)
+
+        scored_cats = [c for c in self.categories if not c.is_only_display]
+        batting_cats = [c for c in scored_cats if c.position_type == "B"]
+        pitching_cats = [c for c in scored_cats if c.position_type == "P"]
+
+        batting_positions = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF",
+                             "OF", "Util", "DH", "IF", "BN"}
+
+        for container_id, team, players, color in [
+            ("#player-scroll-a", m.team_a, players_a, TEAM_A_COLOR),
+            ("#player-scroll-b", m.team_b, players_b, TEAM_B_COLOR),
+        ]:
+            container = self.query_one(container_id, VerticalScroll)
+            await container.remove_children()
+
+            await container.mount(
+                Static(Text(f" {team.name} ", style=f"bold {color}"),
+                       classes="team-roster-label")
+            )
+
+            batters = [p for p in players if
+                       any(pos in batting_positions for pos in p.position.split(","))]
+            pitchers = [p for p in players if p not in batters]
+
+            if batters:
+                await container.mount(
+                    Static(" Batters", classes="roster-section-label"))
+                bat_table = DataTable()
+                await container.mount(bat_table)
+                self._fill_player_table(bat_table, batters, batting_cats)
+
+            if pitchers:
+                await container.mount(
+                    Static(" Pitchers", classes="roster-section-label"))
+                pitch_table = DataTable()
+                await container.mount(pitch_table)
+                self._fill_player_table(pitch_table, pitchers, pitching_cats)
+
+    def _fill_player_table(
+        self, table: DataTable, players: list[PlayerStats],
+        cats: list[StatCategory],
+    ) -> None:
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+
+        cols = ["Player", "Pos"]
+        for cat in cats:
+            cols.append(cat.display_name)
+        table.add_columns(*cols)
+
+        for p in players:
+            row: list[str | Text] = [
+                Text(p.name[:18], style="bold"),
+                Text(p.position, style="dim"),
+            ]
+            for cat in cats:
+                val = p.stats.get(cat.stat_id, "-")
+                row.append(Text(str(val), justify="right"))
+            table.add_row(*row)
+
+    def _reload_players(self) -> None:
+        if self._selected_idx is not None and self._selected_idx < len(self.matchups):
+            async def _do(i: int = self._selected_idx) -> None:
+                await self._load_player_stats(i)
+            self.run_worker(_do, group="player-reload", exclusive=True)
+
+    def action_view_weekly(self) -> None:
+        self._player_view = "weekly"
+        self._reload_players()
+
+    def action_view_daily(self) -> None:
+        self._player_view = "daily"
+        self._reload_players()
+
+    def action_view_season(self) -> None:
+        self._player_view = "season"
+        self._reload_players()
+
+    def action_prev_date(self) -> None:
+        if self._player_view != "daily" or not self._matchup_dates:
+            return
+        idx = self._matchup_dates.index(self._daily_date) if self._daily_date in self._matchup_dates else 0
+        if idx > 0:
+            self._daily_date = self._matchup_dates[idx - 1]
+            self._reload_players()
+
+    def action_next_date(self) -> None:
+        if self._player_view != "daily" or not self._matchup_dates:
+            return
+        idx = self._matchup_dates.index(self._daily_date) if self._daily_date in self._matchup_dates else 0
+        if idx < len(self._matchup_dates) - 1:
+            self._daily_date = self._matchup_dates[idx + 1]
+            self._reload_players()
+
+    def action_refresh(self) -> None:
+        if self.league:
+            self.run_worker(self._refresh_data)
+
+    def action_standings(self) -> None:
+        if self.league:
+            self.app.push_screen(
+                RotoStandingsScreen(self.api, self.league, self.categories)
+            )
+
+    def action_h2h_sim(self) -> None:
+        if self.league:
+            self.app.push_screen(
+                H2HSimulatorScreen(self.api, self.league, self.categories)
+            )
+
+    def action_roster(self) -> None:
+        if self.league:
+            self.app.push_screen(
+                RosterAnalysisScreen(self.api, self.league, self.categories)
+            )
+
+    def action_free_agents(self) -> None:
+        if self.league:
+            self.app.push_screen(
+                FreeAgentScreen(self.api, self.league, self.categories)
+            )
+
+    def action_transactions(self) -> None:
+        if self.league:
+            self.app.push_screen(
+                TransactionsScreen(self.api, self.league, self.categories)
+            )
+
+    def action_mlb_scores(self) -> None:
+        self.app.push_screen(MLBScoreboardScreen())
+
+    def _load_week(self, week: int) -> None:
+        """Switch to viewing a specific week's matchups."""
+        self._viewing_week = week
+        self._selected_idx = None
+        self.query_one("#bottom-pane").display = False
+        self._update_header()
+        self.run_worker(self._refresh_data)
+
+    def action_prev_week(self) -> None:
+        if not self.league:
+            return
+        current = self._viewing_week if self._viewing_week is not None else self.league.current_week
+        if current > 1:
+            self._load_week(current - 1)
+
+    def action_next_week(self) -> None:
+        if not self.league:
+            return
+        current = self._viewing_week if self._viewing_week is not None else self.league.current_week
+        if current < self.league.current_week:
+            self._load_week(current + 1)
+
+    def action_select_week(self) -> None:
+        if not self.league:
+            return
+        current = self._viewing_week if self._viewing_week is not None else self.league.current_week
+        self.app.push_screen(
+            WeekSelectModal(self.league.current_week, current),
+            callback=self._on_week_selected,
+        )
+
+    def _on_week_selected(self, week: int | None) -> None:
+        if week is not None:
+            self._load_week(week)
+
+    def action_quit(self) -> None:
+        self.app.exit()
+
+
+# --- App ---
+
+
+class GklApp(App):
+    TITLE = "GKL — Fantasy Baseball Command Center"
+    CSS = """
+    Screen {
+        background: $background;
+    }
+    """
+
+    def __init__(self, api: YahooFantasyAPI) -> None:
+        super().__init__()
+        self.api = api
+
+    def on_mount(self) -> None:
+        self.register_theme(BASEBALL_THEME)
+        self.theme = "baseball"
+        self.push_screen(ScoreboardScreen(self.api))
+
+
+def main() -> None:
+    saved = load_credentials()
+    if saved:
+        client_id, client_secret = saved
+    else:
+        client_id = os.environ.get("YAHOO_CLIENT_ID")
+        client_secret = os.environ.get("YAHOO_CLIENT_SECRET")
+
+        if not client_id or not client_secret:
+            print(
+                "No saved credentials found.\n"
+                "Create an app at https://developer.yahoo.com/apps/create/\n"
+                "  - App type: Installed Application\n"
+                "  - Redirect URI: oob\n"
+                "  - API Permissions: Fantasy Sports (read)\n",
+                file=sys.stderr,
+            )
+            client_id = input("Yahoo Client ID: ").strip()
+            client_secret = input("Yahoo Client Secret: ").strip()
+            if not client_id or not client_secret:
+                print("Client ID and Secret are required.", file=sys.stderr)
+                sys.exit(1)
+
+        save_credentials(client_id, client_secret)
+
+    auth = YahooAuth(client_id=client_id, client_secret=client_secret)
+    token = auth.get_token()
+    print("Authenticated successfully. Launching app...\n")
+
+    api = YahooFantasyAPI(auth)
+    app = GklApp(api)
+    app.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,25 @@
+[project]
+name = "gkl-cli"
+version = "0.1.0"
+description = "Fantasy baseball command center CLI"
+requires-python = ">=3.12"
+dependencies = [
+    "textual>=3.0",
+    "httpx>=0.28",
+    "textual-plotext>=1.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+gkl = "gkl.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gkl"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

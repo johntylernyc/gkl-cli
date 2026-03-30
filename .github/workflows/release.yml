@@ -1,0 +1,78 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact_name: gkl-linux-amd64
+          - os: windows-latest
+            artifact_name: gkl-windows-amd64.exe
+          - os: macos-latest
+            artifact_name: gkl-macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller
+          pip install .
+
+      - name: Build executable
+        shell: bash
+        run: |
+          pyinstaller --onefile --console --name gkl \
+            --collect-all textual \
+            --collect-all textual_plotext \
+            --collect-data certifi \
+            --hidden-import concurrent.futures \
+            --hidden-import csv \
+            --hidden-import io \
+            --hidden-import markdown_it \
+            --hidden-import mdit_py_plugins \
+            --hidden-import linkify_it \
+            --hidden-import uc_micro \
+            gkl_entry.py
+
+      - name: Rename artifact (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: mv dist/gkl dist/${{ matrix.artifact_name }}
+
+      - name: Rename artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: mv dist/gkl.exe dist/${{ matrix.artifact_name }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
