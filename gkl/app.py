@@ -2751,17 +2751,17 @@ class PlayerExplorerScreen(Screen):
 
                 if d > last_date:
                     # Future day
-                    text.append("░", style="dim")
+                    text.append("░░", style="dim")
                     continue
 
                 info = day_data.get(ds)
                 if not info or info["status"] == "not_owned":
-                    text.append("░", style="#555555")
+                    text.append("░░", style="#555555")
                     not_owned_count += 1
                 else:
                     team = info["team_name"]
                     color = team_color_map.get(team, "dim")
-                    text.append("█", style=color)
+                    text.append("██", style=color)
 
                     status = info["status"]
                     if status == "started":
@@ -2813,11 +2813,11 @@ class PlayerExplorerScreen(Screen):
         # Legend: show each team with its color
         text.append("  ")
         for team, color in team_color_map.items():
-            text.append("█", style=color)
+            text.append("██", style=color)
             text.append(f" {team}  ")
-        text.append("░", style="#555555")
+        text.append("░░", style="#555555")
         text.append(" Not Owned  ")
-        text.append("░", style="dim")
+        text.append("░░", style="dim")
         text.append(" Future\n\n")
 
         widget.update(text)
