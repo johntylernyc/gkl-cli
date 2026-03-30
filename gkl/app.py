@@ -1533,6 +1533,7 @@ class FreeAgentScreen(Screen):
         ("slash", "focus_search", "Search"),
         ("right", "next_page", "Next Page"),
         ("left", "prev_page", "Prev Page"),
+        ("w", "watchlist_toggle", "Watch"),
     ]
     CSS = """
     #fa-header {
@@ -1630,6 +1631,8 @@ class FreeAgentScreen(Screen):
         self._baselines_loaded = False
         self._rank_lookup: dict[str, int] = {}
         self._preseason_rank_lookup: dict[str, int] = {}
+        self._store = RosterDataStore()
+        self._player_rows: dict[str, list[PlayerStats]] = {}  # table_id -> players
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1922,6 +1925,7 @@ class FreeAgentScreen(Screen):
         players: list[PlayerStats],
     ) -> None:
         """Compact overview table for the top-15 mixed batter/pitcher list."""
+        table._players = players  # type: ignore[attr-defined]
         table.clear(columns=True)
         table.cursor_type = "row"
         table.zebra_stripes = True
@@ -1953,6 +1957,7 @@ class FreeAgentScreen(Screen):
         batters: list[PlayerStats],
         batter_statcast: dict[str, StatcastBatter],
     ) -> None:
+        table._players = batters  # type: ignore[attr-defined]
         scored = [c for c in self.categories if not c.is_only_display]
         batting_cats = [c for c in scored if c.position_type == "B"]
 
@@ -2024,6 +2029,7 @@ class FreeAgentScreen(Screen):
         pitchers: list[PlayerStats],
         pitcher_statcast: dict[str, StatcastPitcher],
     ) -> None:
+        table._players = pitchers  # type: ignore[attr-defined]
         scored = [c for c in self.categories if not c.is_only_display]
         pitching_cats = [c for c in scored if c.position_type == "P"]
 
@@ -2167,8 +2173,675 @@ class FreeAgentScreen(Screen):
             self._page_start = max(0, self._page_start - self._page_size)
             self.run_worker(self._load_free_agents, group="fa-load", exclusive=True)
 
+    def action_watchlist_toggle(self) -> None:
+        """Toggle the focused player on/off the watchlist."""
+        # Find the focused DataTable and get the player from its stored list
+        try:
+            focused = self.query("DataTable:focus")
+            if not focused:
+                return
+            table = focused.first()
+            if not isinstance(table, DataTable):
+                return
+        except Exception:
+            return
+
+        players = getattr(table, "_players", [])
+        row_idx = table.cursor_row
+        if row_idx < 0 or row_idx >= len(players):
+            return
+
+        p = players[row_idx]
+        if self._store.is_on_watchlist(self.league.league_key, p.player_key):
+            self._store.remove_from_watchlist(self.league.league_key, p.player_key)
+            self.notify(f"Removed {p.name} from watchlist")
+        else:
+            self._store.add_to_watchlist(
+                self.league.league_key, p.player_key,
+                p.name, p.position, p.team_abbr,
+            )
+            self.notify(f"Added {p.name} to watchlist")
+
     def action_go_back(self) -> None:
         self.app.pop_screen()
+
+
+# --- Watchlist Screen ---
+
+
+class WatchlistScreen(Screen):
+    BINDINGS = [
+        ("escape", "go_back", "Back"),
+        ("q", "go_back", "Back"),
+        ("d", "remove_player", "Remove"),
+        ("enter", "compare", "Compare"),
+    ]
+    CSS = """
+    #wl-header {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #wl-controls {
+        height: 1;
+        content-align: center middle;
+        background: $surface;
+        color: $text-muted;
+    }
+    #wl-loading-container {
+        height: auto;
+        content-align: center middle;
+        padding: 1 0;
+    }
+    #wl-loading-status {
+        height: 1;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    #wl-spinner {
+        height: 3;
+    }
+    #wl-scroll {
+        height: 1fr;
+    }
+    .wl-section-header {
+        height: 1;
+        content-align: left middle;
+        background: #2A2A2A;
+        color: $text-muted;
+        text-style: bold;
+        padding: 0 1;
+    }
+    .wl-table {
+        height: auto;
+        max-height: 45%;
+        background: $panel;
+    }
+    DataTable > .datatable--cursor {
+        background: #3A5A3A;
+        color: #E8E4DF;
+    }
+    """
+
+    def __init__(self, api: YahooFantasyAPI, league: League,
+                 categories: list[StatCategory]) -> None:
+        super().__init__()
+        self.api = api
+        self.league = league
+        self.categories = categories
+        self._store = RosterDataStore()
+        self._sgp_calc: SGPCalculator | None = None
+        self._watchlist_players: list[PlayerStats] = []
+        self._rank_lookup: dict[str, int] = {}
+        self._preseason_rank_lookup: dict[str, int] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("", id="wl-header")
+        yield Static("", id="wl-controls")
+        with Vertical(id="wl-loading-container"):
+            yield LoadingIndicator(id="wl-spinner")
+            yield Static("Loading watchlist...", id="wl-loading-status")
+        yield VerticalScroll(id="wl-scroll")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#wl-header", Static).update(
+            f" {self.league.name} — Watchlist "
+        )
+        ctrl = Text()
+        ctrl.append("  [Enter] Compare to roster  [d] Remove  [Esc] Back", style="dim")
+        self.query_one("#wl-controls", Static).update(ctrl)
+        self.run_worker(self._initial_load)
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
+
+    async def _show_loading(self, msg: str) -> None:
+        try:
+            self.query_one("#wl-loading-status", Static).update(msg)
+            self.query_one("#wl-loading-container").display = True
+            self.query_one("#wl-scroll").display = False
+        except Exception:
+            pass
+
+    def _hide_loading(self) -> None:
+        try:
+            self.query_one("#wl-loading-container").display = False
+            self.query_one("#wl-scroll").display = True
+        except Exception:
+            pass
+
+    async def _initial_load(self) -> None:
+        await self._show_loading("Loading SGP baselines...")
+        all_teams = self.api.get_team_season_stats(self.league.league_key)
+        replacement_by_pos: dict[str, list[PlayerStats]] = {}
+        for pos in ("C", "1B", "2B", "3B", "SS", "OF", "SP", "RP"):
+            players, _ = self.api.get_free_agents(
+                self.league.league_key, stat_type="season",
+                position=pos, sort="AR", sort_type="season", count=25,
+            )
+            replacement_by_pos[pos] = players
+        self._sgp_calc = SGPCalculator(
+            all_teams, self.categories, replacement_by_pos,
+        )
+
+        await self._show_loading("Fetching Yahoo rankings...")
+        self._rank_lookup = self.api.build_rank_lookup(
+            self.league.league_key, sort="AR",
+        )
+        self._preseason_rank_lookup = self.api.get_preseason_ranks(
+            self.league.league_key,
+        )
+
+        await self._load_watchlist()
+
+    async def _load_watchlist(self) -> None:
+        await self._show_loading("Loading watchlist players...")
+        watchlist = self._store.get_watchlist(self.league.league_key)
+        if not watchlist:
+            self._hide_loading()
+            scroll = self.query_one("#wl-scroll", VerticalScroll)
+            await scroll.remove_children()
+            await scroll.mount(Static(
+                "  No players on watchlist.\n"
+                "  Press [w] on a player in the Free Agents screen to add them.\n",
+            ))
+            return
+
+        # Fetch current stats for each watchlisted player
+        self._watchlist_players = []
+        for entry in watchlist:
+            try:
+                results = self.api.search_players(
+                    self.league.league_key, entry["player_name"], count=5,
+                )
+                for r in results:
+                    if r.player_key == entry["player_key"]:
+                        self._watchlist_players.append(r)
+                        break
+                else:
+                    # Player not found via search, use cached info
+                    self._watchlist_players.append(PlayerStats(
+                        player_key=entry["player_key"],
+                        name=entry["player_name"],
+                        position=entry["player_position"],
+                        team_abbr=entry.get("team_abbr", ""),
+                    ))
+            except Exception:
+                self._watchlist_players.append(PlayerStats(
+                    player_key=entry["player_key"],
+                    name=entry["player_name"],
+                    position=entry["player_position"],
+                    team_abbr=entry.get("team_abbr", ""),
+                ))
+
+        await self._show_loading("Loading Statcast data...")
+        batting_positions = {
+            "C", "1B", "2B", "3B", "SS", "LF", "CF", "RF",
+            "OF", "Util", "DH", "IF", "BN",
+        }
+        batters = [p for p in self._watchlist_players
+                   if any(pos in batting_positions for pos in p.position.split(","))]
+        pitchers = [p for p in self._watchlist_players if p not in batters]
+
+        batter_sc: dict[str, StatcastBatter] = {}
+        for p in batters:
+            mlbam_id = lookup_mlbam_id(p.name)
+            if mlbam_id is not None:
+                sc = get_batter_statcast(mlbam_id)
+                if sc is not None:
+                    batter_sc[p.name] = sc
+
+        pitcher_sc: dict[str, StatcastPitcher] = {}
+        for p in pitchers:
+            mlbam_id = lookup_mlbam_id(p.name)
+            if mlbam_id is not None:
+                sc = get_pitcher_statcast(mlbam_id)
+                if sc is not None:
+                    pitcher_sc[p.name] = sc
+
+        await self._show_loading("Rendering watchlist...")
+        scroll = self.query_one("#wl-scroll", VerticalScroll)
+        await scroll.remove_children()
+
+        if batters:
+            label = Static(" Batters", classes="wl-section-header")
+            table = DataTable(classes="wl-table")
+            await scroll.mount(label, table)
+            self._render_batter_table(table, batters, batter_sc)
+
+        if pitchers:
+            label = Static(" Pitchers", classes="wl-section-header")
+            table = DataTable(classes="wl-table")
+            await scroll.mount(label, table)
+            self._render_pitcher_table(table, pitchers, pitcher_sc)
+
+        self._hide_loading()
+
+    def _render_batter_table(
+        self, table: DataTable, batters: list[PlayerStats],
+        batter_sc: dict[str, StatcastBatter],
+    ) -> None:
+        table._players = batters  # type: ignore[attr-defined]
+        scored = [c for c in self.categories if not c.is_only_display]
+        batting_cats = [c for c in scored if c.position_type == "B"]
+
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        cols: list[str] = ["Player".ljust(20), "Pos".ljust(15), "Team", "SGP", "Y!", "Pre"]
+        for cat in batting_cats:
+            cols.append(cat.display_name)
+        cols.append("│")
+        cols.extend(["EV", "MaxEV", "LA", "Barrel%", "HardHit%",
+                      "K%", "BB%", "Whiff%", "xBA", "xSLG", "xwOBA"])
+        table.add_columns(*cols)
+
+        def _f(v, fmt=".1f"):
+            return f"{v:{fmt}}" if v is not None else "-"
+        def _rate(v):
+            return f"{v:.1f}" if v is not None else "-"
+
+        for p in batters:
+            sgp_val = self._sgp_calc.player_sgp(p) if self._sgp_calc else None
+            if sgp_val is not None:
+                sgp_style = "bold green" if sgp_val > 0 else "bold red" if sgp_val < 0 else ""
+                sgp_text = Text(f"{sgp_val:+.1f}", style=sgp_style, justify="right")
+            else:
+                sgp_text = Text("N/A", style="dim", justify="right")
+            y_rank = self._rank_lookup.get(p.player_key)
+            pre_rank = self._preseason_rank_lookup.get(p.player_key)
+            row: list[Text] = [
+                Text(p.name[:20].ljust(20), style="bold"),
+                Text(p.position.ljust(15), style="dim"),
+                Text(p.team_abbr, style="dim"),
+                sgp_text,
+                Text(str(y_rank) if y_rank else "-", style="dim", justify="right"),
+                Text(str(pre_rank) if pre_rank else "-", style="dim", justify="right"),
+            ]
+            for cat in batting_cats:
+                row.append(Text(p.stats.get(cat.stat_id, "-"), justify="right"))
+            row.append(Text("│", style="dim"))
+            sc = batter_sc.get(p.name)
+            if sc:
+                row.extend([
+                    Text(_f(sc.avg_exit_velo), justify="right"),
+                    Text(_f(sc.max_exit_velo), justify="right"),
+                    Text(_f(sc.avg_launch_angle), justify="right"),
+                    Text(_f(sc.barrel_pct), justify="right"),
+                    Text(_f(sc.hard_hit_pct), justify="right"),
+                    Text(_rate(sc.k_pct), justify="right"),
+                    Text(_rate(sc.bb_pct), justify="right"),
+                    Text(_rate(sc.whiff_pct), justify="right"),
+                    Text(_f(sc.xba, ".3f"), justify="right"),
+                    Text(_f(sc.xslg, ".3f"), justify="right"),
+                    Text(_f(sc.xwoba, ".3f"), justify="right"),
+                ])
+            else:
+                row.extend([Text("-", style="dim", justify="right")] * 11)
+            table.add_row(*row)
+
+    def _render_pitcher_table(
+        self, table: DataTable, pitchers: list[PlayerStats],
+        pitcher_sc: dict[str, StatcastPitcher],
+    ) -> None:
+        table._players = pitchers  # type: ignore[attr-defined]
+        scored = [c for c in self.categories if not c.is_only_display]
+        pitching_cats = [c for c in scored if c.position_type == "P"]
+
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        cols: list[str] = ["Player".ljust(20), "Pos".ljust(15), "Team", "SGP", "Y!", "Pre"]
+        for cat in pitching_cats:
+            cols.append(cat.display_name)
+        cols.append("│")
+        cols.extend(["EV Alw", "Barrel%", "HardHit%",
+                      "xBA", "xSLG", "xwOBA", "xERA",
+                      "K%p", "BB%p", "Whiff%p"])
+        table.add_columns(*cols)
+
+        def _f(v, fmt=".1f"):
+            return f"{v:{fmt}}" if v is not None else "-"
+        def _rate(v):
+            return f"{v:.1f}" if v is not None else "-"
+
+        for p in pitchers:
+            sgp_val = self._sgp_calc.player_sgp(p) if self._sgp_calc else None
+            if sgp_val is not None:
+                sgp_style = "bold green" if sgp_val > 0 else "bold red" if sgp_val < 0 else ""
+                sgp_text = Text(f"{sgp_val:+.1f}", style=sgp_style, justify="right")
+            else:
+                sgp_text = Text("N/A", style="dim", justify="right")
+            y_rank = self._rank_lookup.get(p.player_key)
+            pre_rank = self._preseason_rank_lookup.get(p.player_key)
+            row: list[Text] = [
+                Text(p.name[:20].ljust(20), style="bold"),
+                Text(p.position.ljust(15), style="dim"),
+                Text(p.team_abbr, style="dim"),
+                sgp_text,
+                Text(str(y_rank) if y_rank else "-", style="dim", justify="right"),
+                Text(str(pre_rank) if pre_rank else "-", style="dim", justify="right"),
+            ]
+            for cat in pitching_cats:
+                row.append(Text(p.stats.get(cat.stat_id, "-"), justify="right"))
+            row.append(Text("│", style="dim"))
+            sc = pitcher_sc.get(p.name)
+            if sc:
+                row.extend([
+                    Text(_f(sc.avg_exit_velo), justify="right"),
+                    Text(_f(sc.barrel_pct), justify="right"),
+                    Text(_f(sc.hard_hit_pct), justify="right"),
+                    Text(_f(sc.xba, ".3f"), justify="right"),
+                    Text(_f(sc.xslg, ".3f"), justify="right"),
+                    Text(_f(sc.xwoba, ".3f"), justify="right"),
+                    Text(_f(sc.xera, ".2f"), justify="right"),
+                    Text(_rate(sc.k_pct), justify="right"),
+                    Text(_rate(sc.bb_pct), justify="right"),
+                    Text(_rate(sc.whiff_pct), justify="right"),
+                ])
+            else:
+                row.extend([Text("-", style="dim", justify="right")] * 10)
+            table.add_row(*row)
+
+    def action_remove_player(self) -> None:
+        try:
+            focused = self.query("DataTable:focus")
+            if not focused:
+                return
+            table = focused.first()
+            if not isinstance(table, DataTable):
+                return
+        except Exception:
+            return
+
+        players = getattr(table, "_players", [])
+        row_idx = table.cursor_row
+        if row_idx < 0 or row_idx >= len(players):
+            return
+
+        p = players[row_idx]
+        self._store.remove_from_watchlist(self.league.league_key, p.player_key)
+        self.notify(f"Removed {p.name} from watchlist")
+        self.run_worker(self._load_watchlist)
+
+    def action_compare(self) -> None:
+        try:
+            focused = self.query("DataTable:focus")
+            if not focused:
+                return
+            table = focused.first()
+            if not isinstance(table, DataTable):
+                return
+        except Exception:
+            return
+
+        players = getattr(table, "_players", [])
+        row_idx = table.cursor_row
+        if row_idx < 0 or row_idx >= len(players):
+            return
+
+        self._compare_player = players[row_idx]
+
+        # Get team list for selection
+        teams = self.api.get_team_season_stats(self.league.league_key)
+        options = [(t.team_key, t.name) for t in teams]
+        self.app.push_screen(
+            TeamSelectModal(options),
+            callback=self._on_team_selected,
+        )
+
+    def _on_team_selected(self, team_key: str | None) -> None:
+        if team_key is None or not hasattr(self, "_compare_player"):
+            return
+        p = self._compare_player
+        self.app.push_screen(
+            ComparisonScreen(
+                self.api, self.league, self.categories,
+                p, team_key, self._sgp_calc,
+            )
+        )
+
+
+class ComparisonScreen(Screen):
+    """Compare a watchlisted player against position-matched roster players."""
+    BINDINGS = [
+        ("escape", "go_back", "Back"),
+        ("q", "go_back", "Back"),
+    ]
+    CSS = """
+    #cmp-header {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #cmp-subheader {
+        height: 2;
+        padding: 0 1;
+        background: $surface;
+    }
+    #cmp-loading-container {
+        height: auto;
+        content-align: center middle;
+        padding: 1 0;
+    }
+    #cmp-loading-status {
+        height: 1;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    #cmp-spinner {
+        height: 3;
+    }
+    #cmp-scroll {
+        height: 1fr;
+    }
+    .cmp-table {
+        height: auto;
+        background: $panel;
+    }
+    DataTable > .datatable--cursor {
+        background: #3A5A3A;
+        color: #E8E4DF;
+    }
+    """
+
+    def __init__(self, api: YahooFantasyAPI, league: League,
+                 categories: list[StatCategory],
+                 watchlist_player: PlayerStats,
+                 team_key: str,
+                 sgp_calc: SGPCalculator | None) -> None:
+        super().__init__()
+        self.api = api
+        self.league = league
+        self.categories = categories
+        self._wl_player = watchlist_player
+        self._team_key = team_key
+        self._sgp_calc = sgp_calc
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("", id="cmp-header")
+        yield Static("", id="cmp-subheader")
+        with Vertical(id="cmp-loading-container"):
+            yield LoadingIndicator(id="cmp-spinner")
+            yield Static("Loading comparison...", id="cmp-loading-status")
+        yield VerticalScroll(id="cmp-scroll")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#cmp-header", Static).update(
+            f" {self.league.name} — Player Comparison "
+        )
+        sub = Text()
+        sub.append(f"\n Comparing ", style="dim")
+        sub.append(f"{self._wl_player.name}", style="bold #E8A735")
+        sub.append(f" ({self._wl_player.position})", style="dim")
+        sub.append(f" vs roster\n", style="dim")
+        self.query_one("#cmp-subheader", Static).update(sub)
+        self.run_worker(self._load_comparison)
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
+
+    async def _load_comparison(self) -> None:
+        try:
+            self.query_one("#cmp-loading-container").display = True
+            self.query_one("#cmp-scroll").display = False
+        except Exception:
+            pass
+
+        # Fetch the team's roster
+        roster = self.api.get_roster_stats_season(
+            self._team_key, self.league.current_week,
+        )
+
+        # Position-match: find roster players with overlapping positions
+        wl_positions = {pos.strip() for pos in self._wl_player.position.split(",")}
+        matched = []
+        for rp in roster:
+            rp_positions = {pos.strip() for pos in rp.position.split(",")}
+            if wl_positions & rp_positions:
+                matched.append(rp)
+
+        # Build comparison table
+        scroll = self.query_one("#cmp-scroll", VerticalScroll)
+        await scroll.remove_children()
+
+        if not matched:
+            await scroll.mount(Static(
+                "  No position-matched players found on this roster.\n",
+            ))
+        else:
+            table = DataTable(classes="cmp-table")
+            await scroll.mount(table)
+            self._render_comparison(table, matched)
+
+        try:
+            self.query_one("#cmp-loading-container").display = False
+            self.query_one("#cmp-scroll").display = True
+        except Exception:
+            pass
+
+    def _render_comparison(
+        self, table: DataTable, roster_players: list[PlayerStats],
+    ) -> None:
+        scored = [c for c in self.categories if not c.is_only_display]
+        # Determine if batter or pitcher based on watchlist player
+        batting_positions = {
+            "C", "1B", "2B", "3B", "SS", "LF", "CF", "RF",
+            "OF", "Util", "DH",
+        }
+        is_batter = any(
+            pos in batting_positions
+            for pos in self._wl_player.position.split(",")
+        )
+        cats = [c for c in scored if c.position_type == ("B" if is_batter else "P")]
+
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+
+        cols = ["Player".ljust(20), "Pos".ljust(15), "Team", "SGP"]
+        for cat in cats:
+            cols.append(cat.display_name)
+        table.add_columns(*cols)
+
+        # Watchlist player row (highlighted)
+        wl_sgp = self._sgp_calc.player_sgp(self._wl_player) if self._sgp_calc else None
+        wl_row: list[Text] = [
+            Text(("★ " + self._wl_player.name)[:20].ljust(20), style="bold #E8A735"),
+            Text(self._wl_player.position.ljust(15), style="dim"),
+            Text(self._wl_player.team_abbr, style="dim"),
+            Text(f"{wl_sgp:+.1f}" if wl_sgp is not None else "N/A",
+                 style="bold #E8A735", justify="right"),
+        ]
+        for cat in cats:
+            wl_row.append(Text(
+                self._wl_player.stats.get(cat.stat_id, "-"),
+                justify="right", style="#E8A735",
+            ))
+        table.add_row(*wl_row)
+
+        # For each roster player: their stats + delta row
+        for rp in roster_players:
+            rp_sgp = self._sgp_calc.player_sgp(rp) if self._sgp_calc else None
+
+            # Roster player row
+            rp_row: list[Text] = [
+                Text(rp.name[:20].ljust(20), style="bold"),
+                Text(rp.position.ljust(15), style="dim"),
+                Text(rp.team_abbr, style="dim"),
+                Text(f"{rp_sgp:+.1f}" if rp_sgp is not None else "N/A",
+                     justify="right"),
+            ]
+            for cat in cats:
+                rp_row.append(Text(rp.stats.get(cat.stat_id, "-"), justify="right"))
+            table.add_row(*rp_row)
+
+            # Delta row
+            delta_row: list[Text] = [
+                Text("  DELTA".ljust(20), style="italic dim"),
+                Text(""),
+                Text(""),
+                Text("", justify="right"),
+            ]
+
+            # SGP delta
+            if wl_sgp is not None and rp_sgp is not None:
+                sgp_delta = wl_sgp - rp_sgp
+                delta_style = "bold green" if sgp_delta > 0 else "bold red" if sgp_delta < 0 else "dim"
+                delta_row[3] = Text(f"{sgp_delta:+.1f}", style=delta_style, justify="right")
+
+            for cat in cats:
+                wl_val = self._wl_player.stats.get(cat.stat_id, "")
+                rp_val = rp.stats.get(cat.stat_id, "")
+                delta_text = self._compute_delta(wl_val, rp_val, cat)
+                delta_row.append(delta_text)
+            table.add_row(*delta_row)
+
+    def _compute_delta(
+        self, wl_val: str, rp_val: str, cat: StatCategory,
+    ) -> Text:
+        """Compute and format the delta between watchlist and roster values."""
+        try:
+            # Handle H/AB format
+            if "/" in wl_val and "/" in rp_val:
+                return Text("-", style="dim", justify="right")
+
+            wl_f = float(wl_val)
+            rp_f = float(rp_val)
+        except (ValueError, TypeError):
+            return Text("-", style="dim", justify="right")
+
+        # For stats where higher is better (sort_order == "1"), positive delta = good
+        # For stats where lower is better (sort_order == "0"), negative delta = good
+        raw_delta = wl_f - rp_f
+        if cat.sort_order == "0":
+            # Lower is better (ERA, WHIP) — flip for coloring
+            favorable = raw_delta < 0
+        else:
+            favorable = raw_delta > 0
+
+        if raw_delta == 0:
+            return Text("0", style="dim", justify="right")
+
+        # Format based on stat type
+        if cat.stat_id in ("3", "4", "5", "26", "27"):
+            # Rate stat — show 3 decimal places
+            formatted = f"{raw_delta:+.3f}"
+        elif "." in wl_val or "." in rp_val:
+            formatted = f"{raw_delta:+.2f}"
+        else:
+            formatted = f"{raw_delta:+.0f}"
+
+        style = "bold green" if favorable else "bold red"
+        return Text(formatted, style=style, justify="right")
 
 
 # --- Player Explorer Screen ---
@@ -3357,6 +4030,7 @@ class ScoreboardScreen(Screen):
                 ("f", "free_agents", "Free Agents"),
                 ("x", "transactions", "Transactions"),
                 ("p", "player_explorer", "Player Explorer"),
+                ("l", "watchlist", "Watchlist"),
                 ("w", "view_weekly", "Weekly"), ("d", "view_daily", "Daily"),
                 ("n", "view_season", "Season"),
                 ("comma", "prev_date", "< Prev Day"),
@@ -3916,6 +4590,12 @@ class ScoreboardScreen(Screen):
         if self.league:
             self.app.push_screen(
                 PlayerExplorerScreen(self.api, self.league, self.categories)
+            )
+
+    def action_watchlist(self) -> None:
+        if self.league:
+            self.app.push_screen(
+                WatchlistScreen(self.api, self.league, self.categories)
             )
 
     def action_mlb_scores(self) -> None:

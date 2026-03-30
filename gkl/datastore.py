@@ -37,6 +37,16 @@ CREATE TABLE IF NOT EXISTS sync_status (
     synced_at TEXT NOT NULL,
     PRIMARY KEY (league_key, week)
 );
+
+CREATE TABLE IF NOT EXISTS watchlist (
+    league_key TEXT NOT NULL,
+    player_key TEXT NOT NULL,
+    player_name TEXT NOT NULL,
+    player_position TEXT NOT NULL,
+    team_abbr TEXT NOT NULL DEFAULT '',
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (league_key, player_key)
+);
 """
 
 
@@ -321,6 +331,53 @@ class RosterDataStore:
             (league_key, f"%{query}%"),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    # --- Watchlist ---
+
+    def add_to_watchlist(
+        self, league_key: str, player_key: str, player_name: str,
+        player_position: str, team_abbr: str = "",
+    ) -> None:
+        from datetime import datetime
+        self._conn.execute(
+            """INSERT OR IGNORE INTO watchlist
+               (league_key, player_key, player_name, player_position,
+                team_abbr, added_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (league_key, player_key, player_name, player_position,
+             team_abbr, datetime.now().isoformat()),
+        )
+        self._conn.commit()
+
+    def remove_from_watchlist(self, league_key: str, player_key: str) -> None:
+        self._conn.execute(
+            "DELETE FROM watchlist WHERE league_key = ? AND player_key = ?",
+            (league_key, player_key),
+        )
+        self._conn.commit()
+
+    def get_watchlist(self, league_key: str) -> list[dict]:
+        rows = self._conn.execute(
+            """SELECT player_key, player_name, player_position, team_abbr, added_at
+               FROM watchlist WHERE league_key = ?
+               ORDER BY added_at DESC""",
+            (league_key,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def is_on_watchlist(self, league_key: str, player_key: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM watchlist WHERE league_key = ? AND player_key = ?",
+            (league_key, player_key),
+        ).fetchone()
+        return row is not None
+
+    def clear_watchlist(self, league_key: str) -> None:
+        self._conn.execute(
+            "DELETE FROM watchlist WHERE league_key = ?",
+            (league_key,),
+        )
+        self._conn.commit()
 
 
 def _accumulate_stats(target: dict, source: dict) -> None:
