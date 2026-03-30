@@ -2225,8 +2225,8 @@ class WatchlistScreen(Screen):
     BINDINGS = [
         ("escape", "go_back", "Back"),
         ("q", "go_back", "Back"),
+        ("c", "compare", "Compare"),
         ("d", "remove_player", "Remove"),
-        ("enter", "compare", "Compare"),
     ]
     CSS = """
     #wl-header {
@@ -2304,7 +2304,7 @@ class WatchlistScreen(Screen):
             f" {self.league.name} — Watchlist "
         )
         ctrl = Text()
-        ctrl.append("  [Enter] Compare to roster  [d] Remove  [Esc] Back", style="dim")
+        ctrl.append("  [c] Compare to roster  [d] Remove  [Esc] Back", style="dim")
         self.query_one("#wl-controls", Static).update(ctrl)
         self.run_worker(self._initial_load)
 
