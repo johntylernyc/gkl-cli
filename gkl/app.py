@@ -2677,7 +2677,8 @@ class PlayerExplorerScreen(Screen):
         color_idx = 0
 
         # Build day-by-day data from weekly timeline entries
-        day_data: dict[str, dict] = {}  # date_str -> {status, team_name, stats}
+        # Each day stores: status, team_name, week (for stat dedup), stats
+        day_data: dict[str, dict] = {}  # date_str -> {status, team_name, week, stats}
 
         for entry in timeline:
             ws = entry.get("week_start", "")
@@ -2685,6 +2686,7 @@ class PlayerExplorerScreen(Screen):
             status = entry.get("status", "not_owned")
             team_name = entry.get("team_name", "")
             stats = entry.get("stats", {})
+            week_num = entry.get("week", 0)
 
             if not ws or not we:
                 continue
@@ -2705,6 +2707,7 @@ class PlayerExplorerScreen(Screen):
                 day_data[d.strftime("%Y-%m-%d")] = {
                     "status": status,
                     "team_name": team_name,
+                    "week": week_num,
                     "stats": stats,
                 }
                 d += timedelta(days=1)
@@ -2768,10 +2771,10 @@ class PlayerExplorerScreen(Screen):
                     elif status == "il":
                         il_count += 1
 
-                # Accumulate stats once per week (on the week's start day)
-                if info and info["stats"] and d.weekday() == 0:
-                    week_key = f"{d.isocalendar()[1]}"
-                    if week_key not in weeks_seen and info["status"] != "not_owned":
+                # Accumulate stats once per fantasy week (deduplicate by week number)
+                if info and info.get("stats") and info["status"] != "not_owned":
+                    week_key = str(info.get("week", 0))
+                    if week_key != "0" and week_key not in weeks_seen:
                         weeks_seen.add(week_key)
                         _acc(month_stats, info["stats"])
 
