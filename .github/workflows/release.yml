@@ -76,3 +76,70 @@ jobs:
         with:
           files: artifacts/*
           generate_release_notes: true
+          body: |
+            ## Installation
+
+            Download the file for your operating system from the **Assets** section below.
+
+            ### macOS
+
+            1. Download **gkl-macos-arm64**
+            2. Open **Terminal** (Applications > Utilities > Terminal)
+            3. Navigate to where the file was downloaded:
+               ```
+               cd ~/Downloads
+               ```
+            4. Make the file executable:
+               ```
+               chmod +x gkl-macos-arm64
+               ```
+            5. Run it:
+               ```
+               ./gkl-macos-arm64
+               ```
+
+            > **Note:** If macOS shows a security warning, right-click the file in Finder, select **Open**, and confirm. Or run: `xattr -d com.apple.quarantine gkl-macos-arm64`
+
+            ### Windows
+
+            1. Download **gkl-windows-amd64.exe**
+            2. Open **Command Prompt** or **PowerShell** (search "cmd" or "PowerShell" in the Start menu)
+            3. Navigate to where the file was downloaded:
+               ```
+               cd %USERPROFILE%\Downloads
+               ```
+            4. Run it:
+               ```
+               gkl-windows-amd64.exe
+               ```
+
+            ### Linux
+
+            1. Download **gkl-linux-amd64**
+            2. Open a terminal
+            3. Navigate to where the file was downloaded:
+               ```
+               cd ~/Downloads
+               ```
+            4. Make the file executable and run it:
+               ```
+               chmod +x gkl-linux-amd64
+               ./gkl-linux-amd64
+               ```
+
+            ## First-Time Setup
+
+            On the first run, the app will guide you through creating Yahoo API credentials:
+
+            1. Go to https://developer.yahoo.com/apps/create/
+            2. Fill in the following:
+               - **Application Name:** Choose a name for your application
+               - **Description:** A terminal application for managing my fantasy baseball roster
+               - **Homepage URL:** Your personal website if you have one, otherwise choose a website (must be formatted as `https://www.yourwebsitename.com`)
+               - **Redirect URI:** `https://localhost:8080`
+               - **OAuth Client Type:** Confidential Client
+               - **API Permissions:** Fantasy Sports (Read)
+            3. After creating the app, Yahoo will provide a **Client ID** and **Client Secret** — paste these into the app when prompted
+            4. The app will open your browser to authorize access to your Yahoo Fantasy league — approve the request and paste the verification code back into the app
+
+            Your credentials are saved locally so you only need to do this once.

@@ -22,7 +22,7 @@ import httpx
 
 AUTH_URL = "https://api.login.yahoo.com/oauth2/request_auth"
 TOKEN_URL = "https://api.login.yahoo.com/oauth2/get_token"
-REDIRECT_URI = "oob"
+REDIRECT_URI = "https://localhost:8080"
 DEFAULT_TOKEN_PATH = Path.home() / ".config" / "gkl" / "token.json"
 DEFAULT_CREDENTIALS_PATH = Path.home() / ".config" / "gkl" / "credentials.json"
 

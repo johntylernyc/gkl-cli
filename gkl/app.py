@@ -3270,9 +3270,13 @@ def main() -> None:
             print(
                 "No saved credentials found.\n"
                 "Create an app at https://developer.yahoo.com/apps/create/\n"
-                "  - App type: Installed Application\n"
-                "  - Redirect URI: oob\n"
-                "  - API Permissions: Fantasy Sports (read)\n",
+                "  - Application Name: Choose a name for your application\n"
+                "  - Description: A terminal application for managing my fantasy baseball roster\n"
+                "  - Homepage URL: Your personal website if you have one, otherwise choose\n"
+                "    a website. It must be formatted as https://www.yourwebsitename.com\n"
+                "  - Redirect URI: https://localhost:8080\n"
+                "  - OAuth Client Type: Confidential Client\n"
+                "  - API Permissions: Fantasy Sports (Read)\n",
                 file=sys.stderr,
             )
             client_id = input("Yahoo Client ID: ").strip()
