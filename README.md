@@ -2,7 +2,7 @@
 
 A terminal-based application for Yahoo Fantasy Baseball leagues. Combines league data, advanced analytics, and real-time MLB scores into a single interface you can run from any terminal.
 
-Built with [Textual](https://github.com/Textualize/textual) for the terminal UI and the Yahoo Fantasy Sports API.
+Built with [Textual](https://github.com/Textualize/textual) for the terminal UI.
 
 ## Features
 
