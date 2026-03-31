@@ -4766,11 +4766,76 @@ class ScoreboardScreen(Screen):
         self.app.exit()
 
 
+# --- Splash Screen ---
+
+_SPLASH_ART = r"""
+[dim]                              ⠀⠀⠀⠀⠀⣀⣤⣤⣤⣀⠀⠀⠀⠀⠀[/]
+[dim]                          ⠀⠀⠀⣠⣶⣿⣿⣿⣿⣿⣿⣶⣄⠀⠀⠀[/]
+[dim]                        ⠀⠀⣴⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⠀⠀[/]
+[dim]                       ⠀⣼⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣧⠀[/]
+[dim]                      ⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀[/]
+[dim]                      ⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀[/]
+[dim]                       ⠀⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠀[/]
+[dim]                        ⠀⠈⢿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠁⠀⠀[/]
+[dim]                          ⠀⠀⠉⠻⣿⣿⣿⣿⠟⠉⠀⠀⠀⠀[/]
+[dim]                              ⠀⠀⠀⠈⠉⠁⠀⠀⠀⠀⠀⠀⠀[/]
+
+[dim]        ╔═══════════════════════════════════════════════════════╗[/]
+[dim]        ║[/][bold #D4A84B]    ┌─┐  ┌─┐  ┬   ┌─┐  ┌─┐  ┌┐┌         [/][dim]║[/]
+[dim]        ║[/][bold #D4A84B]    │ ┬  │ │  │   │ │  ├┤   │││         [/][dim]║[/]
+[dim]        ║[/][bold #D4A84B]    └─┘  └─┘  ┴─┘ └─┘  └─┘  ┘└┘         [/][dim]║[/]
+[dim]        ║[/][bold #E8A735]    ┬┌─  ┌┐┌  ┬  ┌─┐  ┬ ┬  ┌┬┐         [/][dim]║[/]
+[dim]        ║[/][bold #E8A735]    ├┴┐  │││  │  │ ┬  ├─┤   │          [/][dim]║[/]
+[dim]        ║[/][bold #E8A735]    ┴ ┴  ┘└┘  ┴  └─┘  ┴ ┴   ┴          [/][dim]║[/]
+[dim]        ║[/][bold #C75D5D]    ┬    ┌─┐  ┬ ┬  ┌┐┌  ┌─┐  ┌─┐      [/][dim]║[/]
+[dim]        ║[/][bold #C75D5D]    │    │ │  │ │  │││  │ ┬  ├┤       [/][dim]║[/]
+[dim]        ║[/][bold #C75D5D]    ┴─┘  └─┘  └─┘  ┘└┘  └─┘  └─┘      [/][dim]║[/]
+[dim]        ╚═══════════════════════════════════════════════════════╝[/]
+
+[dim italic]                  ── Terminal Command Center ──[/]
+
+
+[dim]     ┌───────────────────────────────────────────────────────────┐[/]
+[dim]     │[/]                                                         [dim]│[/]
+[dim]     │[/]  [#4A7C59]◆[/] [bold]Scoreboard[/]     [#4A7C59]◆[/] [bold]Roto Standings[/]   [#4A7C59]◆[/] [bold]H2H Simulator[/]  [dim]│[/]
+[dim]     │[/]  [#4A7C59]◆[/] [bold]Roster[/]         [#4A7C59]◆[/] [bold]Free Agents[/]      [#4A7C59]◆[/] [bold]Transactions[/]   [dim]│[/]
+[dim]     │[/]  [#4A7C59]◆[/] [bold]Player Explorer[/] [#4A7C59]◆[/] [bold]Watchlist[/]        [#4A7C59]◆[/] [bold]MLB Scores[/]     [dim]│[/]
+[dim]     │[/]                                                         [dim]│[/]
+[dim]     └───────────────────────────────────────────────────────────┘[/]
+
+[dim italic]               Press any key to enter the lounge...[/]
+"""
+
+
+class SplashScreen(Screen):
+    """Animated baseball-themed splash screen."""
+    BINDINGS = [("any", "continue", "Continue")]
+    AUTO_FOCUS = None
+    CSS = """
+    SplashScreen {
+        align: center middle;
+        background: #181818;
+    }
+    #splash-art {
+        width: auto;
+        height: auto;
+        content-align: center middle;
+        text-align: center;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Static(_SPLASH_ART, id="splash-art", markup=True)
+
+    def on_key(self, event) -> None:
+        self.dismiss(True)
+
+
 # --- App ---
 
 
 class GklApp(App):
-    TITLE = "GKL — Fantasy Baseball Command Center"
+    TITLE = "Golden Knight Lounge — Terminal Command Center"
     CSS = """
     Screen {
         background: $background;
@@ -4784,6 +4849,9 @@ class GklApp(App):
     def on_mount(self) -> None:
         self.register_theme(BASEBALL_THEME)
         self.theme = "baseball"
+        self.push_screen(SplashScreen(), callback=self._on_splash_dismissed)
+
+    def _on_splash_dismissed(self, result) -> None:
         self.push_screen(ScoreboardScreen(self.api))
 
 
