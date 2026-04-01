@@ -23,6 +23,7 @@ from textual.widgets import (
     Static,
 )
 
+from gkl.shared_cache import SharedDataCache
 from gkl.yahoo_api import (
     League, Matchup, PlayerStats, StatCategory, TeamStats, Transaction,
     YahooFantasyAPI,
@@ -189,8 +190,6 @@ class RotoStandingsScreen(Screen):
         self._week_start = 1
         self._week_end = max(1, league.current_week)
         self._max_week = max(1, league.current_week)
-        # Cache: week -> list[TeamStats]
-        self._week_cache: dict[int, list[TeamStats]] = {}
         # Per-week roto ranks for chart: {team_name: [rank_wk1, rank_wk2, ...]}
         self._weekly_ranks: dict[str, list[float]] = {}
 
@@ -228,25 +227,25 @@ class RotoStandingsScreen(Screen):
     async def _fetch_and_render(self) -> None:
         from gkl.stats import aggregate_weekly_stats
 
+        cache = self.app.shared_cache
         scored = [c for c in self.categories if not c.is_only_display]
 
-        # Fetch all weeks we need (use cache)
-        weekly_data: list[list[TeamStats]] = []
-        for w in range(self._week_start, self._week_end + 1):
-            if w not in self._week_cache:
-                self._week_cache[w] = self.api.get_team_week_stats(
-                    self.league.league_key, w)
-            weekly_data.append(self._week_cache[w])
+        # Prefetch all needed weeks in parallel via shared cache
+        needed = list(range(self._week_start, self._week_end + 1))
+        await cache.prefetch_weeks(self.api, self.league.league_key, needed)
+
+        weekly_data = [cache.week_team_stats[w] for w in needed]
 
         # Aggregate for the selected range
         if self._week_start == 1 and self._week_end == self._max_week:
             # Full season — use the faster season endpoint
-            self.teams = self.api.get_team_season_stats(self.league.league_key)
+            self.teams = await asyncio.to_thread(
+                self.api.get_team_season_stats, self.league.league_key)
         else:
             self.teams = aggregate_weekly_stats(weekly_data, self.categories)
 
         # Compute per-week cumulative roto ranks for chart
-        self._compute_weekly_ranks(scored)
+        await self._compute_weekly_ranks(scored)
 
         loading = self.query("#roto-loading")
         if loading:
@@ -256,22 +255,19 @@ class RotoStandingsScreen(Screen):
         self._render_table()
         self._render_chart()
 
-    def _compute_weekly_ranks(self, cats: list[StatCategory]) -> None:
+    async def _compute_weekly_ranks(self, cats: list[StatCategory]) -> None:
         """Compute cumulative roto rank at each week for the chart."""
         from gkl.stats import aggregate_weekly_stats
 
+        cache = self.app.shared_cache
         self._weekly_ranks = {}
         weeks = list(range(1, self._max_week + 1))
 
-        for end_week in weeks:
-            # Get cumulative stats 1..end_week
-            week_data = []
-            for w in range(1, end_week + 1):
-                if w not in self._week_cache:
-                    self._week_cache[w] = self.api.get_team_week_stats(
-                        self.league.league_key, w)
-                week_data.append(self._week_cache[w])
+        # Prefetch all weeks via shared cache
+        await cache.prefetch_weeks(self.api, self.league.league_key, weeks)
 
+        for end_week in weeks:
+            week_data = [cache.week_team_stats[w] for w in range(1, end_week + 1)]
             cum_teams = aggregate_weekly_stats(week_data, self.categories)
             standings = _compute_roto(cum_teams, cats)
 
@@ -482,8 +478,6 @@ class H2HSimulatorScreen(Screen):
         self._season_mode = False
         self._team_keys: list[str] = []
         self._team_idx = 0
-        self._week_cache: dict[int, list[TeamStats]] = {}
-        self._matchup_cache: dict[int, list[Matchup]] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -507,7 +501,7 @@ class H2HSimulatorScreen(Screen):
         self.run_worker(self._load)
 
     async def _load(self) -> None:
-        teams = self._get_week_teams(self._week)
+        teams = await self._get_week_teams(self._week)
         self._team_keys = [t.team_key for t in teams]
         if not self._team_keys:
             return
@@ -518,17 +512,13 @@ class H2HSimulatorScreen(Screen):
 
         await self._render_all()
 
-    def _get_week_teams(self, week: int) -> list[TeamStats]:
-        if week not in self._week_cache:
-            self._week_cache[week] = self.api.get_team_week_stats(
-                self.league.league_key, week)
-        return self._week_cache[week]
+    async def _get_week_teams(self, week: int) -> list[TeamStats]:
+        return await self.app.shared_cache.get_week_teams(
+            self.api, self.league.league_key, week)
 
-    def _get_week_matchups(self, week: int) -> list[Matchup]:
-        if week not in self._matchup_cache:
-            self._matchup_cache[week] = self.api.get_scoreboard(
-                self.league.league_key, week)
-        return self._matchup_cache[week]
+    async def _get_week_matchups(self, week: int) -> list[Matchup]:
+        return await self.app.shared_cache.get_week_matchups(
+            self.api, self.league.league_key, week)
 
     def _find_actual_opponent(self, team_key: str, matchups: list[Matchup]) -> tuple[str, str]:
         """Find the actual opponent and result for a team in a week's matchups.
@@ -558,7 +548,7 @@ class H2HSimulatorScreen(Screen):
         return "", ""
 
     async def _render_all(self) -> None:
-        teams = self._get_week_teams(self._week)
+        teams = await self._get_week_teams(self._week)
         selected_key = self._team_keys[self._team_idx]
         selected_team = next((t for t in teams if t.team_key == selected_key), None)
         if not selected_team:
@@ -576,7 +566,7 @@ class H2HSimulatorScreen(Screen):
 
     async def _render_week(self, teams: list[TeamStats], selected_key: str,
                            selected_team: TeamStats) -> None:
-        matchups = self._get_week_matchups(self._week)
+        matchups = await self._get_week_matchups(self._week)
         preevent = self._week_is_preevent(matchups)
         actual_opp_key, actual_result = self._find_actual_opponent(selected_key, matchups)
 
@@ -641,14 +631,29 @@ class H2HSimulatorScreen(Screen):
         self.query_one("#h2h-controls", Static).update(ctrl)
         self.query_one("#h2h-actual", Static).update("")
 
+        # Prefetch all weeks in parallel via shared cache
+        cache = self.app.shared_cache
+        all_weeks = list(range(1, self._max_week + 1))
+        await cache.prefetch_weeks(self.api, self.league.league_key, all_weeks)
+        # Also prefetch matchups in parallel
+        missing_matchups = [w for w in all_weeks if w not in cache.week_matchups]
+        if missing_matchups:
+            matchup_results = await asyncio.gather(*[
+                asyncio.to_thread(self.api.get_scoreboard,
+                                  self.league.league_key, w)
+                for w in missing_matchups
+            ])
+            for w, data in zip(missing_matchups, matchup_results):
+                cache.week_matchups[w] = data
+
         # Aggregate across all weeks (skip preevent weeks)
         all_rankings: list[list[TeamH2HSummary]] = []
         all_h2h: dict[str, dict[str, H2HResult]] = {}
-        for w in range(1, self._max_week + 1):
-            w_matchups = self._get_week_matchups(w)
+        for w in all_weeks:
+            w_matchups = cache.week_matchups[w]
             if self._week_is_preevent(w_matchups):
                 continue
-            w_teams = self._get_week_teams(w)
+            w_teams = cache.week_team_stats[w]
             h2h = simulate_h2h(w_teams, self.categories)
             rankings = compute_power_rankings(h2h, w_teams)
             all_rankings.append(rankings)
@@ -1213,39 +1218,18 @@ class RosterAnalysisScreen(Screen):
             scroll.first().display = True
 
     async def _initial_load(self) -> None:
-        await self._show_loading("Fetching league data...")
-        self._all_teams = await asyncio.to_thread(
-            self.api.get_team_season_stats, self.league.league_key,
+        cache = self.app.shared_cache
+        await cache.ensure_loaded(
+            self.api, self.league, self.categories,
+            progress_cb=self._show_loading,
         )
-        self._team_keys = [t.team_key for t in self._all_teams]
-        self._team_names = {t.team_key: t.name for t in self._all_teams}
-        self._draft_results = await asyncio.to_thread(
-            self.api.get_draft_results, self.league.league_key,
-        )
-
-        # Fetch free agents per position for SGP replacement baselines
-        replacement_by_pos: dict[str, list[PlayerStats]] = {}
-        for pos in ("C", "1B", "2B", "3B", "SS", "OF", "SP", "RP"):
-            await self._show_loading(f"Computing SGP baselines ({pos})...")
-            players, _ = await asyncio.to_thread(
-                self.api.get_free_agents,
-                self.league.league_key, stat_type="season",
-                position=pos, sort="AR", sort_type="season", count=25,
-            )
-            replacement_by_pos[pos] = players
-        self._sgp_calc = SGPCalculator(
-            self._all_teams, self.categories, replacement_by_pos,
-        )
-
-        # Build rank lookups (no status filter = all players = true overall rank)
-        await self._show_loading("Fetching Yahoo rankings...")
-        self._rank_lookup = await asyncio.to_thread(
-            self.api.build_rank_lookup, self.league.league_key, "AR",
-        )
-        await self._show_loading("Loading pre-season rankings...")
-        self._preseason_rank_lookup = await asyncio.to_thread(
-            self.api.get_preseason_ranks, self.league.league_key,
-        )
+        self._all_teams = cache.all_teams
+        self._team_keys = cache.team_keys
+        self._team_names = cache.team_names
+        self._draft_results = cache.draft_results
+        self._sgp_calc = cache.sgp_calc
+        self._rank_lookup = cache.rank_lookup
+        self._preseason_rank_lookup = cache.preseason_rank_lookup
 
         # Prompt user to select a team
         options = [(k, self._team_names.get(k, k)) for k in self._team_keys]
@@ -1750,30 +1734,16 @@ class FreeAgentScreen(Screen):
 
     async def _initial_load(self) -> None:
         """One-time setup: fetch league data, draft results, and SGP baselines."""
-        await self._show_loading("Fetching league data for SGP baselines...")
-        all_teams = await asyncio.to_thread(
-            self.api.get_team_season_stats, self.league.league_key)
-        self._draft_results = await asyncio.to_thread(
-            self.api.get_draft_results, self.league.league_key)
-
-        replacement_by_pos: dict[str, list[PlayerStats]] = {}
-        for pos in ("C", "1B", "2B", "3B", "SS", "OF", "SP", "RP"):
-            await self._show_loading(f"Computing SGP baselines ({pos})...")
-            players, _ = await asyncio.to_thread(
-                self.api.get_free_agents,
-                self.league.league_key, stat_type="season",
-                position=pos, sort="AR", sort_type="season", count=25)
-            replacement_by_pos[pos] = players
-        self._sgp_calc = SGPCalculator(
-            all_teams, self.categories, replacement_by_pos)
+        cache = self.app.shared_cache
+        await cache.ensure_loaded(
+            self.api, self.league, self.categories,
+            progress_cb=self._show_loading,
+        )
+        self._draft_results = cache.draft_results
+        self._sgp_calc = cache.sgp_calc
         self._baselines_loaded = True
-
-        await self._show_loading("Fetching Yahoo rankings...")
-        self._rank_lookup = await asyncio.to_thread(
-            self.api.build_rank_lookup, self.league.league_key, "AR")
-        await self._show_loading("Loading pre-season rankings...")
-        self._preseason_rank_lookup = await asyncio.to_thread(
-            self.api.get_preseason_ranks, self.league.league_key)
+        self._rank_lookup = cache.rank_lookup
+        self._preseason_rank_lookup = cache.preseason_rank_lookup
 
         # Now load the first page of free agents
         await self._load_free_agents()
@@ -2328,31 +2298,14 @@ class WatchlistScreen(Screen):
             pass
 
     async def _initial_load(self) -> None:
-        await self._show_loading("Loading SGP baselines...")
-        all_teams = await asyncio.to_thread(
-            self.api.get_team_season_stats, self.league.league_key,
+        cache = self.app.shared_cache
+        await cache.ensure_loaded(
+            self.api, self.league, self.categories,
+            progress_cb=self._show_loading,
         )
-        replacement_by_pos: dict[str, list[PlayerStats]] = {}
-        for pos in ("C", "1B", "2B", "3B", "SS", "OF", "SP", "RP"):
-            await self._show_loading(f"Loading SGP baselines ({pos})...")
-            players, _ = await asyncio.to_thread(
-                self.api.get_free_agents,
-                self.league.league_key, stat_type="season",
-                position=pos, sort="AR", sort_type="season", count=25,
-            )
-            replacement_by_pos[pos] = players
-        self._sgp_calc = SGPCalculator(
-            all_teams, self.categories, replacement_by_pos,
-        )
-
-        await self._show_loading("Fetching Yahoo rankings...")
-        self._rank_lookup = await asyncio.to_thread(
-            self.api.build_rank_lookup, self.league.league_key, "AR",
-        )
-        await self._show_loading("Loading pre-season rankings...")
-        self._preseason_rank_lookup = await asyncio.to_thread(
-            self.api.get_preseason_ranks, self.league.league_key,
-        )
+        self._sgp_calc = cache.sgp_calc
+        self._rank_lookup = cache.rank_lookup
+        self._preseason_rank_lookup = cache.preseason_rank_lookup
 
         await self._load_watchlist()
 
@@ -4421,6 +4374,27 @@ class ScoreboardScreen(Screen):
             loading.first().remove()
         self._populate_matchups()
 
+        # Start background prefetch for secondary screens
+        self.run_worker(self._prefetch_background, group="prefetch", exclusive=True)
+
+    async def _prefetch_background(self) -> None:
+        """Prefetch expensive data while user browses the scoreboard."""
+        if not self.league:
+            return
+
+        cache = self.app.shared_cache
+
+        # 1. SGP setup (benefits Roster Analysis, Free Agents, Watchlist)
+        await cache.ensure_loaded(self.api, self.league, self.categories)
+
+        # 2. Statcast cache warm-up (benefits Roster Analysis, Watchlist)
+        from gkl.statcast import _ensure_cache
+        await asyncio.to_thread(_ensure_cache)
+
+        # 3. Weekly team stats (benefits Roto Standings, H2H Simulator)
+        weeks = list(range(1, self.league.current_week + 1))
+        await cache.prefetch_weeks(self.api, self.league.league_key, weeks)
+
     async def _refresh_data(self) -> None:
         if not self.league:
             return
@@ -4858,6 +4832,7 @@ class GklApp(App):
         self.api = api
         self.store = RosterDataStore()
         self._leagues: list[League] = []
+        self.shared_cache = SharedDataCache()
 
     def on_mount(self) -> None:
         self.register_theme(BASEBALL_THEME)
