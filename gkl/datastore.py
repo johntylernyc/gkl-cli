@@ -49,6 +49,11 @@ CREATE TABLE IF NOT EXISTS watchlist (
     added_at TEXT NOT NULL,
     PRIMARY KEY (league_key, player_key)
 );
+
+CREATE TABLE IF NOT EXISTS user_prefs (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -423,6 +428,21 @@ class RosterDataStore:
         self._conn.execute(
             "DELETE FROM watchlist WHERE league_key = ?",
             (league_key,),
+        )
+        self._conn.commit()
+
+    # --- User preferences ---------------------------------------------------
+
+    def get_pref(self, key: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM user_prefs WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+
+    def set_pref(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO user_prefs (key, value) VALUES (?, ?)",
+            (key, value),
         )
         self._conn.commit()
 

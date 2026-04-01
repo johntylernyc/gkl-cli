@@ -27,6 +27,7 @@ from gkl.yahoo_api import (
     League, Matchup, PlayerStats, StatCategory, TeamStats, Transaction,
     YahooFantasyAPI,
 )
+from gkl.datastore import RosterDataStore
 from gkl.yahoo_auth import YahooAuth, load_credentials, save_credentials
 from gkl.stats import (
     who_wins, simulate_h2h, compute_power_rankings, aggregate_h2h_season,
@@ -4144,6 +4145,78 @@ class MLBScoreboardScreen(Screen):
         self.app.pop_screen()
 
 
+# --- League Selection Screen ---
+
+
+class LeagueSelectScreen(Screen):
+    """Full-screen league picker shown when user has multiple leagues."""
+    BINDINGS = [("escape", "quit", "Quit"), ("q", "quit", "Quit")]
+    CSS = """
+    LeagueSelectScreen {
+        align: center middle;
+    }
+    #league-select-container {
+        width: 60;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #league-select-title {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+        margin-bottom: 1;
+    }
+    #league-select-list {
+        height: auto;
+        max-height: 70%;
+    }
+    #league-select-list > ListItem {
+        height: 1;
+        padding: 0 1;
+    }
+    #league-select-list > ListItem.--highlight {
+        background: #3A5A3A;
+    }
+    """
+
+    def __init__(self, leagues: list[League], last_league_key: str | None = None) -> None:
+        super().__init__()
+        self.leagues = leagues
+        self.last_league_key = last_league_key
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="league-select-container"):
+            yield Static("Select League", id="league-select-title")
+            yield ListView(id="league-select-list")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#league-select-list", ListView)
+        highlight_idx = 0
+        for i, league in enumerate(self.leagues):
+            label = Text()
+            label.append(f"{league.name}", style="bold")
+            label.append(f"  {league.season}  •  {league.num_teams} teams", style="dim")
+            item = ListItem(Label(label))
+            item._league = league
+            lv.mount(item)
+            if self.last_league_key and league.league_key == self.last_league_key:
+                highlight_idx = i
+        lv.index = highlight_idx
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        league = getattr(event.item, "_league", None)
+        if league:
+            self.dismiss(league)
+
+    def action_quit(self) -> None:
+        self.app.exit()
+
+
 # --- Scoreboard Screen (3-pane layout) ---
 
 
@@ -4163,7 +4236,8 @@ class ScoreboardScreen(Screen):
                 ("full_stop", "next_date", "> Next Day"),
                 ("left", "prev_week", "Prev Week"),
                 ("right", "next_week", "Next Week"),
-                ("e", "select_week", "Select Week")]
+                ("e", "select_week", "Select Week"),
+                ("L", "switch_league", "Switch League")]
     CSS = """
     #board-header {
         height: 1;
@@ -4297,10 +4371,10 @@ class ScoreboardScreen(Screen):
     }
     """
 
-    def __init__(self, api: YahooFantasyAPI) -> None:
+    def __init__(self, api: YahooFantasyAPI, league: League) -> None:
         super().__init__()
         self.api = api
-        self.league: League | None = None
+        self.league = league
         self.matchups: list[Matchup] = []
         self.categories: list[StatCategory] = []
         self._selected_idx: int | None = None
@@ -4337,14 +4411,6 @@ class ScoreboardScreen(Screen):
             self.run_worker(self._refresh_data)
 
     async def _load(self) -> None:
-        leagues = self.api.get_user_leagues()
-        if not leagues:
-            loading = self.query("#loading-msg")
-            if loading:
-                loading.first().update("No MLB leagues found.")
-            return
-
-        self.league = leagues[0]
         self.categories = self.api.get_stat_categories(self.league.league_key)
         week = self._viewing_week if self._viewing_week is not None else None
         self.matchups = self.api.get_scoreboard(self.league.league_key, week=week)
@@ -4379,6 +4445,8 @@ class ScoreboardScreen(Screen):
         else:
             sub.append(f"  (←→ week, [e] select)", style="dim")
         sub.append(f"  |  {self.league.season} Season  |  {self.league.num_teams} Teams")
+        if len(getattr(self.app, "_leagues", [])) > 1:
+            sub.append("  |  [L] Switch League", style="dim")
         self.query_one("#board-subheader", Static).update(sub)
 
     def _populate_matchups(self) -> None:
@@ -4762,6 +4830,14 @@ class ScoreboardScreen(Screen):
         if week is not None:
             self._load_week(week)
 
+    def action_switch_league(self) -> None:
+        leagues = getattr(self.app, "_leagues", [])
+        if len(leagues) > 1:
+            self.app.pop_screen()
+            self.app._show_league_picker(leagues, self.league.league_key)
+        else:
+            self.notify("Only one league available", severity="information")
+
     def action_quit(self) -> None:
         self.app.exit()
 
@@ -4780,11 +4856,36 @@ class GklApp(App):
     def __init__(self, api: YahooFantasyAPI) -> None:
         super().__init__()
         self.api = api
+        self.store = RosterDataStore()
+        self._leagues: list[League] = []
 
     def on_mount(self) -> None:
         self.register_theme(BASEBALL_THEME)
         self.theme = "baseball"
-        self.push_screen(ScoreboardScreen(self.api))
+        self.run_worker(self._init_league_selection)
+
+    async def _init_league_selection(self) -> None:
+        leagues = self.api.get_user_leagues()
+        self._leagues = leagues
+        if not leagues:
+            self.notify("No MLB leagues found.", severity="error")
+            return
+        if len(leagues) == 1:
+            self.push_screen(ScoreboardScreen(self.api, leagues[0]))
+        else:
+            last_key = self.store.get_pref("last_league_key")
+            self._show_league_picker(leagues, last_key)
+
+    def _show_league_picker(
+        self, leagues: list[League], last_key: str | None
+    ) -> None:
+        def on_league_selected(league: League) -> None:
+            self.store.set_pref("last_league_key", league.league_key)
+            self.push_screen(ScoreboardScreen(self.api, league))
+
+        self.push_screen(
+            LeagueSelectScreen(leagues, last_key), callback=on_league_selected
+        )
 
 
 def main() -> None:
