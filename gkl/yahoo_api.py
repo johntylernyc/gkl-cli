@@ -616,8 +616,7 @@ class YahooFantasyAPI:
     def get_team_week_stats(self, league_key: str, week: int) -> list[TeamStats]:
         """Get stats for all teams for a specific week."""
         return self._get_all_team_stats(
-            f"league/{league_key}/teams;out=stats"
-            f";stats_type=week;stats_week={week}"
+            f"league/{league_key}/teams/stats;type=week;week={week}"
         )
 
     def _get_all_team_stats(self, path: str) -> list[TeamStats]:

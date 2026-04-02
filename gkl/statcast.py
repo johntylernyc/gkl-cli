@@ -44,7 +44,7 @@ class StatcastPitcher:
     k_pct: float | None = None          # strikeout rate
     bb_pct: float | None = None         # walk rate
     whiff_pct: float | None = None      # whiff rate (swings & misses / swings)
-    csw_pct: float | None = None        # called strikes + whiffs %
+    chase_pct: float | None = None       # out-of-zone swing %
     avg_spin: float | None = None       # average spin rate
     avg_velo: float | None = None       # average fastball velocity
 
@@ -115,10 +115,13 @@ def _load_rate_stats(year: int, player_type: str, cache: dict) -> None:
     import csv
     import io
     try:
+        selections = "k_percent,bb_percent,whiff_percent"
+        if player_type == "pitcher":
+            selections += ",fastball_avg_speed,oz_swing_percent"
         url = (
             "https://baseballsavant.mlb.com/leaderboard/custom"
             f"?year={year}&type={player_type}&min=0"
-            "&selections=k_percent,bb_percent,whiff_percent&csv=true"
+            f"&selections={selections}&csv=true"
         )
         resp = httpx.get(url, timeout=30, follow_redirects=True)
         resp.raise_for_status()
@@ -153,6 +156,15 @@ def _load_rate_stats(year: int, player_type: str, cache: dict) -> None:
                     val = fields[col["whiff_percent"]].strip()
                     if val:
                         entry.whiff_pct = float(val)
+                if player_type == "pitcher":
+                    if "fastball_avg_speed" in col:
+                        val = fields[col["fastball_avg_speed"]].strip()
+                        if val:
+                            entry.avg_velo = float(val)
+                    if "oz_swing_percent" in col:
+                        val = fields[col["oz_swing_percent"]].strip()
+                        if val:
+                            entry.chase_pct = float(val)
                 cache[pid] = entry
             except (ValueError, IndexError, KeyError):
                 continue
@@ -511,7 +523,7 @@ def get_statcast_league_averages(
         attrs = [
             "avg_exit_velo", "barrel_pct", "hard_hit_pct",
             "xba", "xslg", "xwoba", "xera",
-            "k_pct", "bb_pct", "whiff_pct", "csw_pct", "avg_velo",
+            "k_pct", "bb_pct", "whiff_pct", "chase_pct", "avg_velo",
         ]
 
     # Collect all non-None values per attr across years

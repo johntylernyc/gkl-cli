@@ -25,7 +25,7 @@ from textual.widgets import (
 
 from gkl.shared_cache import SharedDataCache
 from gkl.yahoo_api import (
-    League, Matchup, PlayerStats, StatCategory, TeamStats, Transaction,
+    League, Matchup, PlayerStats, StatCategory, TeamStats, Transaction, TransactionPlayer,
     YahooFantasyAPI,
 )
 from gkl.datastore import RosterDataStore
@@ -136,8 +136,7 @@ class RotoStandingsScreen(Screen):
     BINDINGS = [("escape", "go_back", "Back"), ("q", "go_back", "Back"),
                 ("1", "show_overall", "Overall"), ("2", "show_batting", "Batting"),
                 ("3", "show_pitching", "Pitching"),
-                ("left", "dec_start", "Start -1"), ("right", "inc_start", "Start +1"),
-                ("down", "dec_end", "End -1"), ("up", "inc_end", "End +1"),
+                ("w", "pick_weeks", "Weeks"),
                 ("a", "select_all", "All Weeks")]
     CSS = """
     #roto-header {
@@ -218,7 +217,7 @@ class RotoStandingsScreen(Screen):
         ctrl.append("[1] Overall  [2] Batting  [3] Pitching", style="dim")
         ctrl.append("  |  ")
         ctrl.append(f"Weeks {self._week_start}-{self._week_end}", style="bold")
-        ctrl.append(f"  (←→ start, ↑↓ end, [a] all)", style="dim")
+        ctrl.append(f"  ([w] change, [a] all)", style="dim")
         self.query_one("#roto-controls", Static).update(ctrl)
 
     async def _load(self) -> None:
@@ -366,29 +365,16 @@ class RotoStandingsScreen(Screen):
         self._current_view = "pitching"
         self._render_table()
 
-    def action_dec_start(self) -> None:
-        if self._week_start > 1:
-            self._week_start -= 1
-            self._update_controls()
-            self.run_worker(self._fetch_and_render, group="roto-fetch", exclusive=True)
-
-    def action_inc_start(self) -> None:
-        if self._week_start < self._week_end:
-            self._week_start += 1
-            self._update_controls()
-            self.run_worker(self._fetch_and_render, group="roto-fetch", exclusive=True)
-
-    def action_dec_end(self) -> None:
-        if self._week_end > self._week_start:
-            self._week_end -= 1
-            self._update_controls()
-            self.run_worker(self._fetch_and_render, group="roto-fetch", exclusive=True)
-
-    def action_inc_end(self) -> None:
-        if self._week_end < self._max_week:
-            self._week_end += 1
-            self._update_controls()
-            self.run_worker(self._fetch_and_render, group="roto-fetch", exclusive=True)
+    def action_pick_weeks(self) -> None:
+        def _on_result(result: tuple[int, int] | None) -> None:
+            if result is not None:
+                self._week_start, self._week_end = result
+                self._update_controls()
+                self.run_worker(self._fetch_and_render, group="roto-fetch", exclusive=True)
+        self.app.push_screen(
+            WeekRangeModal(self._max_week, self._week_start, self._week_end),
+            callback=_on_result,
+        )
 
     def action_select_all(self) -> None:
         self._week_start = 1
@@ -940,6 +926,117 @@ class WeekSelectModal(Screen):
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         week = getattr(event.item, "_week", None)
         self.dismiss(week)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class WeekRangeModal(Screen):
+    """Modal for selecting a start and end week range."""
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+        ("up", "switch_field", "Switch"),
+        ("down", "switch_field", "Switch"),
+        ("left", "decrement", "-1"),
+        ("right", "increment", "+1"),
+        ("enter", "confirm", "Confirm"),
+    ]
+    CSS = """
+    WeekRangeModal {
+        align: center middle;
+    }
+    #week-range-container {
+        width: 44;
+        height: auto;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #week-range-title {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+        margin-bottom: 1;
+    }
+    .week-range-row {
+        height: 1;
+        padding: 0 1;
+    }
+    .week-range-row.--active {
+        background: #3A5A3A;
+    }
+    #week-range-hint {
+        height: 1;
+        content-align: center middle;
+        color: $text-muted;
+        margin-top: 1;
+    }
+    """
+
+    def __init__(self, max_week: int, week_start: int, week_end: int) -> None:
+        super().__init__()
+        self.max_week = max_week
+        self._start = week_start
+        self._end = week_end
+        self._field = 0  # 0 = start, 1 = end
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="week-range-container"):
+            yield Static("Select Week Range", id="week-range-title")
+            yield Static("", id="week-range-start", classes="week-range-row")
+            yield Static("", id="week-range-end", classes="week-range-row")
+            yield Static("↑↓ switch  ←→ adjust  enter confirm", id="week-range-hint")
+
+    def on_mount(self) -> None:
+        self._refresh_display()
+
+    def _refresh_display(self) -> None:
+        start_label = self.query_one("#week-range-start", Static)
+        end_label = self.query_one("#week-range-end", Static)
+
+        s_text = Text()
+        s_text.append("  Start Week:  ", style="bold" if self._field == 0 else "")
+        s_text.append(f"◀ Week {self._start} ▶", style="bold")
+        start_label.update(s_text)
+
+        e_text = Text()
+        e_text.append("  End Week:    ", style="bold" if self._field == 1 else "")
+        e_text.append(f"◀ Week {self._end} ▶", style="bold")
+        end_label.update(e_text)
+
+        start_label.set_class(self._field == 0, "--active")
+        end_label.set_class(self._field == 1, "--active")
+
+    def action_switch_field(self) -> None:
+        self._field = 1 - self._field
+        self._refresh_display()
+
+    def action_decrement(self) -> None:
+        if self._field == 0:
+            if self._start > 1:
+                self._start -= 1
+                if self._end < self._start:
+                    self._end = self._start
+        else:
+            if self._end > self._start:
+                self._end -= 1
+        self._refresh_display()
+
+    def action_increment(self) -> None:
+        if self._field == 0:
+            if self._start < self._end:
+                self._start += 1
+        else:
+            if self._end < self.max_week:
+                self._end += 1
+                if self._start > self._end:
+                    self._start = self._end
+        self._refresh_display()
+
+    def action_confirm(self) -> None:
+        self.dismiss((self._start, self._end))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -4166,7 +4263,7 @@ class PlayerDetailScreen(Screen):
         else:
             cols = ["Season", "PA", "EV", "Barrel%", "HardHit%",
                     "xBA", "xSLG", "xwOBA", "xERA",
-                    "K%", "BB%", "Whiff%", "CSW%", "Velo"]
+                    "K%", "BB%", "Whiff%", "Chase%", "Velo"]
             table.add_columns(*cols)
             for year in self._years:
                 sc = self._statcast_data.get(year)
@@ -4185,7 +4282,7 @@ class PlayerDetailScreen(Screen):
                         _fmt(sc.xwoba, 3), _fmt(sc.xera, 2),
                         _fmt(sc.k_pct, pct=True), _fmt(sc.bb_pct, pct=True),
                         _fmt(sc.whiff_pct, pct=True),
-                        _fmt(sc.csw_pct, pct=True),
+                        _fmt(sc.chase_pct, pct=True),
                         _fmt(sc.avg_velo),
                     ]
                 table.add_row(*row)
@@ -4240,7 +4337,7 @@ class PlayerDetailScreen(Screen):
                     ("EV", "avg_exit_velo"), ("Barrel%", "barrel_pct"),
                     ("K%", "k_pct"), ("Whiff%", "whiff_pct"),
                     ("xERA", "xera"), ("xwOBA", "xwoba"),
-                    ("CSW%", "csw_pct"), ("Velo", "avg_velo"),
+                    ("Chase%", "chase_pct"), ("Velo", "avg_velo"),
                 ]
 
     def _get_stat_value(self, year: int, attr: str) -> float:
@@ -4337,6 +4434,7 @@ class TransactionsScreen(Screen):
     BINDINGS = [
         ("escape", "go_back", "Back"),
         ("q", "go_back", "Back"),
+        ("i", "player_detail", "Player Detail"),
     ]
     CSS = """
     #tx-header {
@@ -4406,6 +4504,25 @@ class TransactionsScreen(Screen):
     def action_go_back(self) -> None:
         self.app.pop_screen()
 
+    def action_player_detail(self) -> None:
+        try:
+            focused = self.query("DataTable:focus")
+            table = focused.first()
+        except Exception:
+            return
+        players = getattr(table, "_players", [])
+        row_idx = table.cursor_row
+        if row_idx < 0 or row_idx >= len(players):
+            return
+        p = players[row_idx]
+        cache = self.app.shared_cache
+        self.app.push_screen(PlayerDetailScreen(
+            p.name, p.position, p.team_abbr,
+            categories=self.categories,
+            all_teams=cache.all_teams if cache.is_loaded else None,
+            replacement_by_pos=cache.replacement_by_pos if cache.is_loaded else None,
+        ))
+
     async def _show_loading(self, msg: str) -> None:
         try:
             self.query_one("#tx-loading-status", Static).update(msg)
@@ -4466,10 +4583,12 @@ class TransactionsScreen(Screen):
         table.add_columns("Date", "Type", "Player".ljust(20), "Pos".ljust(15),
                           "Team", "Action", "From", "To")
 
+        table._players = []
         recent = self._transactions[:10]
         for tx in recent:
             ts = datetime.fromtimestamp(tx.timestamp).strftime("%m/%d %H:%M")
             for p in tx.players:
+                table._players.append(p)
                 table.add_row(
                     Text(ts, style="dim"),
                     Text(tx.type, style="bold"),
@@ -4506,9 +4625,14 @@ class TransactionsScreen(Screen):
 
         top_added = sorted(add_counts.items(), key=lambda x: x[1], reverse=True)[:10]
 
+        table._players = []
         for pkey, count in top_added:
             name, pos, team = player_info[pkey]
             teams = ", ".join(sorted(add_teams[pkey]))
+            table._players.append(TransactionPlayer(
+                player_key=pkey, name=name, position=pos, team_abbr=team,
+                action="", from_team="", to_team="",
+            ))
             table.add_row(
                 Text(name[:20].ljust(20), style="bold"),
                 Text(pos.ljust(15), style="dim"),
