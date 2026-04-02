@@ -443,6 +443,93 @@ def get_pitcher_statcast(mlbam_id: int, year: int | None = None) -> StatcastPitc
     return _pitcher_cache.get(mlbam_id)
 
 
+# Separate per-year cache so multi-year lookups don't clobber the global cache
+_year_cache: dict[int, tuple[dict[int, StatcastBatter], dict[int, StatcastPitcher]]] = {}
+
+
+def _load_year_data(year: int) -> tuple[dict[int, StatcastBatter], dict[int, StatcastPitcher]]:
+    """Load full leaderboard for *year* into an isolated cache pair."""
+    if year in _year_cache:
+        return _year_cache[year]
+    # If the global cache already has this year, copy it
+    if _cache_year == year and _batter_cache:
+        _year_cache[year] = (dict(_batter_cache), dict(_pitcher_cache))
+        return _year_cache[year]
+    b_cache: dict[int, StatcastBatter] = {}
+    p_cache: dict[int, StatcastPitcher] = {}
+    _load_expected_stats(year, "batter", b_cache)
+    _load_exit_velo(year, "batter", b_cache)
+    _load_expected_stats(year, "pitcher", p_cache)
+    _load_exit_velo(year, "pitcher", p_cache)
+    _load_rate_stats(year, "batter", b_cache)
+    _load_rate_stats(year, "pitcher", p_cache)
+    _load_mlb_rate_stats_fallback(year, p_cache)
+    _year_cache[year] = (b_cache, p_cache)
+    return _year_cache[year]
+
+
+def get_batter_statcast_multi_year(
+    mlbam_id: int, years: list[int],
+) -> dict[int, StatcastBatter | None]:
+    """Get statcast data for a batter across multiple seasons."""
+    result: dict[int, StatcastBatter | None] = {}
+    for year in years:
+        b_cache, _ = _load_year_data(year)
+        result[year] = b_cache.get(mlbam_id)
+    return result
+
+
+def get_pitcher_statcast_multi_year(
+    mlbam_id: int, years: list[int],
+) -> dict[int, StatcastPitcher | None]:
+    """Get statcast data for a pitcher across multiple seasons."""
+    result: dict[int, StatcastPitcher | None] = {}
+    for year in years:
+        _, p_cache = _load_year_data(year)
+        result[year] = p_cache.get(mlbam_id)
+    return result
+
+
+def get_statcast_league_averages(
+    years: list[int], player_type: str,
+) -> dict[str, float]:
+    """Compute mean of each statcast metric across the leaderboard.
+
+    Averages across all given *years* and all qualified players (PA >= 50)
+    to produce a single reference value per stat.  This represents roughly
+    league-average performance and can be used as a benchmark line.
+    """
+    from statistics import mean
+
+    if player_type == "batter":
+        attrs = [
+            "avg_exit_velo", "max_exit_velo", "avg_launch_angle",
+            "barrel_pct", "hard_hit_pct", "k_pct", "bb_pct", "whiff_pct",
+            "xba", "xslg", "xwoba",
+        ]
+    else:
+        attrs = [
+            "avg_exit_velo", "barrel_pct", "hard_hit_pct",
+            "xba", "xslg", "xwoba", "xera",
+            "k_pct", "bb_pct", "whiff_pct", "csw_pct", "avg_velo",
+        ]
+
+    # Collect all non-None values per attr across years
+    collected: dict[str, list[float]] = {a: [] for a in attrs}
+    for year in years:
+        b_cache, p_cache = _load_year_data(year)
+        cache = b_cache if player_type == "batter" else p_cache
+        for entry in cache.values():
+            if entry.pa < 50:
+                continue
+            for a in attrs:
+                val = getattr(entry, a, None)
+                if val is not None:
+                    collected[a].append(float(val))
+
+    return {a: mean(vals) if vals else 0.0 for a, vals in collected.items()}
+
+
 def lookup_mlbam_id(player_name: str) -> int | None:
     """Try to find a player's MLBAM ID by name from cached data."""
     name_lower = player_name.lower()

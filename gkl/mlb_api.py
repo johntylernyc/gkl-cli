@@ -52,6 +52,231 @@ def get_mlb_scoreboard(game_date: date | None = None) -> list[MLBGame]:
     return games
 
 
+# ---------------------------------------------------------------------------
+# Historical player stats
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MLBBattingStats:
+    season: int
+    games: int = 0
+    pa: int = 0
+    ab: int = 0
+    hits: int = 0
+    hr: int = 0
+    rbi: int = 0
+    runs: int = 0
+    sb: int = 0
+    bb: int = 0
+    so: int = 0
+    avg: float = 0.0
+    obp: float = 0.0
+    slg: float = 0.0
+    ops: float = 0.0
+
+
+@dataclass
+class MLBPitchingStats:
+    season: int
+    games: int = 0
+    games_started: int = 0
+    wins: int = 0
+    losses: int = 0
+    saves: int = 0
+    ip: float = 0.0
+    hits: int = 0
+    er: int = 0
+    bb: int = 0
+    so: int = 0
+    era: float = 0.0
+    whip: float = 0.0
+    k_per_9: float = 0.0
+    bb_per_9: float = 0.0
+
+
+def _safe_float(val: str | float | int | None, default: float = 0.0) -> float:
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def get_player_batting_stats(
+    mlbam_id: int, years: list[int],
+) -> dict[int, MLBBattingStats | None]:
+    """Fetch batting stats for a player across multiple seasons."""
+    result: dict[int, MLBBattingStats | None] = {}
+    for year in years:
+        try:
+            resp = httpx.get(
+                f"{MLB_API_BASE}/people/{mlbam_id}/stats",
+                params={"stats": "season", "season": year, "group": "hitting"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            splits = resp.json().get("stats", [{}])[0].get("splits", [])
+            if not splits:
+                result[year] = None
+                continue
+            s = splits[0].get("stat", {})
+            result[year] = MLBBattingStats(
+                season=year,
+                games=s.get("gamesPlayed", 0),
+                pa=s.get("plateAppearances", 0),
+                ab=s.get("atBats", 0),
+                hits=s.get("hits", 0),
+                hr=s.get("homeRuns", 0),
+                rbi=s.get("rbi", 0),
+                runs=s.get("runs", 0),
+                sb=s.get("stolenBases", 0),
+                bb=s.get("baseOnBalls", 0),
+                so=s.get("strikeOuts", 0),
+                avg=_safe_float(s.get("avg")),
+                obp=_safe_float(s.get("obp")),
+                slg=_safe_float(s.get("slg")),
+                ops=_safe_float(s.get("ops")),
+            )
+        except (httpx.HTTPError, Exception):
+            result[year] = None
+    return result
+
+
+def get_player_pitching_stats(
+    mlbam_id: int, years: list[int],
+) -> dict[int, MLBPitchingStats | None]:
+    """Fetch pitching stats for a player across multiple seasons."""
+    result: dict[int, MLBPitchingStats | None] = {}
+    for year in years:
+        try:
+            resp = httpx.get(
+                f"{MLB_API_BASE}/people/{mlbam_id}/stats",
+                params={"stats": "season", "season": year, "group": "pitching"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            splits = resp.json().get("stats", [{}])[0].get("splits", [])
+            if not splits:
+                result[year] = None
+                continue
+            s = splits[0].get("stat", {})
+            ip_str = s.get("inningsPitched", "0")
+            result[year] = MLBPitchingStats(
+                season=year,
+                games=s.get("gamesPlayed", 0),
+                games_started=s.get("gamesStarted", 0),
+                wins=s.get("wins", 0),
+                losses=s.get("losses", 0),
+                saves=s.get("saves", 0),
+                ip=_safe_float(ip_str),
+                hits=s.get("hits", 0),
+                er=s.get("earnedRuns", 0),
+                bb=s.get("baseOnBalls", 0),
+                so=s.get("strikeOuts", 0),
+                era=_safe_float(s.get("era")),
+                whip=_safe_float(s.get("whip")),
+                k_per_9=_safe_float(s.get("strikeoutsPer9Inn")),
+                bb_per_9=_safe_float(s.get("walksPer9Inn")),
+            )
+        except (httpx.HTTPError, Exception):
+            result[year] = None
+    return result
+
+
+def get_league_averages_batting(years: list[int]) -> dict[str, float]:
+    """Compute per-player league-average batting line from team totals.
+
+    Uses the teams/stats endpoint to get aggregate totals for all 30 MLB
+    teams, then divides by approximate roster spots to get a per-player
+    baseline.  Averages across the given *years*.
+    """
+    from statistics import mean
+
+    _PER_TEAM_BATTERS = 13  # typical active position players per team
+
+    attrs = ["hr", "rbi", "runs", "sb", "avg", "obp", "slg", "ops"]
+    collected: dict[str, list[float]] = {a: [] for a in attrs}
+
+    for year in years:
+        try:
+            resp = httpx.get(
+                f"{MLB_API_BASE}/teams/stats",
+                params={
+                    "stats": "season", "season": year,
+                    "group": "hitting", "sportId": 1, "gameType": "R",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            splits = resp.json().get("stats", [{}])[0].get("splits", [])
+            if not splits:
+                continue
+            for sp in splits:
+                s = sp.get("stat", {})
+                gp = s.get("gamesPlayed", 162) or 162
+                n = _PER_TEAM_BATTERS
+                collected["hr"].append(s.get("homeRuns", 0) / n)
+                collected["rbi"].append(s.get("rbi", 0) / n)
+                collected["runs"].append(s.get("runs", 0) / n)
+                collected["sb"].append(s.get("stolenBases", 0) / n)
+                collected["avg"].append(_safe_float(s.get("avg")))
+                collected["obp"].append(_safe_float(s.get("obp")))
+                collected["slg"].append(_safe_float(s.get("slg")))
+                collected["ops"].append(_safe_float(s.get("ops")))
+        except (httpx.HTTPError, Exception):
+            continue
+
+    return {a: mean(vals) if vals else 0.0 for a, vals in collected.items()}
+
+
+def get_league_averages_pitching(years: list[int]) -> dict[str, float]:
+    """Compute per-pitcher league-average pitching line from team totals."""
+    from statistics import mean
+
+    _PER_TEAM_PITCHERS = 13  # typical pitching staff size
+
+    attrs = ["wins", "saves", "so", "ip", "era", "whip", "k_per_9", "bb_per_9"]
+    collected: dict[str, list[float]] = {a: [] for a in attrs}
+
+    for year in years:
+        try:
+            resp = httpx.get(
+                f"{MLB_API_BASE}/teams/stats",
+                params={
+                    "stats": "season", "season": year,
+                    "group": "pitching", "sportId": 1, "gameType": "R",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            splits = resp.json().get("stats", [{}])[0].get("splits", [])
+            if not splits:
+                continue
+            for sp in splits:
+                s = sp.get("stat", {})
+                n = _PER_TEAM_PITCHERS
+                collected["wins"].append(s.get("wins", 0) / n)
+                collected["saves"].append(s.get("saves", 0) / n)
+                collected["so"].append(s.get("strikeOuts", 0) / n)
+                collected["ip"].append(
+                    _safe_float(s.get("inningsPitched")) / n,
+                )
+                collected["era"].append(_safe_float(s.get("era")))
+                collected["whip"].append(_safe_float(s.get("whip")))
+                collected["k_per_9"].append(
+                    _safe_float(s.get("strikeoutsPer9Inn")),
+                )
+                collected["bb_per_9"].append(
+                    _safe_float(s.get("walksPer9Inn")),
+                )
+        except (httpx.HTTPError, Exception):
+            continue
+
+    return {a: mean(vals) if vals else 0.0 for a, vals in collected.items()}
+
+
 def _parse_game(g: dict) -> MLBGame:
     status = g.get("status", {})
     teams = g.get("teams", {})

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -243,6 +244,9 @@ class YahooFantasyAPI:
         data = self._get(path)
         return self._parse_free_agent_players(data)
 
+    _AR_RANK_CACHE = Path.home() / ".cache" / "gkl" / "ar_ranks.json"
+    _AR_RANK_TTL = 3600  # 1 hour
+
     def build_rank_lookup(
         self, league_key: str, sort: str = "AR", max_players: int = 1000,
     ) -> dict[str, int]:
@@ -251,6 +255,17 @@ class YahooFantasyAPI:
         Uses no status filter so ALL players (rostered + free agents) are included,
         giving the true overall ranking.
         """
+        # Try disk cache for AR sort (most common)
+        if sort == "AR" and self._AR_RANK_CACHE.exists():
+            try:
+                data = json.loads(self._AR_RANK_CACHE.read_text())
+                if (data.get("league_key") == league_key
+                        and data.get("sort") == sort
+                        and time.time() - data.get("timestamp", 0) < self._AR_RANK_TTL):
+                    return data["ranks"]
+            except (json.JSONDecodeError, KeyError):
+                pass
+
         lookup: dict[str, int] = {}
         for start in range(0, max_players, 25):
             players, _ = self.get_free_agents(
@@ -262,6 +277,20 @@ class YahooFantasyAPI:
                 lookup[p.player_key] = start + i + 1
             if len(players) < 25:
                 break
+
+        # Persist AR ranks to disk
+        if sort == "AR":
+            try:
+                self._AR_RANK_CACHE.parent.mkdir(parents=True, exist_ok=True)
+                self._AR_RANK_CACHE.write_text(json.dumps({
+                    "league_key": league_key,
+                    "sort": sort,
+                    "timestamp": time.time(),
+                    "ranks": lookup,
+                }))
+            except OSError:
+                pass
+
         return lookup
 
     _PRESEASON_CACHE = Path.home() / ".cache" / "gkl" / "preseason_ranks.json"
