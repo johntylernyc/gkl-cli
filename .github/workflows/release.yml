@@ -27,6 +27,10 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Embed version from tag
+        shell: bash
+        run: echo "__version__ = \"${GITHUB_REF_NAME#v}\"" > gkl/_version.py
+
       - name: Install dependencies
         run: |
           pip install pyinstaller

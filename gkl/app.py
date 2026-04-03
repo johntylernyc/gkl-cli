@@ -25,6 +25,10 @@ from textual.widgets import (
 )
 
 from gkl.shared_cache import SharedDataCache
+from gkl.updater import (
+    UpdateInfo, UpdateModal, apply_update, check_for_update,
+    cleanup_old_binary, download_update,
+)
 from gkl.yahoo_api import (
     League, Matchup, PlayerStats, StatCategory, TeamStats, Transaction, TransactionPlayer,
     YahooFantasyAPI,
@@ -5927,6 +5931,27 @@ class GklApp(App):
         self.register_theme(BASEBALL_THEME)
         self.theme = "baseball"
         self.run_worker(self._init_league_selection)
+        self.run_worker(self._check_for_updates)
+
+    async def _check_for_updates(self) -> None:
+        cleanup_old_binary()
+        info = check_for_update()
+        if info is None:
+            return
+        should_update = await self.app.push_screen_wait(UpdateModal(info))
+        if not should_update:
+            return
+        try:
+            self.notify("Downloading update…")
+            new_binary = download_update(info.asset_url)
+            apply_update(new_binary)
+            self.notify(
+                f"Updated to v{info.latest_version}. Restart the app to use it.",
+                severity="information",
+                timeout=10,
+            )
+        except Exception:
+            self.notify("Update failed. Try again later.", severity="error")
 
     async def _init_league_selection(self) -> None:
         leagues = self.api.get_user_leagues()
