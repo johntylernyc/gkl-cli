@@ -522,8 +522,8 @@ class LeagueStandingsScreen(Screen):
     def action_set_weeks(self) -> None:
         modal = WeekRangeModal(
             max_week=self._max_week,
-            current_start=self._week_start,
-            current_end=self._week_end,
+            week_start=self._week_start,
+            week_end=self._week_end,
         )
         self.app.push_screen(modal, self._on_week_range_selected)
 
