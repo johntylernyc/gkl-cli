@@ -4367,8 +4367,8 @@ class PlayerDetailScreen(Screen):
                     ]
                 table.add_row(*row)
         else:
-            cols = ["Season", "G", "GS", "W", "L", "SV", "IP", "H",
-                    "ER", "BB", "SO", "ERA", "WHIP", "K/9", "BB/9"]
+            cols = ["Season", "G", "GS", "IP", "W", "L", "SV", "HLD", "H",
+                    "SO", "BB", "ERA", "WHIP", "K/9", "BB/9"]
             table.add_columns(*cols)
             for year in self._years:
                 s = self._pitching_stats.get(year)
@@ -4380,11 +4380,13 @@ class PlayerDetailScreen(Screen):
                     row = [
                         Text(str(year), style="bold"),
                         Text(str(s.games)), Text(str(s.games_started)),
+                        Text(f"{s.ip:.1f}"),
                         Text(str(s.wins), style="bold #6AAF6E"),
                         Text(str(s.losses)), Text(str(s.saves)),
-                        Text(f"{s.ip:.1f}"), Text(str(s.hits)),
-                        Text(str(s.er)), Text(str(s.bb)),
+                        Text(str(s.holds)),
+                        Text(str(s.hits)),
                         Text(str(s.so), style="bold #E8A735"),
+                        Text(str(s.bb)),
                         Text(f"{s.era:.2f}"), Text(f"{s.whip:.2f}"),
                         Text(f"{s.k_per_9:.1f}"), Text(f"{s.bb_per_9:.1f}"),
                     ]

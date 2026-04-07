@@ -84,6 +84,7 @@ class MLBPitchingStats:
     wins: int = 0
     losses: int = 0
     saves: int = 0
+    holds: int = 0
     ip: float = 0.0
     hits: int = 0
     er: int = 0
@@ -249,6 +250,7 @@ def get_player_pitching_stats(
                 wins=s.get("wins", 0),
                 losses=s.get("losses", 0),
                 saves=s.get("saves", 0),
+                holds=s.get("holds", 0),
                 ip=_safe_float(ip_str),
                 hits=s.get("hits", 0),
                 er=s.get("earnedRuns", 0),
