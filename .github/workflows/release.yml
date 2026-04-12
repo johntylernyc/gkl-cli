@@ -50,6 +50,10 @@ jobs:
             --hidden-import mdit_py_plugins \
             --hidden-import linkify_it \
             --hidden-import uc_micro \
+            --hidden-import anthropic \
+            --collect-all anthropic \
+            --collect-all pydantic \
+            --hidden-import sniffio \
             gkl_entry.py
 
       - name: Rename artifact (Linux/macOS)

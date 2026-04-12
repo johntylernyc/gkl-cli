@@ -82,6 +82,58 @@ def get_stat_value(stats: dict[str, str], stat_id: str, display_name: str) -> st
     return "-"
 
 
+def compute_roto(
+    teams: list[TeamStats],
+    categories: list[StatCategory],
+) -> list[dict]:
+    """Compute roto points for each team across the given categories.
+
+    Each team is ranked per category (ties get averaged ranks).
+    Returns a list of dicts sorted by total roto points (highest first),
+    each containing: name, manager, team_key, total, and per-category rank
+    keyed by stat_id, plus raw values keyed as raw_{stat_id}.
+    """
+    results: list[dict] = []
+    for t in teams:
+        results.append({
+            "name": t.name,
+            "manager": t.manager,
+            "team_key": t.team_key,
+            "total": 0.0,
+        })
+
+    scored = [c for c in categories if not c.is_only_display]
+    for cat in scored:
+        vals: list[tuple[int, float]] = []
+        for i, t in enumerate(teams):
+            raw = t.stats.get(cat.stat_id, "0")
+            results[i][f"raw_{cat.stat_id}"] = raw
+            try:
+                vals.append((i, float(raw)))
+            except (ValueError, TypeError):
+                vals.append((i, 0.0))
+
+        higher_is_better = cat.sort_order == "1"
+        vals.sort(key=lambda x: x[1], reverse=not higher_is_better)
+
+        rank = 1
+        i = 0
+        while i < len(vals):
+            j = i
+            while j < len(vals) and vals[j][1] == vals[i][1]:
+                j += 1
+            avg_rank = sum(range(rank, rank + j - i)) / (j - i)
+            for k in range(i, j):
+                idx = vals[k][0]
+                results[idx][cat.stat_id] = avg_rank
+                results[idx]["total"] += avg_rank
+            rank += j - i
+            i = j
+
+    results.sort(key=lambda r: r["total"], reverse=True)
+    return results
+
+
 def aggregate_weekly_stats(
     weekly_data: list[list[TeamStats]],
     categories: list[StatCategory],

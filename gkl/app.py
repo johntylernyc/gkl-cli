@@ -38,7 +38,7 @@ from gkl.yahoo_auth import YahooAuth, load_credentials, save_credentials
 from gkl.stats import (
     who_wins, simulate_h2h, compute_power_rankings, aggregate_h2h_season,
     H2HResult, TeamH2HSummary, SGPCalculator,
-    build_stat_columns, get_stat_value,
+    build_stat_columns, get_stat_value, compute_roto,
 )
 from gkl.datastore import RosterDataStore
 from gkl.mlb_api import MLBGame, get_mlb_scoreboard, get_player_ages, get_player_games
@@ -46,6 +46,7 @@ from gkl.statcast import (
     get_batter_statcast, get_pitcher_statcast, lookup_mlbam_id,
     StatcastBatter, StatcastPitcher,
 )
+from gkl.skipper import Skipper, load_anthropic_key, save_anthropic_key
 
 # Consistent team colors used across the entire app
 TEAM_A_COLOR = "#E8A735"  # warm amber/gold
@@ -81,49 +82,7 @@ BASEBALL_THEME = Theme(
 # --- Roto Standings Calculation ---
 
 
-def _compute_roto(
-    teams: list[TeamStats],
-    categories: list[StatCategory],
-) -> list[dict]:
-    """Compute roto points for each team across the given categories."""
-    results: list[dict] = []
-    for t in teams:
-        results.append({
-            "name": t.name,
-            "manager": t.manager,
-            "team_key": t.team_key,
-            "total": 0.0,
-        })
-
-    for cat in categories:
-        vals: list[tuple[int, float]] = []
-        for i, t in enumerate(teams):
-            raw = t.stats.get(cat.stat_id, "0")
-            results[i][f"raw_{cat.stat_id}"] = raw
-            try:
-                vals.append((i, float(raw)))
-            except (ValueError, TypeError):
-                vals.append((i, 0.0))
-
-        higher_is_better = cat.sort_order == "1"
-        vals.sort(key=lambda x: x[1], reverse=not higher_is_better)
-
-        rank = 1
-        i = 0
-        while i < len(vals):
-            j = i
-            while j < len(vals) and vals[j][1] == vals[i][1]:
-                j += 1
-            avg_rank = sum(range(rank, rank + j - i)) / (j - i)
-            for k in range(i, j):
-                idx = vals[k][0]
-                results[idx][cat.stat_id] = avg_rank
-                results[idx]["total"] += avg_rank
-            rank += j - i
-            i = j
-
-    results.sort(key=lambda r: r["total"], reverse=True)
-    return results
+_compute_roto = compute_roto  # alias for backward compatibility
 
 
 # --- Week Range Modal ---
@@ -5081,6 +5040,194 @@ class MLBScoreboardScreen(Screen):
         self.app.pop_screen()
 
 
+# --- Ask Skipper (AI Chat) ---
+
+
+class ApiKeyModal(Screen):
+    """Modal for entering an Anthropic API key."""
+    BINDINGS = [("escape", "cancel", "Cancel")]
+    CSS = """
+    ApiKeyModal {
+        align: center middle;
+    }
+    #apikey-container {
+        width: 70;
+        height: auto;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #apikey-title {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+        margin-bottom: 1;
+    }
+    #apikey-help {
+        height: auto;
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="apikey-container"):
+            yield Static("Anthropic API Key Required", id="apikey-title")
+            yield Static(
+                "Ask Skipper uses Claude to answer questions about your league.\n"
+                "Enter your Anthropic API key below (starts with sk-ant-).\n"
+                "Get one at https://console.anthropic.com/settings/keys",
+                id="apikey-help",
+            )
+            yield Input(
+                placeholder="sk-ant-...",
+                id="apikey-input",
+                password=True,
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#apikey-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        key = event.value.strip()
+        if key:
+            save_anthropic_key(key)
+            self.dismiss(key)
+        else:
+            self.notify("API key cannot be empty.", severity="error")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class AskSkipperScreen(Screen):
+    """Chat screen for asking Skipper questions about your fantasy league."""
+    BINDINGS = [("escape", "go_back", "Back")]
+    CSS = """
+    #skipper-header {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #skipper-messages {
+        height: 1fr;
+        padding: 0 1;
+    }
+    .skipper-user-msg {
+        margin: 1 0 0 0;
+        color: #E8A735;
+    }
+    .skipper-assistant-msg {
+        margin: 0 0 1 0;
+        color: $foreground;
+    }
+    .skipper-error-msg {
+        margin: 0 0 1 0;
+        color: $error;
+    }
+    #skipper-status {
+        height: 1;
+        content-align: center middle;
+        color: $text-muted;
+        display: none;
+    }
+    #skipper-input {
+        dock: bottom;
+    }
+    """
+
+    def __init__(
+        self,
+        api: YahooFantasyAPI,
+        league: League,
+        categories: list[StatCategory],
+    ) -> None:
+        super().__init__()
+        self.api = api
+        self.league = league
+        self.categories = categories
+        self.skipper: Skipper | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static(" Ask Skipper ", id="skipper-header")
+        yield VerticalScroll(id="skipper-messages")
+        yield Static("Skipper is thinking...", id="skipper-status")
+        yield Input(placeholder="Ask Skipper a question...", id="skipper-input")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        key = load_anthropic_key()
+        if key:
+            self._init_skipper(key)
+        else:
+            self.app.push_screen(ApiKeyModal(), callback=self._on_api_key)
+        self.query_one("#skipper-input", Input).focus()
+
+    def _on_api_key(self, key: str | None) -> None:
+        if key:
+            self._init_skipper(key)
+        else:
+            self.app.pop_screen()
+
+    def _init_skipper(self, key: str) -> None:
+        try:
+            self.skipper = Skipper(self.api, self.league, self.categories)
+            messages = self.query_one("#skipper-messages", VerticalScroll)
+            messages.mount(
+                Static(
+                    "Skipper here. Ask me anything about your league — "
+                    "standings, matchups, rosters, free agents.",
+                    classes="skipper-assistant-msg",
+                )
+            )
+        except Exception as e:
+            self.notify(f"Failed to initialize Skipper: {e}", severity="error")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        if not text or not self.skipper:
+            return
+
+        event.input.value = ""
+        messages = self.query_one("#skipper-messages", VerticalScroll)
+        messages.mount(Static(f"You: {text}", classes="skipper-user-msg"))
+
+        # Show thinking indicator and disable input
+        status = self.query_one("#skipper-status", Static)
+        status.display = True
+        event.input.disabled = True
+
+        self.run_worker(self._get_response(text), group="skipper", exclusive=True)
+
+    async def _get_response(self, text: str) -> None:
+        messages = self.query_one("#skipper-messages", VerticalScroll)
+        try:
+            response = await self.skipper.chat(text)
+            await messages.mount(
+                Static(f"Skipper: {response}", classes="skipper-assistant-msg")
+            )
+        except Exception as e:
+            await messages.mount(
+                Static(f"Error: {e}", classes="skipper-error-msg")
+            )
+
+        # Hide thinking indicator and re-enable input
+        status = self.query_one("#skipper-status", Static)
+        status.display = False
+        inp = self.query_one("#skipper-input", Input)
+        inp.disabled = False
+        inp.focus()
+        messages.scroll_end(animate=False)
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
+
+
 # --- League Selection Screen ---
 
 
@@ -5175,7 +5322,8 @@ class ScoreboardScreen(Screen):
                 ("right", "next_week", "Next Week"),
                 ("e", "select_week", "Select Week"),
                 ("L", "switch_league", "Switch League"),
-                ("i", "player_detail", "Player Detail")]
+                ("i", "player_detail", "Player Detail"),
+                ("a", "ask_skipper", "Ask Skipper")]
     CSS = """
     #board-header {
         height: 1;
@@ -5779,6 +5927,12 @@ class ScoreboardScreen(Screen):
         if self.league:
             self.app.push_screen(
                 WatchlistScreen(self.api, self.league, self.categories)
+            )
+
+    def action_ask_skipper(self) -> None:
+        if self.league:
+            self.app.push_screen(
+                AskSkipperScreen(self.api, self.league, self.categories)
             )
 
     def action_mlb_scores(self) -> None:
