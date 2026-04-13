@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 
 import httpx
@@ -31,6 +31,104 @@ class MLBGame:
     away_errors: int
     home_hits: int
     home_errors: int
+    innings: list[tuple[int | None, int | None]]  # per-inning (away_runs, home_runs)
+
+
+@dataclass
+class BoxScoreBatter:
+    name: str
+    position: str
+    stats: dict[str, int | str]  # raw MLB API game stats
+    season_stats: dict[str, int | str]  # season stats for rate calculations
+    is_current: bool = False
+
+
+@dataclass
+class BoxScorePitcher:
+    name: str
+    stats: dict[str, int | str]  # raw MLB API game stats
+    season_stats: dict[str, int | str]  # season stats
+    is_current: bool = False
+    decision: str = ""  # "W", "L", "S", "H", ""
+
+
+@dataclass
+class BoxScoreTeam:
+    name: str
+    abbr: str
+    batters: list[BoxScoreBatter] = field(default_factory=list)
+    pitchers: list[BoxScorePitcher] = field(default_factory=list)
+
+
+@dataclass
+class BoxScore:
+    gamePk: str
+    away: BoxScoreTeam = field(default_factory=lambda: BoxScoreTeam("", ""))
+    home: BoxScoreTeam = field(default_factory=lambda: BoxScoreTeam("", ""))
+
+
+def get_mlb_boxscore(gamePk: str) -> BoxScore:
+    """Fetch the full box score for a game."""
+    resp = httpx.get(f"{MLB_API_BASE}/game/{gamePk}/boxscore", timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    box = BoxScore(gamePk=gamePk)
+    for side in ("away", "home"):
+        team_data = data.get("teams", {}).get(side, {})
+        team_info = team_data.get("team", {})
+        team = BoxScoreTeam(
+            name=team_info.get("name", ""),
+            abbr=team_info.get("abbreviation", team_info.get("teamName", "")),
+        )
+
+        players = team_data.get("players", {})
+        batter_ids = team_data.get("batters", [])
+        pitcher_ids = team_data.get("pitchers", [])
+
+        for pid in batter_ids:
+            p = players.get(f"ID{pid}", {})
+            person = p.get("person", {})
+            game_stats = p.get("stats", {}).get("batting", {})
+            season = p.get("seasonStats", {}).get("batting", {})
+            game_status = p.get("gameStatus", {})
+            batting_order = p.get("battingOrder", "")
+            if not game_stats and not batting_order:
+                continue
+            team.batters.append(BoxScoreBatter(
+                name=person.get("fullName", "?"),
+                position=p.get("position", {}).get("abbreviation", ""),
+                stats=dict(game_stats),
+                season_stats=dict(season),
+                is_current=game_status.get("isCurrentBatter", False),
+            ))
+
+        for pid in pitcher_ids:
+            p = players.get(f"ID{pid}", {})
+            person = p.get("person", {})
+            game_stats = p.get("stats", {}).get("pitching", {})
+            season = p.get("seasonStats", {}).get("pitching", {})
+            game_status = p.get("gameStatus", {})
+            if not game_stats:
+                continue
+            decision = ""
+            note = game_stats.get("note", "")
+            if note:
+                decision = note.strip("()")
+            team.pitchers.append(BoxScorePitcher(
+                name=person.get("fullName", "?"),
+                stats=dict(game_stats),
+                season_stats=dict(season),
+                is_current=game_status.get("isCurrentPitcher", False),
+                decision=decision,
+            ))
+
+        if side == "away":
+            box.away = team
+        else:
+            box.home = team
+
+    return box
 
 
 def get_mlb_scoreboard(game_date: date | None = None) -> list[MLBGame]:
@@ -373,6 +471,13 @@ def _parse_game(g: dict) -> MLBGame:
     ls_away = linescore.get("teams", {}).get("away", {})
     ls_home = linescore.get("teams", {}).get("home", {})
 
+    raw_innings = linescore.get("innings", [])
+    innings: list[tuple[int | None, int | None]] = []
+    for inn in raw_innings:
+        a_runs = inn.get("away", {}).get("runs")
+        h_runs = inn.get("home", {}).get("runs")
+        innings.append((a_runs, h_runs))
+
     runners = (
         "first" in offense,
         "second" in offense,
@@ -399,4 +504,5 @@ def _parse_game(g: dict) -> MLBGame:
         away_errors=ls_away.get("errors", 0),
         home_hits=ls_home.get("hits", 0),
         home_errors=ls_home.get("errors", 0),
+        innings=innings,
     )

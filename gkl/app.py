@@ -44,7 +44,10 @@ from gkl.stats import (
     build_stat_columns, get_stat_value, compute_roto,
 )
 from gkl.datastore import RosterDataStore
-from gkl.mlb_api import MLBGame, get_mlb_scoreboard, get_player_ages, get_player_games
+from gkl.mlb_api import (
+    MLBGame, BoxScore, BoxScoreTeam, get_mlb_scoreboard, get_mlb_boxscore,
+    get_player_ages, get_player_games,
+)
 from gkl.statcast import (
     get_batter_statcast, get_pitcher_statcast, lookup_mlbam_id,
     StatcastBatter, StatcastPitcher,
@@ -4902,6 +4905,188 @@ class TransactionsScreen(Screen):
             table.add_row(*row)
 
 
+# --- Settings Screen ---
+
+
+class SettingsScreen(Screen):
+    """Global application settings."""
+    BINDINGS = [("escape", "go_back", "Back"), ("q", "go_back", "Back")]
+    CSS = """
+    SettingsScreen {
+        align: center middle;
+    }
+    #settings-container {
+        width: 60;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #settings-title {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #settings-controls {
+        height: 1;
+        content-align: center middle;
+        background: $surface;
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #settings-list {
+        height: auto;
+        max-height: 20;
+    }
+    #settings-list > ListItem {
+        height: 1;
+        padding: 0 1;
+    }
+    #settings-list > ListItem.--highlight {
+        background: #3A5A3A;
+    }
+    """
+
+    def __init__(self, api: YahooFantasyAPI, league: League) -> None:
+        super().__init__()
+        self._api = api
+        self._league = league
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="settings-container"):
+            yield Static("Settings", id="settings-title")
+            yield Static("\\[esc] to go back", id="settings-controls")
+            yield ListView(id="settings-list")
+
+    def on_mount(self) -> None:
+        self._refresh_list()
+
+    def _refresh_list(self) -> None:
+        lv = self.query_one("#settings-list", ListView)
+        lv.clear()
+        current = self.app.store.get_pref("my_team_key")
+        current_name = self.app.store.get_pref("my_team_name")
+        label = Text()
+        label.append("My Fantasy Team: ", style="bold")
+        if current and current_name:
+            label.append(current_name, style="")
+        else:
+            label.append("Not set", style="dim")
+        item = ListItem(Label(label))
+        item._action = "my_team"
+        lv.mount(item)
+        lv.index = 0
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        action = getattr(event.item, "_action", None)
+        if action == "my_team":
+            self.app.push_screen(
+                FantasyTeamPickerScreen(self._api, self._league),
+                callback=self._on_team_picked,
+            )
+
+    def _on_team_picked(self, result: tuple[str, str] | str) -> None:
+        if result == "__clear__":
+            self.app.store.set_pref("my_team_key", "")
+            self.app.store.set_pref("my_team_name", "")
+            self.notify("My Team cleared")
+        elif isinstance(result, tuple):
+            team_key, team_name = result
+            self.app.store.set_pref("my_team_key", team_key)
+            self.app.store.set_pref("my_team_name", team_name)
+            self.notify(f"My Team set to {team_name}")
+        self._refresh_list()
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
+
+
+class FantasyTeamPickerScreen(Screen):
+    """Pick your fantasy team from the league."""
+    BINDINGS = [("escape", "quit", "Cancel"), ("q", "quit", "Cancel")]
+    CSS = """
+    FantasyTeamPickerScreen {
+        align: center middle;
+    }
+    #team-picker-container {
+        width: 60;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #team-picker-title {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #team-picker-controls {
+        height: 1;
+        content-align: center middle;
+        background: $surface;
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #team-picker-list {
+        height: 20;
+    }
+    #team-picker-list > ListItem {
+        height: 1;
+        padding: 0 1;
+    }
+    #team-picker-list > ListItem.--highlight {
+        background: #3A5A3A;
+    }
+    """
+
+    def __init__(self, api: YahooFantasyAPI, league: League) -> None:
+        super().__init__()
+        self._api = api
+        self._league = league
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="team-picker-container"):
+            yield Static("Select Your Fantasy Team", id="team-picker-title")
+            yield Static("\\[esc] to cancel", id="team-picker-controls")
+            yield ListView(id="team-picker-list")
+
+    def on_mount(self) -> None:
+        self.run_worker(self._load_teams)
+
+    async def _load_teams(self) -> None:
+        teams = self._api.get_team_season_stats(self._league.league_key)
+        lv = self.query_one("#team-picker-list", ListView)
+        current = self.app.store.get_pref("my_team_key")
+        # Clear option
+        clear_item = ListItem(Label(Text("(None — clear selection)", style="dim italic")))
+        clear_item._team_data = "__clear__"
+        await lv.mount(clear_item)
+        for team in teams:
+            label = Text()
+            label.append(f"{team.name}", style="bold")
+            label.append(f"  ({team.manager})", style="dim")
+            if team.team_key == current:
+                label.append("  ★", style="bold #FFD700")
+            item = ListItem(Label(label))
+            item._team_data = (team.team_key, team.name)
+            await lv.mount(item)
+        lv.index = 0
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        data = getattr(event.item, "_team_data", None)
+        if data is not None:
+            self.dismiss(data)
+
+    def action_quit(self) -> None:
+        self.dismiss("")
+
+
 # --- MLB Scoreboard Screen ---
 
 
@@ -4911,7 +5096,8 @@ class MLBScoreboardScreen(Screen):
                 ("comma", "prev_day", "< Prev Day"),
                 ("full_stop", "next_day", "> Next Day"),
                 ("t", "today", "Today"),
-                ("m", "mlbtv", "MLB.TV")]
+                ("m", "mlbtv", "MLB.TV"),
+                ("enter", "open_boxscore", "Box Score")]
     CSS = """
     #mlb-header {
         height: 1;
@@ -4935,12 +5121,22 @@ class MLBScoreboardScreen(Screen):
         height: 1fr;
         background: $background;
     }
+    #game-list {
+        height: 1fr;
+    }
+    #game-list > ListItem {
+        height: auto;
+        padding: 0;
+    }
+    #game-list > ListItem.--highlight {
+        background: transparent;
+    }
     .game-row {
         height: auto;
         width: 100%;
     }
     .game-card {
-        height: 5;
+        height: auto;
         width: 1fr;
         margin: 0 0 1 1;
         padding: 0 1;
@@ -4948,7 +5144,7 @@ class MLBScoreboardScreen(Screen):
         border: solid $primary-lighten-3;
     }
     .game-card-live {
-        height: 5;
+        height: auto;
         width: 1fr;
         margin: 0 0 1 1;
         padding: 0 1;
@@ -4956,12 +5152,36 @@ class MLBScoreboardScreen(Screen):
         border: solid #4A7C59;
     }
     .game-card-final {
-        height: 5;
+        height: auto;
         width: 1fr;
         margin: 0 0 1 1;
         padding: 0 1;
         background: #252525;
         border: solid #444444;
+    }
+    .game-card-roster {
+        height: auto;
+        width: 1fr;
+        margin: 0 0 1 1;
+        padding: 0 1;
+        background: $surface;
+        border: solid #FFD700;
+    }
+    .game-card-live-roster {
+        height: auto;
+        width: 1fr;
+        margin: 0 0 1 1;
+        padding: 0 1;
+        background: #1E2E1E;
+        border: solid #FFD700;
+    }
+    .game-card-final-roster {
+        height: auto;
+        width: 1fr;
+        margin: 0 0 1 1;
+        padding: 0 1;
+        background: #252525;
+        border: solid #FFD700;
     }
     .game-line {
         height: 1;
@@ -4972,13 +5192,30 @@ class MLBScoreboardScreen(Screen):
         width: 100%;
         color: $text-muted;
     }
+    .linescore-line {
+        height: 1;
+        width: 100%;
+        color: $text-muted;
+    }
+    .roster-players-line {
+        height: 1;
+        width: 100%;
+    }
     """
 
-    def __init__(self) -> None:
+    def __init__(self, api: YahooFantasyAPI, league: League) -> None:
         super().__init__()
         from datetime import date as date_cls
         self._date = date_cls.today()
+        self._api = api
+        self._league = league
         self._games: list[MLBGame] = []
+        self._categories: list = []
+        self._roster_mlb_teams: set[str] = set()  # MLB team abbrs on user's roster
+        self._roster_players_by_team: dict[str, list[str]] = {}  # MLB abbr -> [player names]
+        self._collapsed_games: set[str] = set()
+        self._refresh_timer = None
+        self._game_index = 0  # currently focused game index
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -4989,9 +5226,40 @@ class MLBScoreboardScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
+        self._load_roster_teams()
+        try:
+            self._categories = self._api.get_stat_categories(self._league.league_key)
+        except Exception:
+            self._categories = []
         self.query_one("#mlb-games").display = False
         self._update_controls()
         self.run_worker(self._load)
+
+    def on_unmount(self) -> None:
+        if self._refresh_timer:
+            self._refresh_timer.stop()
+            self._refresh_timer = None
+
+    def _load_roster_teams(self) -> None:
+        """Load the user's fantasy roster and map players to MLB teams."""
+        team_key = self.app.store.get_pref("my_team_key")
+        if not team_key:
+            self._roster_mlb_teams = set()
+            self._roster_players_by_team = {}
+            return
+        try:
+            players = self._api.get_roster_stats(
+                team_key, self._league.current_week
+            )
+            by_team: dict[str, list[str]] = {}
+            for p in players:
+                if p.team_abbr:
+                    by_team.setdefault(p.team_abbr, []).append(p.name)
+            self._roster_mlb_teams = set(by_team.keys())
+            self._roster_players_by_team = by_team
+        except Exception:
+            self._roster_mlb_teams = set()
+            self._roster_players_by_team = {}
 
     def _update_controls(self) -> None:
         from datetime import date as date_cls
@@ -5001,7 +5269,23 @@ class MLBScoreboardScreen(Screen):
         if self._date == today:
             ctrl.append("  (today)", style="dim")
         ctrl.append("  |  <,> change day  [t] today  [r] refresh", style="dim")
+        if self._refresh_timer:
+            ctrl.append("  [auto-refreshing]", style="dim #4A7C59")
         self.query_one("#mlb-controls", Static).update(ctrl)
+
+    def _has_roster_players(self, game: MLBGame) -> bool:
+        return bool(
+            self._roster_mlb_teams
+            and (game.away_abbr in self._roster_mlb_teams
+                 or game.home_abbr in self._roster_mlb_teams)
+        )
+
+    def _get_roster_players_in_game(self, game: MLBGame) -> list[str]:
+        """Get names of fantasy roster players in this game."""
+        names = []
+        for abbr in (game.away_abbr, game.home_abbr):
+            names.extend(self._roster_players_by_team.get(abbr, []))
+        return names
 
     async def _load(self) -> None:
         games = get_mlb_scoreboard(self._date)
@@ -5017,11 +5301,15 @@ class MLBScoreboardScreen(Screen):
 
         if not games:
             await container.mount(Static("  No games scheduled.", classes="game-line"))
+            self._manage_refresh_timer(games)
             return
 
-        # Sort: live first, then scheduled, then final
+        # Sort: roster games first within each status group, then live > preview > final
         order = {"Live": 0, "Preview": 1, "Final": 2}
-        games.sort(key=lambda g: order.get(g.status, 1))
+        games.sort(key=lambda g: (
+            order.get(g.status, 1),
+            0 if self._has_roster_players(g) else 1,
+        ))
 
         # Batch into rows of 4
         cards_per_row = 4
@@ -5029,36 +5317,148 @@ class MLBScoreboardScreen(Screen):
             row = Horizontal(classes="game-row")
             await container.mount(row)
             for game in games[i:i + cards_per_row]:
-                card = Vertical(classes=self._card_class(game))
+                card = Vertical(
+                    classes=self._card_class(game),
+                    id=f"game-{game.gamePk}",
+                )
                 await row.mount(card)
                 await card.mount(Static(self._format_status(game), classes="game-status"))
                 await card.mount(Static(self._format_away(game), classes="game-line"))
                 await card.mount(Static(self._format_home(game), classes="game-line"))
+                # Show roster players in this game
+                roster_names = self._get_roster_players_in_game(game)
+                if roster_names:
+                    names_text = Text()
+                    names_text.append(" ★ ", style="#FFD700")
+                    names_text.append(", ".join(roster_names), style="dim italic")
+                    await card.mount(Static(names_text, classes="roster-players-line"))
+                # Show linescore for live/final by default, or if explicitly expanded
+                # Show linescore for Live/Final unless user collapsed it
+                show_linescore = (
+                    game.innings
+                    and game.status in ("Live", "Final")
+                    and game.gamePk not in self._collapsed_games
+                )
+                if show_linescore:
+                    await self._mount_linescore(card, game)
 
-    @staticmethod
-    def _card_class(game: MLBGame) -> str:
+        self._manage_refresh_timer(games)
+
+    def _manage_refresh_timer(self, games: list[MLBGame]) -> None:
+        has_live = any(g.status == "Live" for g in games)
+        if has_live and self._refresh_timer is None:
+            self._refresh_timer = self.set_interval(45, self._auto_refresh)
+            self._update_controls()
+        elif not has_live and self._refresh_timer is not None:
+            self._refresh_timer.stop()
+            self._refresh_timer = None
+            self._update_controls()
+
+    def _auto_refresh(self) -> None:
+        self.run_worker(self._load, group="mlb-load", exclusive=True)
+
+    async def _mount_linescore(self, card: Vertical, game: MLBGame) -> None:
+        num_innings = max(len(game.innings), 9)
+        # Header row: inning numbers + R H E
+        hdr = Text()
+        hdr.append("     ", style="dim")  # team abbr padding
+        for n in range(1, num_innings + 1):
+            hdr.append(f"{n:>3}", style="dim bold")
+        hdr.append("   R  H  E", style="dim bold")
+        await card.mount(Static(hdr, classes="linescore-line"))
+
+        # Away row
+        away_line = Text()
+        away_line.append(f" {game.away_abbr:<4}", style="bold" if game.away_score > game.home_score else "")
+        for n in range(num_innings):
+            if n < len(game.innings) and game.innings[n][0] is not None:
+                away_line.append(f"{game.innings[n][0]:>3}")
+            else:
+                away_line.append("  -", style="dim")
+        away_line.append(f"  {game.away_score:>2} {game.away_hits:>2} {game.away_errors:>2}")
+        await card.mount(Static(away_line, classes="linescore-line"))
+
+        # Home row
+        home_line = Text()
+        home_line.append(f" {game.home_abbr:<4}", style="bold" if game.home_score > game.away_score else "")
+        for n in range(num_innings):
+            if n < len(game.innings) and game.innings[n][1] is not None:
+                home_line.append(f"{game.innings[n][1]:>3}")
+            else:
+                home_line.append("  -", style="dim")
+        home_line.append(f"  {game.home_score:>2} {game.home_hits:>2} {game.home_errors:>2}")
+        await card.mount(Static(home_line, classes="linescore-line"))
+
+    def on_click(self, event) -> None:
+        """Open box score when a game card is clicked."""
+        try:
+            widget, _ = self.screen.get_widget_at(event.screen_x, event.screen_y)
+        except Exception:
+            return
+        while widget is not None and widget is not self:
+            widget_id = getattr(widget, "id", None) or ""
+            if widget_id.startswith("game-"):
+                gamePk = widget_id[5:]
+                for g in self._games:
+                    if g.gamePk == gamePk:
+                        self.app.push_screen(
+                            BoxScoreScreen(g, self._roster_players_by_team, self._categories)
+                        )
+                        return
+                return
+            widget = widget.parent
+
+    def action_open_boxscore(self) -> None:
+        """Open full box score for the first live game or first game."""
+        if not self._games:
+            return
+        # Prefer the first live game, then first game with data
+        target = None
+        for g in self._games:
+            if g.status == "Live":
+                target = g
+                break
+        if target is None:
+            for g in self._games:
+                if g.status == "Final":
+                    target = g
+                    break
+        if target is None:
+            target = self._games[0]
+        self.app.push_screen(BoxScoreScreen(target, self._roster_players_by_team, self._categories))
+
+    def _card_class(self, game: MLBGame) -> str:
+        has_roster = self._has_roster_players(game)
         if game.status == "Live":
-            return "game-card-live"
+            return "game-card-live-roster" if has_roster else "game-card-live"
         elif game.status == "Final":
-            return "game-card-final"
-        return "game-card"
+            return "game-card-final-roster" if has_roster else "game-card-final"
+        return "game-card-roster" if has_roster else "game-card"
 
-    @staticmethod
-    def _format_away(game: MLBGame) -> Text:
+    def _format_away(self, game: MLBGame) -> Text:
         line = Text()
         winning = game.away_score > game.home_score
+        has_roster = game.away_abbr in self._roster_mlb_teams
         style = "bold" if winning else ""
-        line.append(f" {game.away_abbr:<4}", style=style)
+        if has_roster:
+            line.append("★ ", style="#FFD700")
+            line.append(f"{game.away_abbr:<4}", style=style)
+        else:
+            line.append(f" {game.away_abbr:<4}", style=style)
         if game.status != "Preview":
             line.append(f" {game.away_score:>2}", style=style)
         return line
 
-    @staticmethod
-    def _format_home(game: MLBGame) -> Text:
+    def _format_home(self, game: MLBGame) -> Text:
         line = Text()
         winning = game.home_score > game.away_score
+        has_roster = game.home_abbr in self._roster_mlb_teams
         style = "bold" if winning else ""
-        line.append(f" {game.home_abbr:<4}", style=style)
+        if has_roster:
+            line.append("★ ", style="#FFD700")
+            line.append(f"{game.home_abbr:<4}", style=style)
+        else:
+            line.append(f" {game.home_abbr:<4}", style=style)
         if game.status != "Preview":
             line.append(f" {game.home_score:>2}", style=style)
             if game.status == "Live":
@@ -5105,18 +5505,21 @@ class MLBScoreboardScreen(Screen):
     def action_prev_day(self) -> None:
         from datetime import timedelta
         self._date -= timedelta(days=1)
+        self._collapsed_games.clear()
         self._update_controls()
         self.run_worker(self._load, group="mlb-load", exclusive=True)
 
     def action_next_day(self) -> None:
         from datetime import timedelta
         self._date += timedelta(days=1)
+        self._collapsed_games.clear()
         self._update_controls()
         self.run_worker(self._load, group="mlb-load", exclusive=True)
 
     def action_today(self) -> None:
         from datetime import date as date_cls
         self._date = date_cls.today()
+        self._collapsed_games.clear()
         self._update_controls()
         self.run_worker(self._load, group="mlb-load", exclusive=True)
 
@@ -5137,6 +5540,406 @@ class MLBScoreboardScreen(Screen):
         self.app.push_screen(
             MlbtvSelectScreen(games), callback=on_game_selected
         )
+
+
+# --- Box Score Screen ---
+
+
+# Mapping from Yahoo stat display names to MLB boxscore API field names.
+# Batting: (game_field, season_field, is_rate, width)
+_BATTING_STAT_MAP: dict[str, tuple[str, str, bool, int]] = {
+    "AB":  ("atBats", "atBats", False, 4),
+    "R":   ("runs", "runs", False, 4),
+    "H":   ("hits", "hits", False, 4),
+    "HR":  ("homeRuns", "homeRuns", False, 4),
+    "RBI": ("rbi", "rbi", False, 4),
+    "SB":  ("stolenBases", "stolenBases", False, 4),
+    "BB":  ("baseOnBalls", "baseOnBalls", False, 4),
+    "K":   ("strikeOuts", "strikeOuts", False, 4),
+    "HBP": ("hitByPitch", "hitByPitch", False, 4),
+    "SF":  ("sacFlies", "sacFlies", False, 4),
+    "2B":  ("doubles", "doubles", False, 4),
+    "3B":  ("triples", "triples", False, 4),
+    "TB":  ("totalBases", "totalBases", False, 4),
+    "CS":  ("caughtStealing", "caughtStealing", False, 4),
+    "AVG": ("", "avg", True, 6),
+    "OBP": ("", "obp", True, 6),
+    "SLG": ("", "slg", True, 6),
+    "OPS": ("", "ops", True, 6),
+    "PA":  ("plateAppearances", "plateAppearances", False, 4),
+    "LOB": ("leftOnBase", "leftOnBase", False, 4),
+    "GIDP": ("groundIntoDoublePlay", "groundIntoDoublePlay", False, 5),
+    "H/AB": ("", "", False, 0),  # special: skip in box score
+    "G":   ("gamesPlayed", "gamesPlayed", False, 0),  # skip game-level
+}
+
+# Pitching: (game_field, season_field, is_rate, width)
+_PITCHING_STAT_MAP: dict[str, tuple[str, str, bool, int]] = {
+    "IP":   ("inningsPitched", "inningsPitched", False, 5),
+    "W":    ("wins", "wins", False, 3),
+    "L":    ("losses", "losses", False, 3),
+    "SV":   ("saves", "saves", False, 3),
+    "S":    ("saves", "saves", False, 3),
+    "HLD":  ("holds", "holds", False, 4),
+    "BS":   ("blownSaves", "blownSaves", False, 3),
+    "H":    ("hits", "hits", False, 4),
+    "HA":   ("hits", "hits", False, 4),
+    "R":    ("runs", "runs", False, 4),
+    "ER":   ("earnedRuns", "earnedRuns", False, 4),
+    "HR":   ("homeRuns", "homeRuns", False, 4),
+    "BB":   ("baseOnBalls", "baseOnBalls", False, 4),
+    "K":    ("strikeOuts", "strikeOuts", False, 4),
+    "SO":   ("strikeOuts", "strikeOuts", False, 4),
+    "HBP":  ("hitBatsmen", "hitBatsmen", False, 4),
+    "WP":   ("wildPitches", "wildPitches", False, 3),
+    "BK":   ("balks", "balks", False, 3),
+    "ERA":  ("", "era", True, 6),
+    "WHIP": ("", "whip", True, 6),
+    "K/9":  ("", "strikeoutsPer9Inn", True, 5),
+    "BB/9": ("", "walksPer9Inn", True, 5),
+    "K/BB": ("", "strikeoutWalkRatio", True, 5),
+    "QS":   ("", "", False, 0),  # not in boxscore
+    "P":    ("pitchesThrown", "pitchesThrown", False, 4),
+    "G":    ("gamesPlayed", "gamesPlayed", False, 0),  # skip game-level
+    "GS":   ("gamesStarted", "gamesStarted", False, 0),
+}
+
+
+def _get_box_stat(
+    stats: dict, season_stats: dict,
+    game_field: str, season_field: str, is_rate: bool,
+) -> str:
+    """Extract a stat value from boxscore data."""
+    if is_rate:
+        # Use season stats for rate stats
+        val = season_stats.get(season_field, "")
+        if val and val != ".---" and val != "-.--":
+            return str(val)
+        return "-"
+    if game_field:
+        val = stats.get(game_field, 0)
+        if isinstance(val, str):
+            return val
+        return str(val)
+    return "-"
+
+
+class BoxScoreScreen(Screen):
+    """Full box score for a single game."""
+    BINDINGS = [("escape", "go_back", "Back"), ("q", "go_back", "Back"),
+                ("r", "refresh", "Refresh")]
+    CSS = """
+    #box-header {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #box-subheader {
+        height: 1;
+        content-align: center middle;
+        background: $surface;
+        color: $text-muted;
+    }
+    #box-loading {
+        height: 3;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    #box-content {
+        height: 1fr;
+        background: $background;
+    }
+    .box-section-label {
+        height: 1;
+        content-align: left middle;
+        background: #3A4A3A;
+        color: $foreground;
+        text-style: bold;
+        padding: 0 1;
+        margin-top: 1;
+    }
+    .box-table-header {
+        height: 1;
+        background: #2A2A2A;
+        padding: 0 1;
+    }
+    .box-player-row {
+        height: 1;
+        padding: 0 1;
+    }
+    .box-player-row-highlight {
+        height: 1;
+        padding: 0 1;
+        background: #2E3A1E;
+    }
+    .box-player-row-current {
+        height: 1;
+        padding: 0 1;
+        background: #1E2E1E;
+        text-style: bold;
+    }
+    .box-totals-row {
+        height: 1;
+        padding: 0 1;
+        background: #2A2A2A;
+        text-style: bold;
+    }
+    .box-linescore-line {
+        height: 1;
+        padding: 0 1;
+    }
+    """
+
+    def __init__(
+        self, game: MLBGame,
+        roster_players_by_team: dict[str, list[str]] | None = None,
+        categories: list | None = None,
+    ) -> None:
+        super().__init__()
+        self._game = game
+        self._roster_names: set[str] = set()
+        if roster_players_by_team:
+            for abbr in (game.away_abbr, game.home_abbr):
+                for name in roster_players_by_team.get(abbr, []):
+                    self._roster_names.add(name)
+        self._categories = categories or []
+        self._boxscore: BoxScore | None = None
+
+        # Build column lists from league categories
+        self._bat_cols = self._build_batting_cols()
+        self._pitch_cols = self._build_pitching_cols()
+
+    def _build_batting_cols(self) -> list[tuple[str, str, str, bool, int]]:
+        """Build batting columns: (display_name, game_field, season_field, is_rate, width)."""
+        cols: list[tuple[str, str, str, bool, int]] = []
+        seen: set[str] = set()
+        # Always show AB first
+        cols.append(("AB", "atBats", "atBats", False, 4))
+        seen.add("AB")
+        # Add league scoring categories
+        for cat in self._categories:
+            if cat.position_type != "B":
+                continue
+            name = cat.display_name
+            if name in seen:
+                continue
+            mapping = _BATTING_STAT_MAP.get(name)
+            if mapping and mapping[3] > 0:  # has width (not skipped)
+                cols.append((name, mapping[0], mapping[1], mapping[2], mapping[3]))
+                seen.add(name)
+        # If no categories, use defaults
+        if len(cols) <= 1:
+            for name in ("R", "H", "HR", "RBI", "SB", "BB", "K", "AVG", "OBP", "SLG"):
+                mapping = _BATTING_STAT_MAP.get(name)
+                if mapping and name not in seen:
+                    cols.append((name, mapping[0], mapping[1], mapping[2], mapping[3]))
+        return cols
+
+    def _build_pitching_cols(self) -> list[tuple[str, str, str, bool, int]]:
+        """Build pitching columns."""
+        cols: list[tuple[str, str, str, bool, int]] = []
+        seen: set[str] = set()
+        # Always show IP first
+        cols.append(("IP", "inningsPitched", "inningsPitched", False, 5))
+        seen.add("IP")
+        # Add league scoring categories
+        for cat in self._categories:
+            if cat.position_type != "P":
+                continue
+            name = cat.display_name
+            if name in seen:
+                continue
+            mapping = _PITCHING_STAT_MAP.get(name)
+            if mapping and mapping[3] > 0:
+                cols.append((name, mapping[0], mapping[1], mapping[2], mapping[3]))
+                seen.add(name)
+        # Always add pitches at the end
+        if "P" not in seen:
+            cols.append(("P", "pitchesThrown", "pitchesThrown", False, 4))
+        # If no categories, use defaults
+        if len(cols) <= 2:
+            for name in ("H", "R", "ER", "BB", "K", "HR", "ERA", "WHIP"):
+                mapping = _PITCHING_STAT_MAP.get(name)
+                if mapping and name not in seen:
+                    cols.append((name, mapping[0], mapping[1], mapping[2], mapping[3]))
+        return cols
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("", id="box-header")
+        yield Static("", id="box-subheader")
+        yield Static("Loading box score...", id="box-loading")
+        yield VerticalScroll(id="box-content")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        g = self._game
+        title = Text()
+        title.append(f" {g.away_team} @ {g.home_team} ", style="bold")
+        self.query_one("#box-header", Static).update(title)
+
+        sub = Text()
+        if g.status == "Live":
+            sub.append(" LIVE ", style="bold on #4A7C59")
+            sub.append(f"  {g.inning_half} {g.inning_ordinal}")
+        elif g.status == "Final":
+            sub.append(" FINAL ", style="bold on #444444")
+            if g.inning > 9:
+                sub.append(f"  ({g.inning})")
+        sub.append(f"    {g.away_abbr} {g.away_score} - {g.home_abbr} {g.home_score}",
+                   style="bold")
+        sub.append("    [r] refresh  [esc] back", style="dim")
+        self.query_one("#box-subheader", Static).update(sub)
+
+        self.query_one("#box-content").display = False
+        self.run_worker(self._load)
+
+    async def _load(self) -> None:
+        try:
+            boxscore = get_mlb_boxscore(self._game.gamePk)
+        except Exception as e:
+            loading = self.query("#box-loading")
+            if loading:
+                loading.first().update(f"Failed to load box score: {e}")
+            return
+
+        self._boxscore = boxscore
+
+        loading = self.query("#box-loading")
+        if loading:
+            loading.first().remove()
+
+        container = self.query_one("#box-content", VerticalScroll)
+        container.display = True
+        await container.remove_children()
+
+        g = self._game
+
+        # Linescore
+        if g.innings:
+            await container.mount(Static(
+                Text(" Line Score", style="bold"), classes="box-section-label"
+            ))
+            num_innings = max(len(g.innings), 9)
+            hdr = Text()
+            hdr.append(f"{'':>20s}")
+            for n in range(1, num_innings + 1):
+                hdr.append(f"{n:>3}", style="bold")
+            hdr.append("   R  H  E", style="bold")
+            await container.mount(Static(hdr, classes="box-table-header"))
+
+            away_line = Text()
+            away_line.append(f" {g.away_team[:18]:<19s}")
+            for n in range(num_innings):
+                if n < len(g.innings) and g.innings[n][0] is not None:
+                    away_line.append(f"{g.innings[n][0]:>3}")
+                else:
+                    away_line.append("  -", style="dim")
+            away_line.append(f"  {g.away_score:>2} {g.away_hits:>2} {g.away_errors:>2}")
+            await container.mount(Static(away_line, classes="box-linescore-line"))
+
+            home_line = Text()
+            home_line.append(f" {g.home_team[:18]:<19s}")
+            for n in range(num_innings):
+                if n < len(g.innings) and g.innings[n][1] is not None:
+                    home_line.append(f"{g.innings[n][1]:>3}")
+                else:
+                    home_line.append("  -", style="dim")
+            home_line.append(f"  {g.home_score:>2} {g.home_hits:>2} {g.home_errors:>2}")
+            await container.mount(Static(home_line, classes="box-linescore-line"))
+
+        # Batting tables
+        for team in (boxscore.away, boxscore.home):
+            await self._render_batting(container, team)
+
+        # Pitching tables
+        for team in (boxscore.away, boxscore.home):
+            await self._render_pitching(container, team)
+
+    async def _render_batting(self, container, team: BoxScoreTeam) -> None:
+        await container.mount(Static(
+            Text(f" {team.name} — Batting", style="bold"),
+            classes="box-section-label",
+        ))
+
+        hdr = Text()
+        hdr.append(f" {'Batter':<24s}", style="bold")
+        hdr.append(f"{'Pos':>4s}", style="bold")
+        for name, _, _, is_rate, width in self._bat_cols:
+            hdr.append(f"{name:>{width}s}", style="bold")
+        await container.mount(Static(hdr, classes="box-table-header"))
+
+        # Track totals for counting stats
+        totals: dict[str, int] = {}
+        for b in team.batters:
+            is_roster = b.name in self._roster_names
+            row = Text()
+            name_style = "#FFD700 bold" if is_roster else ("bold" if b.is_current else "")
+            prefix = "★ " if is_roster else ("► " if b.is_current else "  ")
+            row.append(f"{prefix}{b.name[:22]:<22s}", style=name_style)
+            row.append(f"{b.position:>4s}", style="dim")
+            for col_name, game_field, season_field, is_rate, width in self._bat_cols:
+                val = _get_box_stat(b.stats, b.season_stats, game_field, season_field, is_rate)
+                style = "dim" if is_rate else ""
+                row.append(f"{val:>{width}s}", style=style)
+                if not is_rate and game_field:
+                    try:
+                        totals[col_name] = totals.get(col_name, 0) + int(val)
+                    except (ValueError, TypeError):
+                        pass
+            css_cls = "box-player-row-current" if b.is_current else (
+                "box-player-row-highlight" if is_roster else "box-player-row"
+            )
+            await container.mount(Static(row, classes=css_cls))
+
+        # Totals row
+        totals_row = Text()
+        totals_row.append(f"  {'Totals':<22s}")
+        totals_row.append(f"{'':>4s}")
+        for col_name, game_field, _, is_rate, width in self._bat_cols:
+            if is_rate or not game_field:
+                totals_row.append(f"{'':>{width}s}")
+            else:
+                totals_row.append(f"{totals.get(col_name, 0):>{width}d}")
+        await container.mount(Static(totals_row, classes="box-totals-row"))
+
+    async def _render_pitching(self, container, team: BoxScoreTeam) -> None:
+        await container.mount(Static(
+            Text(f" {team.name} — Pitching", style="bold"),
+            classes="box-section-label",
+        ))
+
+        hdr = Text()
+        hdr.append(f" {'Pitcher':<24s}", style="bold")
+        for name, _, _, is_rate, width in self._pitch_cols:
+            hdr.append(f"{name:>{width}s}", style="bold")
+        await container.mount(Static(hdr, classes="box-table-header"))
+
+        for p in team.pitchers:
+            is_roster = p.name in self._roster_names
+            row = Text()
+            name_style = "#FFD700 bold" if is_roster else ("bold" if p.is_current else "")
+            prefix = "★ " if is_roster else ("► " if p.is_current else "  ")
+            name_display = p.name[:20]
+            if p.decision:
+                name_display += f" ({p.decision})"
+            row.append(f"{prefix}{name_display:<22s}", style=name_style)
+            for col_name, game_field, season_field, is_rate, width in self._pitch_cols:
+                val = _get_box_stat(p.stats, p.season_stats, game_field, season_field, is_rate)
+                style = "dim" if is_rate else ""
+                row.append(f"{val:>{width}s}", style=style)
+            css_cls = "box-player-row-current" if p.is_current else (
+                "box-player-row-highlight" if is_roster else "box-player-row"
+            )
+            await container.mount(Static(row, classes=css_cls))
+
+    def action_refresh(self) -> None:
+        self.run_worker(self._load, group="box-load", exclusive=True)
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
 
 
 # --- MLB.TV Selection Screen ---
@@ -5503,7 +6306,8 @@ class ScoreboardScreen(Screen):
                 ("e", "select_week", "Select Week"),
                 ("L", "switch_league", "Switch League"),
                 ("i", "player_detail", "Player Detail"),
-                ("a", "ask_skipper", "Ask Skipper")]
+                ("a", "ask_skipper", "Ask Skipper"),
+                ("c", "settings", "Config")]
     CSS = """
     #board-header {
         height: 1;
@@ -6116,7 +6920,10 @@ class ScoreboardScreen(Screen):
             )
 
     def action_mlb_scores(self) -> None:
-        self.app.push_screen(MLBScoreboardScreen())
+        self.app.push_screen(MLBScoreboardScreen(self.api, self.league))
+
+    def action_settings(self) -> None:
+        self.app.push_screen(SettingsScreen(self.api, self.league))
 
     def _load_week(self, week: int) -> None:
         """Switch to viewing a specific week's matchups."""
