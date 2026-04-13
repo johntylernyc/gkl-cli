@@ -9,7 +9,10 @@ from pathlib import Path
 
 import anthropic
 
-from gkl.yahoo_api import YahooFantasyAPI, League, Matchup, StatCategory, PlayerStats, TeamStats
+from gkl.yahoo_api import (
+    YahooFantasyAPI, League, Matchup, StatCategory, PlayerStats, TeamStats,
+    Transaction,
+)
 from gkl.stats import who_wins, compute_roto, simulate_h2h, compute_power_rankings
 from gkl.statcast import lookup_mlbam_id
 from gkl.mlb_api import (
@@ -102,6 +105,36 @@ TOOLS = [
                 "week": {
                     "type": "integer",
                     "description": "Week number. Omit for current week.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_weekly_recap",
+        "description": (
+            "Get a comprehensive recap of a specific league week — designed "
+            "for building a narrative summary of what happened across the "
+            "entire league. Returns: (1) all H2H matchup results with category "
+            "breakdowns, classifying each as a blowout, competitive, or upset, "
+            "(2) that week's power rankings showing how each team would have "
+            "fared against every opponent, (3) roto standings movement compared "
+            "to the prior week, (4) standout weekly team performances (best "
+            "individual stats that week), and (5) all transactions (trades, "
+            "adds, drops) that happened during the week. Use this when asked "
+            "for a league recap, weekly summary, or 'what happened last week'. "
+            "Write the recap as a compelling league-wide narrative, not a "
+            "data dump."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "week": {
+                    "type": "integer",
+                    "description": (
+                        "Week number to recap. Omit to recap the most recently "
+                        "completed week."
+                    ),
                 },
             },
             "required": [],
@@ -381,6 +414,8 @@ class Skipper:
                     return await self._tool_strength_of_schedule()
                 case "get_matchup_scoreboard":
                     return await self._tool_matchups(tool_input.get("week"))
+                case "get_weekly_recap":
+                    return await self._tool_weekly_recap(tool_input.get("week"))
                 case "get_team_roster":
                     return await self._tool_roster(
                         tool_input["team_name"],
@@ -492,22 +527,23 @@ class Skipper:
                 records[a.team_key]["ties"] += 1
                 records[b.team_key]["ties"] += 1
 
-        # Sort by wins desc, then losses asc
+        # Sort by category record — the official league standings metric
         sorted_teams = sorted(
             records.items(),
-            key=lambda x: (x[1]["wins"], -x[1]["losses"]),
+            key=lambda x: (x[1]["cat_wins"], -x[1]["cat_losses"]),
             reverse=True,
         )
 
         lines = [f"H2H Standings through Week {current}:", ""]
-        lines.append("Rank | Team | Manager | Record (W-L-T) | Cat Record (W-L-T)")
-        lines.append("-" * 70)
+        lines.append("  (Ranked by category record — the official league standings)")
+        lines.append("Rank | Team | Manager | Cat Record (W-L-T) | Matchup Record (W-L-T)")
+        lines.append("-" * 75)
         for rank, (_, r) in enumerate(sorted_teams, 1):
-            matchup_record = f"{r['wins']}-{r['losses']}-{r['ties']}"
             cat_record = f"{r['cat_wins']}-{r['cat_losses']}-{r['cat_ties']}"
+            matchup_record = f"{r['wins']}-{r['losses']}-{r['ties']}"
             lines.append(
                 f"{rank}. {r['name']} | {r['manager']} | "
-                f"{matchup_record} | {cat_record}"
+                f"{cat_record} | {matchup_record}"
             )
         return "\n".join(lines)
 
@@ -772,6 +808,430 @@ class Skipper:
                 av = a.stats.get(c.stat_id, "-")
                 bv = b.stats.get(c.stat_id, "-")
                 lines.append(f"  {c.display_name}: {av} vs {bv}")
+        return "\n".join(lines)
+
+    async def _tool_weekly_recap(self, week: int | None) -> str:
+        """Build a comprehensive weekly recap for narrative generation."""
+        from datetime import datetime, timezone
+
+        await self._ensure_teams()
+        league_key = self.league.league_key
+        scored = [c for c in self.categories if not c.is_only_display]
+        current = self.league.current_week
+
+        # Determine which week to recap
+        if week is not None:
+            recap_week = week
+        else:
+            # Most recently completed week: current if postevent, else previous
+            test_matchups = await asyncio.to_thread(
+                self.api.get_scoreboard, league_key, current
+            )
+            if test_matchups and test_matchups[0].status == "postevent":
+                recap_week = current
+            else:
+                recap_week = max(1, current - 1)
+
+        # Fetch all the data we need concurrently
+        matchups_task = asyncio.to_thread(
+            self.api.get_scoreboard, league_key, recap_week
+        )
+        week_stats_task = asyncio.to_thread(
+            self.api.get_team_week_stats, league_key, recap_week
+        )
+        season_stats_task = asyncio.to_thread(
+            self.api.get_team_season_stats, league_key
+        )
+        transactions_task = asyncio.to_thread(
+            self.api.get_transactions, league_key, 100
+        )
+        matchups, week_stats, season_stats, all_transactions = await asyncio.gather(
+            matchups_task, week_stats_task, season_stats_task, transactions_task
+        )
+
+        # Fetch all weeks' matchups for cumulative H2H standings
+        all_week_matchups: list[Matchup] = list(matchups)  # include recap week
+        for w in range(1, recap_week):
+            wm = await asyncio.to_thread(
+                self.api.get_scoreboard, league_key, w
+            )
+            all_week_matchups.extend(wm)
+
+        # Compute cumulative H2H records
+        h2h_records: dict[str, dict] = {}
+        for m in all_week_matchups:
+            a, b = m.team_a, m.team_b
+            for tk in (a.team_key, b.team_key):
+                if tk not in h2h_records:
+                    h2h_records[tk] = {
+                        "name": "", "manager": "",
+                        "wins": 0, "losses": 0, "ties": 0,
+                        "cat_wins": 0, "cat_losses": 0, "cat_ties": 0,
+                    }
+            h2h_records[a.team_key]["name"] = a.name
+            h2h_records[a.team_key]["manager"] = a.manager
+            h2h_records[b.team_key]["name"] = b.name
+            h2h_records[b.team_key]["manager"] = b.manager
+
+            a_cat_w, b_cat_w, cat_t = 0, 0, 0
+            for c in scored:
+                result = who_wins(
+                    a.stats.get(c.stat_id, "0"),
+                    b.stats.get(c.stat_id, "0"),
+                    c.sort_order,
+                )
+                if result == "a":
+                    a_cat_w += 1
+                elif result == "b":
+                    b_cat_w += 1
+                else:
+                    cat_t += 1
+            h2h_records[a.team_key]["cat_wins"] += a_cat_w
+            h2h_records[a.team_key]["cat_losses"] += b_cat_w
+            h2h_records[a.team_key]["cat_ties"] += cat_t
+            h2h_records[b.team_key]["cat_wins"] += b_cat_w
+            h2h_records[b.team_key]["cat_losses"] += a_cat_w
+            h2h_records[b.team_key]["cat_ties"] += cat_t
+            if a_cat_w > b_cat_w:
+                h2h_records[a.team_key]["wins"] += 1
+                h2h_records[b.team_key]["losses"] += 1
+            elif b_cat_w > a_cat_w:
+                h2h_records[b.team_key]["wins"] += 1
+                h2h_records[a.team_key]["losses"] += 1
+            else:
+                h2h_records[a.team_key]["ties"] += 1
+                h2h_records[b.team_key]["ties"] += 1
+
+        # Sort by category record (the official league standings metric)
+        h2h_sorted = sorted(
+            h2h_records.values(),
+            key=lambda r: (r["cat_wins"], -r["cat_losses"]),
+            reverse=True,
+        )
+
+        # ── Section 1: H2H Matchup Results ──
+        matchup_results = []
+        for m in matchups:
+            a, b = m.team_a, m.team_b
+            a_wins, b_wins, ties = 0, 0, 0
+            cat_details = []
+            for c in scored:
+                result = who_wins(
+                    a.stats.get(c.stat_id, "0"),
+                    b.stats.get(c.stat_id, "0"),
+                    c.sort_order,
+                )
+                if result == "a":
+                    a_wins += 1
+                elif result == "b":
+                    b_wins += 1
+                else:
+                    ties += 1
+                cat_details.append((c.display_name, a.stats.get(c.stat_id, "-"),
+                                    b.stats.get(c.stat_id, "-"), result))
+
+            margin = abs(a_wins - b_wins)
+            total_cats = a_wins + b_wins + ties
+            if margin >= total_cats * 0.6:
+                matchup_type = "BLOWOUT"
+            elif margin <= 1:
+                matchup_type = "NAIL-BITER"
+            else:
+                matchup_type = "COMPETITIVE"
+
+            if a_wins > b_wins:
+                winner, loser = a.name, b.name
+                w_cats, l_cats = a_wins, b_wins
+            elif b_wins > a_wins:
+                winner, loser = b.name, a.name
+                w_cats, l_cats = b_wins, a_wins
+            else:
+                winner, loser = a.name, b.name
+                w_cats, l_cats = a_wins, b_wins
+                matchup_type = "TIE"
+
+            matchup_results.append({
+                "winner": winner, "loser": loser,
+                "w_cats": w_cats, "l_cats": l_cats, "ties": ties,
+                "type": matchup_type,
+                "cat_details": cat_details,
+                "team_a": a.name, "team_b": b.name,
+            })
+
+        # ── Section 2: Weekly Power Rankings ──
+        h2h = simulate_h2h(week_stats, self.categories)
+        power = compute_power_rankings(h2h, week_stats)
+
+        # ── Section 3: Season Roto Standings (current) ──
+        season_roto = compute_roto(season_stats, self.categories)
+
+        # ── Section 4: Weekly Roto (who had the best week) ──
+        week_roto = compute_roto(week_stats, self.categories)
+
+        # ── Section 5: Standout Performances ──
+        # Find league-leading individual week stats
+        standouts = []
+        bat_cats = [c for c in scored if c.position_type == "B"]
+        pit_cats = [c for c in scored if c.position_type == "P"]
+        week_stats_by_key = {t.team_key: t for t in week_stats}
+        for c in scored:
+            best_val = None
+            best_team = None
+            higher = c.sort_order == "1"
+            for t in week_stats:
+                try:
+                    val = float(t.stats.get(c.stat_id, "0"))
+                except (ValueError, TypeError):
+                    continue
+                if best_val is None or (higher and val > best_val) or (not higher and val < best_val):
+                    best_val = val
+                    best_team = t.name
+            if best_val is not None and best_team:
+                standouts.append((c.display_name, best_team, best_val))
+
+        # ── Section 6: Transactions during this week ──
+        week_start = None
+        week_end = None
+        if matchups:
+            week_start = matchups[0].week_start
+            week_end = matchups[0].week_end
+
+        week_txns: list[Transaction] = []
+        if week_start and week_end:
+            try:
+                start_ts = datetime.strptime(week_start, "%Y-%m-%d").replace(
+                    tzinfo=timezone.utc
+                ).timestamp()
+                # End of the end date
+                end_ts = datetime.strptime(week_end, "%Y-%m-%d").replace(
+                    tzinfo=timezone.utc
+                ).timestamp() + 86400
+                week_txns = [
+                    tx for tx in all_transactions
+                    if start_ts <= tx.timestamp <= end_ts
+                ]
+            except (ValueError, TypeError):
+                week_txns = []
+
+        trades = [tx for tx in week_txns if tx.type == "trade"]
+        adds_drops = [tx for tx in week_txns if tx.type in ("add", "drop", "add/drop")]
+
+        # ── Build Output ──
+        lines = [
+            f"WEEKLY LEAGUE RECAP — WEEK {recap_week}",
+            f"({matchups[0].week_start} to {matchups[0].week_end})"
+            if matchups else "",
+            "",
+        ]
+
+        # Matchup results
+        lines.append("═══ MATCHUP RESULTS ═══")
+        for mr in matchup_results:
+            if mr["type"] == "TIE":
+                lines.append(
+                    f"  [{mr['type']}] {mr['team_a']} vs {mr['team_b']}: "
+                    f"{mr['w_cats']}-{mr['l_cats']}-{mr['ties']}"
+                )
+            else:
+                lines.append(
+                    f"  [{mr['type']}] {mr['winner']} def. {mr['loser']} "
+                    f"{mr['w_cats']}-{mr['l_cats']}-{mr['ties']}"
+                )
+            # Show key categories
+            decisive = [(name, av, bv, r) for name, av, bv, r in mr["cat_details"]]
+            for name, av, bv, r in decisive:
+                marker = "←" if r == "a" else ("→" if r == "b" else "=")
+                lines.append(f"    {name}: {av} {marker} {bv}")
+        lines.append("")
+
+        # Weekly power rankings (who was actually strongest this week)
+        lines.append("═══ WEEK'S POWER RANKINGS (hypothetical record vs all teams) ═══")
+        for i, p in enumerate(power, 1):
+            lines.append(f"  {i}. {p.name} ({p.manager}): {p.record_str}")
+        lines.append("")
+
+        # Weekly roto (best raw production this week)
+        lines.append("═══ WEEKLY PRODUCTION LEADERS (roto points for this week only) ═══")
+        for i, r in enumerate(week_roto[:5], 1):
+            lines.append(f"  {i}. {r['name']} — {r['total']:.1f} roto pts")
+        lines.append("")
+
+        # Season standings
+        lines.append("═══ SEASON ROTO STANDINGS (cumulative through this week) ═══")
+        for i, r in enumerate(season_roto, 1):
+            lines.append(f"  {i}. {r['name']} ({r['manager']}) — {r['total']:.1f} pts")
+        lines.append("")
+
+        # H2H standings — category record is the official standings metric
+        lines.append(f"═══ H2H STANDINGS (through Week {recap_week}) ═══")
+        lines.append("  (Ranked by category record — the official league standings)")
+        for i, r in enumerate(h2h_sorted, 1):
+            cat_record = f"{r['cat_wins']}-{r['cat_losses']}-{r['cat_ties']}"
+            matchup_record = f"{r['wins']}-{r['losses']}-{r['ties']}"
+            lines.append(
+                f"  {i}. {r['name']} ({r['manager']}) — "
+                f"{cat_record} (matchups: {matchup_record})"
+            )
+        lines.append("")
+
+        # Stat leaders — every scored category, all teams shown ranked
+        lines.append("═══ WEEKLY STAT LEADERS (all scored categories) ═══")
+        for c in scored:
+            higher = c.sort_order == "1"
+            team_vals = []
+            for t in week_stats:
+                try:
+                    val = float(t.stats.get(c.stat_id, "0"))
+                except (ValueError, TypeError):
+                    val = 0.0
+                team_vals.append((t.name, val))
+            team_vals.sort(key=lambda x: x[1], reverse=higher)
+            ptype = "bat" if c.position_type == "B" else "pit"
+            formatted = []
+            for tname, val in team_vals:
+                if val == int(val) and abs(val) < 10000:
+                    formatted.append(f"{tname} {int(val)}")
+                else:
+                    formatted.append(f"{tname} {val:.3f}")
+            lines.append(f"  {c.display_name} ({ptype}): " + " | ".join(formatted))
+        lines.append("")
+
+        # Transactions — enhanced with stats
+        if trades:
+            lines.append("═══ TRADES ═══")
+            for tx in trades:
+                involved = {}
+                for p in tx.players:
+                    team = p.to_team
+                    if team not in involved:
+                        involved[team] = []
+                    involved[team].append(f"{p.name} ({p.position})")
+                parts = [f"{team} gets {', '.join(players)}"
+                         for team, players in involved.items()]
+                lines.append(f"  {' ⟷ '.join(parts)}")
+            lines.append("")
+
+        # Build enhanced transaction wire: top adds with stats, notable drops
+        _NON_TEAM = {"free agents", "freeagents", "waivers", ""}
+        added_players: dict[str, str] = {}  # player_name -> to_team
+        dropped_players: dict[str, str] = {}  # player_name -> from_team
+        for tx in adds_drops:
+            for p in tx.players:
+                if p.action in ("add", "added") and p.to_team.lower() not in _NON_TEAM:
+                    added_players[p.name] = p.to_team
+                elif p.action in ("drop", "dropped") and p.from_team.lower() not in _NON_TEAM:
+                    dropped_players[p.name] = p.from_team
+
+        # Fetch draft costs to identify high-cost drops
+        draft_costs = await asyncio.to_thread(
+            self.api.get_draft_results, league_key
+        )
+
+        # Look up season stats for added players (top 5 by Yahoo rank)
+        if added_players:
+            add_stats: list[tuple[str, str, PlayerStats | None]] = []
+            for name, team in list(added_players.items())[:10]:
+                try:
+                    results = await asyncio.to_thread(
+                        self.api.search_players, league_key, name, 1
+                    )
+                    add_stats.append((name, team, results[0] if results else None))
+                except Exception:
+                    add_stats.append((name, team, None))
+
+            # Sort by draft_cost descending as a proxy for perceived value,
+            # then show top 5
+            def _add_sort_key(item: tuple) -> float:
+                _, _, ps = item
+                if ps is None:
+                    return 0
+                try:
+                    return float(ps.draft_cost) if ps.draft_cost else 0
+                except (ValueError, TypeError):
+                    return 0
+            add_stats.sort(key=_add_sort_key, reverse=True)
+
+            lines.append("═══ TOP ADDS THIS WEEK (with season stats) ═══")
+            add_cats_bat = [c for c in scored if c.position_type == "B"]
+            add_cats_pit = [c for c in scored if c.position_type == "P"]
+            for name, team, ps in add_stats[:5]:
+                if ps:
+                    is_pit = ps.position in ("SP", "RP", "P")
+                    cats = add_cats_pit if is_pit else add_cats_bat
+                    vals = [f"{c.display_name}={ps.stats.get(c.stat_id, '-')}"
+                            for c in cats]
+                    lines.append(
+                        f"  {name} ({ps.position}) → {team}: "
+                        + ", ".join(vals)
+                    )
+                else:
+                    lines.append(f"  {name} → {team}: (stats unavailable)")
+            lines.append("")
+
+        # Notable drops: players that were drafted (manager spent $ on them)
+        if dropped_players:
+            notable_drops: list[tuple[str, str, str, PlayerStats | None]] = []
+            for name, team in dropped_players.items():
+                # Look up if they were drafted by checking all player keys
+                # We need to search for the player to get their key
+                try:
+                    results = await asyncio.to_thread(
+                        self.api.search_players, league_key, name, 1
+                    )
+                    ps = results[0] if results else None
+                    cost = draft_costs.get(ps.player_key, "") if ps else ""
+                    if cost and cost != "0":
+                        notable_drops.append((name, team, cost, ps))
+                except Exception:
+                    pass
+
+            if notable_drops:
+                notable_drops.sort(
+                    key=lambda x: float(x[2]) if x[2] else 0, reverse=True
+                )
+                lines.append("═══ NOTABLE DROPS (drafted players hitting waivers) ═══")
+                for name, team, cost, ps in notable_drops:
+                    if ps:
+                        is_pit = ps.position in ("SP", "RP", "P")
+                        cats = add_cats_pit if is_pit else add_cats_bat
+                        vals = [f"{c.display_name}={ps.stats.get(c.stat_id, '-')}"
+                                for c in cats]
+                        lines.append(
+                            f"  {name} ({ps.position}) dropped by {team} "
+                            f"[drafted ${cost}]: " + ", ".join(vals)
+                        )
+                    else:
+                        lines.append(
+                            f"  {name} dropped by {team} [drafted ${cost}]"
+                        )
+                lines.append("")
+
+        lines.append(
+            "INSTRUCTIONS FOR RESPONSE: Blend narrative and structured data. "
+            "Use this format:\n"
+            "1. **Headline** — one punchy sentence summarizing the week's biggest story\n"
+            "2. **Matchup Results** — for each matchup, 1-2 sentences of context "
+            "(was it an upset? a blowout? a rivalry?) plus the category record. "
+            "Call out the decisive categories by name and value.\n"
+            "3. **Standings Check** — show both H2H standings (win-loss record) "
+            "and roto standings (points) side by side or in sequence. Note any "
+            "meaningful movement, tightening races, or divergence between the two.\n"
+            "4. **Power Rankings vs Reality** — highlight any teams whose power "
+            "ranking diverges significantly from their actual record (lucky/unlucky).\n"
+            "5. **Stat Leaders** — present all scored categories in a compact "
+            "format showing who led each one. Group batting and pitching. "
+            "Call out any especially dominant or surprising performances.\n"
+            "6. **Transaction Wire** — lead with any trades. Then cover the top "
+            "adds with their season stat lines (are they legit pickups or desperation "
+            "moves?). Highlight any notable drops — players that were drafted with "
+            "real auction dollars hitting waivers. Are any of them buy-low targets "
+            "other managers should watch?\n"
+            "7. **Looking Ahead** — a brief sentence or two about storylines to "
+            "watch next week.\n\n"
+            "Keep narrative sections engaging but grounded in the actual numbers. "
+            "Every claim should be backed by a stat from the data above."
+        )
+
         return "\n".join(lines)
 
     async def _tool_roster(self, team_name: str, stat_type: str) -> str:

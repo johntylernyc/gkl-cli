@@ -6,15 +6,27 @@ from dataclasses import dataclass, field
 
 from gkl.yahoo_api import PlayerStats, StatCategory, TeamStats
 
-# Rate stats that need special aggregation (not just summing)
-# These are computed from component counting stats
+# Rate stats that need special aggregation (not just summing).
+# Values are skipped during counting-stat summation and instead
+# accumulated as weighted averages (see _RATE_WEIGHTS).
 RATE_STATS = {
     "3": ("60",),   # AVG = H/AB (stat 60 is "H/AB" like "31/103")
-    "4": None,      # OBP — needs H, BB, HBP, AB, SF (complex, approximate from components)
-    "5": None,      # SLG — needs TB, AB (complex)
+    "4": None,      # OBP — needs H, BB, HBP, AB, SF (complex)
+    "5": None,      # SLG — needs TB, AB
     "26": ("50",),  # ERA = ER*9/IP (stat 50 is IP)
     "27": ("50",),  # WHIP = (W+H)/IP
     "56": None,     # K/BB ratio
+}
+
+# Weight stat and decimal places for rate-stat weighted averaging.
+# Batting rates are weighted by AB (stat 6); pitching rates by IP (stat 50).
+_RATE_WEIGHTS: dict[str, tuple[str, int]] = {
+    "3":  ("6", 3),   # AVG weighted by AB
+    "4":  ("6", 3),   # OBP weighted by AB (approximate — denom is PA, not AB)
+    "5":  ("6", 3),   # SLG weighted by AB
+    "26": ("50", 2),  # ERA weighted by IP
+    "27": ("50", 2),  # WHIP weighted by IP
+    "56": ("50", 2),  # K/BB weighted by IP (approximate)
 }
 
 # Stats pinned to always display regardless of league scoring configuration.
@@ -141,8 +153,8 @@ def aggregate_weekly_stats(
     """Aggregate multiple weeks of team stats into a single set.
 
     For counting stats: sum across weeks.
-    For rate stats: recompute from summed components where possible,
-    otherwise sum (as an approximation).
+    For rate stats: compute weighted averages (batting rates by AB,
+    pitching rates by IP).
     """
     if not weekly_data:
         return []
@@ -170,17 +182,57 @@ def aggregate_weekly_stats(
                     # H/AB — aggregate components separately
                     _add_hab(agg, val)
                 elif stat_id in RATE_STATS:
-                    # Rate stats: skip, we'll recompute
+                    # Rate stats: skip counting, accumulated below
                     continue
                 else:
                     # Counting stat: sum
                     _add_numeric(agg, stat_id, val)
 
-    # Recompute rate stats from components
+            # Accumulate rate stats as weighted sums for proper averaging.
+            # Batting rates weighted by AB, pitching rates weighted by IP.
+            ab = _get_ab(t)
+            ip = _parse_ip(t.stats.get("50", "0"))
+
+            for stat_id, (weight_stat, _decimals) in _RATE_WEIGHTS.items():
+                if stat_id not in t.stats:
+                    continue
+                try:
+                    val_f = float(t.stats[stat_id])
+                except (ValueError, TypeError):
+                    continue
+                weight = ab if weight_stat == "6" else ip
+                if weight <= 0:
+                    continue
+                wk = f"_rw_{stat_id}"
+                wtk = f"_rwt_{stat_id}"
+                agg.stats[wk] = str(
+                    float(agg.stats.get(wk, "0")) + val_f * weight)
+                agg.stats[wtk] = str(
+                    float(agg.stats.get(wtk, "0")) + weight)
+
+    # Compute final rate stat values from weighted sums
     for agg in team_map.values():
         _compute_rates(agg)
 
     return list(team_map.values())
+
+
+def _get_ab(t: TeamStats) -> float:
+    """Get at-bats from stat 6, falling back to parsing H/AB (stat 60)."""
+    try:
+        ab = float(t.stats.get("6", "0"))
+        if ab > 0:
+            return ab
+    except (ValueError, TypeError):
+        pass
+    # Fallback: parse AB from H/AB string like "31/103"
+    hab = t.stats.get("60", "")
+    if "/" in hab:
+        try:
+            return float(hab.split("/")[1])
+        except (ValueError, IndexError):
+            pass
+    return 0.0
 
 
 def _add_hab(agg: TeamStats, val: str) -> None:
@@ -209,44 +261,14 @@ def _add_numeric(agg: TeamStats, stat_id: str, val: str) -> None:
 
 
 def _compute_rates(agg: TeamStats) -> None:
-    """Recompute rate stats from accumulated components."""
-    h = float(agg.stats.get("_h", "0"))
-    ab = float(agg.stats.get("_ab", "0"))
-
-    # AVG (stat 3) = H / AB
-    if ab > 0:
-        agg.stats["3"] = f"{h / ab:.3f}"
-    else:
-        agg.stats["3"] = ".000"
-
-    # ERA (stat 26) = ER * 9 / IP
-    # We need earned runs (stat 40) and IP (stat 50)
-    ip = _parse_ip(agg.stats.get("50", "0"))
-    er = float(agg.stats.get("40", "0"))
-    if ip > 0:
-        agg.stats["26"] = f"{er * 9 / ip:.2f}"
-
-    # WHIP (stat 27) = (BB + H_allowed) / IP
-    # BB = stat 39 (walks allowed), H_allowed = stat 35
-    bb = float(agg.stats.get("39", "0"))
-    h_allowed = float(agg.stats.get("35", "0"))
-    if ip > 0:
-        agg.stats["27"] = f"{(bb + h_allowed) / ip:.2f}"
-
-    # K/BB (stat 56)
-    if bb > 0:
-        k = float(agg.stats.get("42", "0"))
-        agg.stats["56"] = f"{k / bb:.2f}"
-
-    # OBP (stat 4) — approximate: (H + BB + HBP) / (AB + BB + HBP + SF)
-    bb_bat = float(agg.stats.get("18", "0"))  # walks drawn (batting)
-    hbp = float(agg.stats.get("19", "0"))
-    sf = float(agg.stats.get("20", "0"))
-    denom = ab + bb_bat + hbp + sf
-    if denom > 0:
-        agg.stats["4"] = f"{(h + bb_bat + hbp) / denom:.3f}"
-
-    # SLG (stat 5) — would need total bases, approximate with raw if available
+    """Compute rate stats from weighted sums accumulated during aggregation."""
+    for stat_id, (_weight_stat, decimals) in _RATE_WEIGHTS.items():
+        wk = f"_rw_{stat_id}"
+        wtk = f"_rwt_{stat_id}"
+        weight = float(agg.stats.get(wtk, "0"))
+        if weight > 0:
+            val = float(agg.stats.get(wk, "0")) / weight
+            agg.stats[stat_id] = f"{val:.{decimals}f}"
 
 
 def _parse_ip(val: str) -> float:

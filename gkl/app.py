@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from datetime import date
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -88,6 +89,11 @@ _compute_roto = compute_roto  # alias for backward compatibility
 # --- Week Range Modal ---
 
 
+def _is_monday() -> bool:
+    """Monday = 0 in weekday(). On Mondays, default to completed weeks only."""
+    return date.today().weekday() == 0
+
+
 # --- League Standings Screen ---
 
 
@@ -96,7 +102,8 @@ class LeagueStandingsScreen(Screen):
     BINDINGS = [("escape", "go_back", "Back"), ("q", "go_back", "Back"),
                 ("1", "show_overall", "Overall"), ("2", "show_batting", "Batting"),
                 ("3", "show_pitching", "Pitching"),
-                ("w", "set_weeks", "Set Weeks")]
+                ("w", "set_weeks", "Set Weeks"),
+                ("i", "toggle_in_progress", "Incl. In-Progress")]
     CSS = """
     #ls-header {
         height: 1;
@@ -156,8 +163,11 @@ class LeagueStandingsScreen(Screen):
         self._roto_teams: list[TeamStats] = []
         self._current_view = "overall"
         self._week_start = 1
-        self._week_end = max(1, league.current_week)
         self._max_week = max(1, league.current_week)
+        self._last_completed_week = self._max_week  # updated in _load
+        self._week_end = self._max_week  # updated in _load to last completed
+        self._include_in_progress = False
+        self._num_scored_cats = len([c for c in categories if not c.is_only_display])
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -197,10 +207,53 @@ class LeagueStandingsScreen(Screen):
             for w, data in zip(missing_matchups, matchup_results):
                 cache.week_matchups[w] = data
 
-        # Compute actual H2H records from matchup results
-        num_scored_cats = len([c for c in self.categories if not c.is_only_display])
-        h2h_records: dict[str, dict] = {}
+        # Determine last fully completed week
+        self._last_completed_week = 0
         for w in all_weeks:
+            matchups = cache.week_matchups.get(w, [])
+            if matchups and all(m.status == "postevent" for m in matchups):
+                self._last_completed_week = w
+        self._last_completed_week = max(1, self._last_completed_week)
+
+        # Mon: show completed weeks only; Tue-Sun: include in-progress week
+        if _is_monday() or self._last_completed_week >= self._max_week:
+            self._week_end = self._last_completed_week
+            self._include_in_progress = False
+        else:
+            self._week_end = self._max_week
+            self._include_in_progress = True
+
+        # Remove loading indicator, show both panels
+        loading = self.query("#ls-loading")
+        if loading:
+            loading.first().remove()
+        self.query_one("#ls-top").display = True
+        self.query_one("#ls-bottom").display = True
+
+        await self._render_standings()
+
+    async def _render_standings(self) -> None:
+        """Recompute and render both H2H and roto tables for current week range."""
+        from gkl.stats import aggregate_weekly_stats
+
+        cache = self.app.shared_cache
+        needed = list(range(self._week_start, self._week_end + 1))
+        await cache.prefetch_weeks(self.api, self.league.league_key, needed)
+
+        # Ensure matchups are cached
+        missing_matchups = [w for w in needed if w not in cache.week_matchups]
+        if missing_matchups:
+            matchup_results = await asyncio.gather(*[
+                asyncio.to_thread(self.api.get_scoreboard,
+                                  self.league.league_key, w)
+                for w in missing_matchups
+            ])
+            for w, data in zip(missing_matchups, matchup_results):
+                cache.week_matchups[w] = data
+
+        # Compute H2H records from matchups in the selected range
+        h2h_records: dict[str, dict] = {}
+        for w in needed:
             matchups = cache.week_matchups.get(w, [])
             for m in matchups:
                 if m.status == "preevent":
@@ -212,7 +265,6 @@ class LeagueStandingsScreen(Screen):
                             "wins": 0, "losses": 0, "ties": 0,
                             "cat_wins": 0, "cat_losses": 0, "cat_ties": 0,
                         }
-                cat_ties = int(num_scored_cats - pa - pb)
                 # Weekly matchup winner
                 if pa > pb:
                     h2h_records[m.team_a.team_key]["wins"] += 1
@@ -223,37 +275,50 @@ class LeagueStandingsScreen(Screen):
                 else:
                     h2h_records[m.team_a.team_key]["ties"] += 1
                     h2h_records[m.team_b.team_key]["ties"] += 1
-                # Category-level totals
-                h2h_records[m.team_a.team_key]["cat_wins"] += int(pa)
-                h2h_records[m.team_a.team_key]["cat_losses"] += int(pb)
-                h2h_records[m.team_a.team_key]["cat_ties"] += cat_ties
-                h2h_records[m.team_b.team_key]["cat_wins"] += int(pb)
-                h2h_records[m.team_b.team_key]["cat_losses"] += int(pa)
-                h2h_records[m.team_b.team_key]["cat_ties"] += cat_ties
+                # Category-level totals (only from completed weeks to
+                # avoid phantom ties from in-progress weeks with partial
+                # or zero point data)
+                if m.status == "postevent":
+                    cat_ties = int(self._num_scored_cats - pa - pb)
+                    h2h_records[m.team_a.team_key]["cat_wins"] += int(pa)
+                    h2h_records[m.team_a.team_key]["cat_losses"] += int(pb)
+                    h2h_records[m.team_a.team_key]["cat_ties"] += cat_ties
+                    h2h_records[m.team_b.team_key]["cat_wins"] += int(pb)
+                    h2h_records[m.team_b.team_key]["cat_losses"] += int(pa)
+                    h2h_records[m.team_b.team_key]["cat_ties"] += cat_ties
+
+        # Compute roto stats for the selected week range
+        if self._week_start == 1 and self._week_end == self._max_week:
+            roto_teams = await asyncio.to_thread(
+                self.api.get_team_season_stats, self.league.league_key)
+        else:
+            weekly_data = [cache.week_team_stats[w] for w in needed]
+            roto_teams = aggregate_weekly_stats(weekly_data, self.categories)
+        self._roto_teams = roto_teams
 
         # Compute roto rank summaries for the H2H table
-        season_teams = await asyncio.to_thread(
-            self.api.get_team_season_stats, self.league.league_key)
-
         scored = [c for c in self.categories if not c.is_only_display]
         bat_scored = [c for c in scored if c.position_type == "B"]
         pitch_scored = [c for c in scored if c.position_type == "P"]
 
-        overall_roto = _compute_roto(season_teams, scored)
-        batting_roto = _compute_roto(season_teams, bat_scored)
-        pitching_roto = _compute_roto(season_teams, pitch_scored)
+        overall_roto = _compute_roto(roto_teams, scored)
+        batting_roto = _compute_roto(roto_teams, bat_scored)
+        pitching_roto = _compute_roto(roto_teams, pitch_scored)
 
         overall_rank = {e["team_key"]: r for r, e in enumerate(overall_roto, 1)}
         batting_rank = {e["team_key"]: r for r, e in enumerate(batting_roto, 1)}
         pitching_rank = {e["team_key"]: r for r, e in enumerate(pitching_roto, 1)}
 
         # Build combined data sorted by H2H standings
-        team_info = {t.team_key: t for t in season_teams}
+        team_info = {t.team_key: t for t in roto_teams}
         standings = []
         for team_key, rec in h2h_records.items():
             total = rec["wins"] + rec["losses"] + rec["ties"]
-            pct = rec["wins"] / total if total > 0 else 0.0
+            pct = (rec["wins"] + 0.5 * rec["ties"]) / total if total > 0 else 0.0
             team = team_info.get(team_key)
+            cat_total = rec["cat_wins"] + rec["cat_losses"] + rec["cat_ties"]
+            cat_pct = ((rec["cat_wins"] + 0.5 * rec["cat_ties"]) / cat_total
+                       if cat_total > 0 else 0.0)
             standings.append({
                 "team_key": team_key,
                 "name": team.name if team else team_key,
@@ -265,37 +330,40 @@ class LeagueStandingsScreen(Screen):
                 "cat_wins": rec["cat_wins"],
                 "cat_losses": rec["cat_losses"],
                 "cat_ties": rec["cat_ties"],
+                "cat_pct": cat_pct,
                 "overall_rank": overall_rank.get(team_key, 0),
                 "batting_rank": batting_rank.get(team_key, 0),
                 "pitching_rank": pitching_rank.get(team_key, 0),
             })
-        standings.sort(key=lambda s: (s["win_pct"], s["wins"]), reverse=True)
+        standings.sort(key=lambda s: (s["cat_pct"], s["cat_wins"]), reverse=True)
 
-        # Remove loading indicator, show both panels
-        loading = self.query("#ls-loading")
-        if loading:
-            loading.first().remove()
-        self.query_one("#ls-top").display = True
-        self.query_one("#ls-bottom").display = True
+        self._render_h2h_table(standings)
+        self._render_roto_table()
 
-        # Render H2H standings table
-        self.query_one("#ls-top-label", Static).update(" H2H Standings ")
+    def _render_h2h_table(self, standings: list[dict]) -> None:
+        week_label = f"Weeks {self._week_start}-{self._week_end}"
+        if self._include_in_progress:
+            week_label += " (incl. in-progress)"
+        self.query_one("#ls-top-label", Static).update(
+            f" H2H Standings — {week_label} "
+        )
         table = self.query_one("#ls-table", DataTable)
         table.clear(columns=True)
         table.cursor_type = "row"
         table.zebra_stripes = True
-        table.add_columns("#", "Team", "Manager", "H2H Record", "Win %",
-                          "Total Record", "Total Win %", "Roto Overall",
-                          "Roto Batting", "Roto Pitching")
+        table.add_columns("#", "Team", "Manager",
+                          "Official W-L-T", "Official Win %",
+                          "H2H Matchup Record", "Matchup Win %",
+                          "Roto Overall", "Roto Batting", "Roto Pitching")
 
         num_teams = len(standings)
         for rank, s in enumerate(standings, 1):
             pct = s["win_pct"]
             pct_style = "bold green" if pct >= 0.6 else "bold red" if pct < 0.4 else ""
 
-            cat_total = s["cat_wins"] + s["cat_losses"] + s["cat_ties"]
-            cat_pct = s["cat_wins"] / cat_total if cat_total > 0 else 0.0
-            cat_pct_style = "bold green" if cat_pct >= 0.6 else "bold red" if cat_pct < 0.4 else ""
+            cat_pct = s["cat_pct"]
+            cat_pct_style = ("bold green" if cat_pct >= 0.6
+                             else "bold red" if cat_pct < 0.4 else "")
 
             def _roto_style(r: int, n: int = num_teams) -> str:
                 if r <= 3:
@@ -308,11 +376,11 @@ class LeagueStandingsScreen(Screen):
                 Text(str(rank), justify="right"),
                 Text(s["name"], style="bold"),
                 Text(s["manager"], style="dim"),
-                Text(f"{s['wins']}-{s['losses']}-{s['ties']}", justify="center"),
-                Text(f"{pct:.1%}", style=pct_style, justify="right"),
                 Text(f"{s['cat_wins']}-{s['cat_losses']}-{s['cat_ties']}",
                      justify="center"),
                 Text(f"{cat_pct:.1%}", style=cat_pct_style, justify="right"),
+                Text(f"{s['wins']}-{s['losses']}-{s['ties']}", justify="center"),
+                Text(f"{pct:.1%}", style=pct_style, justify="right"),
                 Text(str(s["overall_rank"]), style=_roto_style(s["overall_rank"]),
                      justify="center"),
                 Text(str(s["batting_rank"]), style=_roto_style(s["batting_rank"]),
@@ -320,27 +388,6 @@ class LeagueStandingsScreen(Screen):
                 Text(str(s["pitching_rank"]), style=_roto_style(s["pitching_rank"]),
                      justify="center"),
             )
-
-        # Initial roto table load (full season)
-        self._roto_teams = season_teams
-        self._render_roto_table()
-
-    async def _fetch_roto(self) -> None:
-        """Fetch roto stats for the selected week range and re-render."""
-        from gkl.stats import aggregate_weekly_stats
-
-        cache = self.app.shared_cache
-        needed = list(range(self._week_start, self._week_end + 1))
-        await cache.prefetch_weeks(self.api, self.league.league_key, needed)
-
-        if self._week_start == 1 and self._week_end == self._max_week:
-            self._roto_teams = await asyncio.to_thread(
-                self.api.get_team_season_stats, self.league.league_key)
-        else:
-            weekly_data = [cache.week_team_stats[w] for w in needed]
-            self._roto_teams = aggregate_weekly_stats(weekly_data, self.categories)
-
-        self._render_roto_table()
 
     def _render_roto_table(self) -> None:
         scored = [c for c in self.categories if not c.is_only_display]
@@ -410,7 +457,19 @@ class LeagueStandingsScreen(Screen):
         if result is None:
             return
         self._week_start, self._week_end = result
-        self.run_worker(self._fetch_roto, group="roto-fetch", exclusive=True)
+        # Track whether the user explicitly included the in-progress week
+        self._include_in_progress = self._week_end > self._last_completed_week
+        self.run_worker(self._render_standings, group="standings-fetch", exclusive=True)
+
+    def action_toggle_in_progress(self) -> None:
+        if self._last_completed_week >= self._max_week:
+            return  # No in-progress week exists
+        self._include_in_progress = not self._include_in_progress
+        if self._include_in_progress:
+            self._week_end = self._max_week
+        else:
+            self._week_end = min(self._week_end, self._last_completed_week)
+        self.run_worker(self._render_standings, group="standings-fetch", exclusive=True)
 
     def action_go_back(self) -> None:
         self.app.pop_screen()
@@ -489,9 +548,13 @@ class H2HSimulatorScreen(Screen):
         self.api = api
         self.league = league
         self.categories = categories
-        self._week = league.current_week
         self._max_week = league.current_week
-        self._season_mode = False
+        # Mon: default to last completed week; Tue-Sun: current (in-progress)
+        if _is_monday() and league.current_week > 1:
+            self._week = league.current_week - 1
+        else:
+            self._week = league.current_week
+        self._season_mode = "off"  # "off" | "completed" | "all"
         self._team_keys: list[str] = []
         self._team_idx = 0
 
@@ -570,7 +633,7 @@ class H2HSimulatorScreen(Screen):
         if not selected_team:
             return
 
-        if self._season_mode:
+        if self._season_mode != "off":
             await self._render_season(teams, selected_key, selected_team)
         else:
             await self._render_week(teams, selected_key, selected_team)
@@ -579,6 +642,11 @@ class H2HSimulatorScreen(Screen):
     def _week_is_preevent(matchups: list[Matchup]) -> bool:
         """Check if all matchups for a week are preevent (no games started)."""
         return bool(matchups) and all(m.status == "preevent" for m in matchups)
+
+    @staticmethod
+    def _week_is_completed(matchups: list[Matchup]) -> bool:
+        """Check if all matchups for a week are postevent (fully completed)."""
+        return bool(matchups) and all(m.status == "postevent" for m in matchups)
 
     async def _render_week(self, teams: list[TeamStats], selected_key: str,
                            selected_team: TeamStats) -> None:
@@ -639,11 +707,14 @@ class H2HSimulatorScreen(Screen):
 
     async def _render_season(self, teams: list[TeamStats], selected_key: str,
                              selected_team: TeamStats) -> None:
+        completed_only = self._season_mode == "completed"
+        mode_label = "Completed Weeks" if completed_only else "All Weeks"
+        next_label = "All Weeks" if completed_only else "Week View"
         ctrl = Text()
-        ctrl.append(f"SEASON", style="bold")
+        ctrl.append(f"SEASON — {mode_label}", style="bold")
         ctrl.append(f"  (←→ week)  |  ", style="dim")
         ctrl.append(f"Manager: {selected_team.name}", style=f"bold {TEAM_A_COLOR}")
-        ctrl.append(f"  (Enter on rankings to select)  |  [a] Week View", style="dim")
+        ctrl.append(f"  (Enter on rankings to select)  |  [a] {next_label}", style="dim")
         self.query_one("#h2h-controls", Static).update(ctrl)
         self.query_one("#h2h-actual", Static).update("")
 
@@ -662,12 +733,14 @@ class H2HSimulatorScreen(Screen):
             for w, data in zip(missing_matchups, matchup_results):
                 cache.week_matchups[w] = data
 
-        # Aggregate across all weeks (skip preevent weeks)
+        # Aggregate across weeks (skip preevent; optionally skip in-progress)
         all_rankings: list[list[TeamH2HSummary]] = []
         all_h2h: dict[str, dict[str, H2HResult]] = {}
         for w in all_weeks:
             w_matchups = cache.week_matchups[w]
             if self._week_is_preevent(w_matchups):
+                continue
+            if completed_only and not self._week_is_completed(w_matchups):
                 continue
             w_teams = cache.week_team_stats[w]
             h2h = simulate_h2h(w_teams, self.categories)
@@ -690,10 +763,10 @@ class H2HSimulatorScreen(Screen):
         season_rankings = aggregate_h2h_season(all_rankings)
 
         self.query_one("#h2h-top-label", Static).update(
-            f" Season H2H — {selected_team.name} — Matchup W/L vs Each Opponent "
+            f" Season H2H — {selected_team.name} — Matchup W/L vs Each Opponent ({mode_label}) "
         )
         self.query_one("#h2h-bottom-label", Static).update(
-            " Season Power Rankings — All Weeks Combined "
+            f" Season Power Rankings — {mode_label} Combined "
         )
 
         loading = self.query("#h2h-loading")
@@ -855,15 +928,15 @@ class H2HSimulatorScreen(Screen):
             )
 
     def action_prev_week(self) -> None:
-        if self._season_mode:
-            self._season_mode = False
+        if self._season_mode != "off":
+            self._season_mode = "off"
         if self._week > 1:
             self._week -= 1
             self.run_worker(self._render_all, group="h2h-load", exclusive=True)
 
     def action_next_week(self) -> None:
-        if self._season_mode:
-            self._season_mode = False
+        if self._season_mode != "off":
+            self._season_mode = "off"
         if self._week < self._max_week:
             self._week += 1
             self.run_worker(self._render_all, group="h2h-load", exclusive=True)
@@ -887,7 +960,13 @@ class H2HSimulatorScreen(Screen):
                     self.run_worker(self._render_all, group="h2h-load", exclusive=True)
 
     def action_toggle_season(self) -> None:
-        self._season_mode = not self._season_mode
+        if self._season_mode == "off":
+            # Mon: default to completed only; Tue-Sun: show all weeks
+            self._season_mode = "completed" if _is_monday() else "all"
+        elif self._season_mode == "completed":
+            self._season_mode = "all"
+        else:
+            self._season_mode = "off"
         self.run_worker(self._render_all, group="h2h-load", exclusive=True)
 
     def action_go_back(self) -> None:
