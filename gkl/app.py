@@ -5130,9 +5130,9 @@ class MLBScoreboardScreen(Screen):
             self.notify("No games available", severity="information")
 
     def _show_mlbtv_picker(self, games: list[MLBGame]) -> None:
-        def on_game_selected(game_pk: str | None) -> None:
-            if game_pk:
-                webbrowser.open("https://www.mlb.com/tv/g" + game_pk)
+        def on_game_selected(gamePk: str) -> None:
+            if gamePk != "":
+                webbrowser.open("https://www.mlb.com/tv/g" + gamePk)
 
         self.app.push_screen(
             MlbtvSelectScreen(games), callback=on_game_selected
@@ -5187,7 +5187,6 @@ class MlbtvSelectScreen(Screen):
     def __init__(self, games: list[MLBGame]) -> None:
         super().__init__()
         self.games = games
-        self._game_pks: list[str] = []
 
     def compose(self) -> ComposeResult:
         with Vertical(id="mlbtv-select-container"):
@@ -5208,17 +5207,18 @@ class MlbtvSelectScreen(Screen):
                 label.append(" Final", style="dim")
             else:
                 label.append(" " + game.inning_half + " " + game.inning_ordinal, style="bold")
-            lv.mount(ListItem(Label(label)))
-            self._game_pks.append(game.game_pk)
+            item = ListItem(Label(label))
+            item._gamePk = game.gamePk
+            lv.mount(item)
         lv.index = 0
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        idx = self.query_one("#mlbtv-select-list", ListView).index
-        if idx is not None and 0 <= idx < len(self._game_pks):
-            self.dismiss(self._game_pks[idx])
+        gamePk = getattr(event.item, "_gamePk", None)
+        if gamePk:
+            self.dismiss(gamePk)
 
     def action_quit(self) -> None:
-        self.dismiss(None)
+        self.dismiss("")
 
 # --- Ask Skipper (AI Chat) ---
 
