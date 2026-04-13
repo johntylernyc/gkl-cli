@@ -6,6 +6,8 @@ import asyncio
 import os
 import sys
 
+import webbrowser
+
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -4870,7 +4872,8 @@ class MLBScoreboardScreen(Screen):
                 ("r", "refresh", "Refresh"),
                 ("comma", "prev_day", "< Prev Day"),
                 ("full_stop", "next_day", "> Next Day"),
-                ("t", "today", "Today")]
+                ("t", "today", "Today"),
+                ("m", "mlbtv", "MLB.TV")]
     CSS = """
     #mlb-header {
         height: 1;
@@ -4963,6 +4966,7 @@ class MLBScoreboardScreen(Screen):
 
     async def _load(self) -> None:
         games = get_mlb_scoreboard(self._date)
+        self._games = games
 
         loading = self.query("#mlb-loading")
         if loading:
@@ -5080,6 +5084,103 @@ class MLBScoreboardScreen(Screen):
     def action_go_back(self) -> None:
         self.app.pop_screen()
 
+    def action_mlbtv(self) -> None:
+        games = getattr(self, "_games", [])
+        if len(games) > 0:
+           self._show_mlbtv_picker(games)
+        else:
+           self.notify("No games available", severity="information")
+
+    def _show_mlbtv_picker(
+        self, games: list[MLBGame]) -> None:
+        def on_game_selected(gamePk: str) -> None:
+            if gamePk != "":
+               webbrowser.open("https://www.mlb.com/tv/g" + gamePk)
+
+        self.app.push_screen(
+            MlbtvSelectScreen(games), callback=on_game_selected
+        )
+
+# --- MLB.TV Selection Screen ---
+
+
+class MlbtvSelectScreen(Screen):
+    """Full-screen league picker shown when user has multiple leagues."""
+    BINDINGS = [("escape", "quit", "Quit"), ("q", "quit", "Quit")]
+    CSS = """
+    MlbtvSelectScreen {
+        align: center middle;
+    }
+    #mlbtv-select-container {
+        width: 60;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #mlbtv-select-title {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #mlbtv-controls {
+        height: 1;
+        content-align: center middle;
+        background: $surface;
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #mlbtv-select-list {
+        height: 15;
+        max-height: 85%
+    }
+    #mlbtv-select-list > ListItem {
+        height: 1;
+        padding: 0 1;
+    }
+    #mlbtv-select-list > ListItem.--highlight {
+        background: #3A5A3A;
+    }
+    """
+
+    def __init__(self, games: list[MLBGame]) -> None:
+        super().__init__()
+        self.games = games
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="mlbtv-select-container"):
+            yield Static("Select game to view MLB.TV Stream", id="mlbtv-select-title")
+            yield Static("\\[esc] or \\[q] to go back", id="mlbtv-controls")
+            yield ListView(id="mlbtv-select-list")
+
+    def on_mount(self) -> None:
+        gv = self.query_one("#mlbtv-select-list", ListView)
+        for i, game in enumerate(self.games):
+            label = Text()
+            label.append(f"{game.away_team} {game.away_score}", style="bold")
+            label.append(" @ ", style = "dim")
+            label.append(f"{game.home_team} {game.home_score}", style="bold")
+            if game.status == "Preview":
+               label.append(" " + game.detail_status, style="dim")
+            elif game.status == "Final":
+               label.append(" Final", style="dim")
+            else:
+               label.append(" " + game.inning_half + " " + game.inning_ordinal, style="bold")
+            item = ListItem(Label(label))
+            item._gamePk = game.gamePk
+            gv.mount(item)
+        gv.index = 0
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        gamePk = getattr(event.item, "_gamePk", None)
+        if gamePk:
+            self.dismiss(gamePk)
+
+    def action_quit(self) -> None:
+        self.dismiss("")
 
 # --- League Selection Screen ---
 

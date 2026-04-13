@@ -12,6 +12,7 @@ MLB_API_BASE = "https://statsapi.mlb.com/api/v1"
 
 @dataclass
 class MLBGame:
+    gamePk: str
     away_team: str
     away_abbr: str
     away_score: int
@@ -379,6 +380,7 @@ def _parse_game(g: dict) -> MLBGame:
     )
 
     return MLBGame(
+        gamePk=str(g.get("gamePk", "")),
         away_team=away_team_info.get("teamName", away_team_info.get("name", "?")),
         away_abbr=away_team_info.get("abbreviation", "???"),
         away_score=away.get("score", 0),
