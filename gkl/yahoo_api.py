@@ -94,18 +94,50 @@ class YahooFantasyAPI:
         self.auth = auth
         self._stat_categories: dict[str, list[StatCategory]] = {}
 
-    def _get(self, path: str, retries: int = 2) -> dict:
+    def _get(self, path: str, retries: int = 2, cache_ttl: float = 0) -> dict:
+        """Make an authenticated GET request to the Yahoo Fantasy API.
+
+        If cache_ttl > 0 and running in web mode, responses are cached in
+        the shared SQLite response cache to deduplicate requests across users.
+        """
+        url = f"{BASE_URL}/{path}"
+
+        # Check shared cache (web mode only)
+        if cache_ttl > 0:
+            try:
+                from gkl.web.api_cache import get_cache
+                cache = get_cache()
+                if cache is not None:
+                    cached = cache.get(url)
+                    if cached is not None:
+                        return json.loads(cached)["fantasy_content"]
+            except ImportError:
+                pass
+
         token = self.auth.get_token()
         for attempt in range(retries + 1):
             try:
                 resp = httpx.get(
-                    f"{BASE_URL}/{path}",
+                    url,
                     headers=token.auth_header(),
                     params={"format": "json"},
                     timeout=30.0,
                 )
                 resp.raise_for_status()
-                return resp.json()["fantasy_content"]
+                result = resp.json()
+
+                # Store in shared cache
+                if cache_ttl > 0:
+                    try:
+                        from gkl.web.api_cache import get_cache
+                        cache = get_cache()
+                        if cache is not None:
+                            cache.put(url, None, json.dumps(result),
+                                      api_name="yahoo", ttl=cache_ttl)
+                    except ImportError:
+                        pass
+
+                return result["fantasy_content"]
             except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError):
                 if attempt == retries:
                     raise
@@ -115,7 +147,7 @@ class YahooFantasyAPI:
 
     def get_current_mlb_game_key(self) -> str:
         """Get the game key for the current MLB season."""
-        data = self._get("game/mlb")
+        data = self._get("game/mlb", cache_ttl=3600)
         game = data["game"][0]
         return game["game_key"]
 
@@ -152,7 +184,7 @@ class YahooFantasyAPI:
         if league_key in self._stat_categories:
             return self._stat_categories[league_key]
 
-        data = self._get(f"league/{league_key}/settings")
+        data = self._get(f"league/{league_key}/settings", cache_ttl=3600)
         categories: list[StatCategory] = []
         try:
             settings = data["league"][1]["settings"][0]
@@ -327,7 +359,7 @@ class YahooFantasyAPI:
 
         week_dates: dict[int, tuple[str, str]] = {}
         try:
-            data = self._get(f"league/{league_key}/settings")
+            data = self._get(f"league/{league_key}/settings", cache_ttl=3600)
             settings = data["league"][1]["settings"]
             for item in settings:
                 if isinstance(item, dict) and "roster_positions" in item:
@@ -505,7 +537,7 @@ class YahooFantasyAPI:
 
         results: dict[str, str] = {}
         try:
-            data = self._get(f"league/{league_key}/draftresults")
+            data = self._get(f"league/{league_key}/draftresults", cache_ttl=3600)
             draft_data = data["league"][1]["draft_results"]
             count = int(draft_data.get("count", 0))
             for i in range(count):
@@ -523,7 +555,8 @@ class YahooFantasyAPI:
         """Get league transactions (adds, drops, trades)."""
         data = self._get(
             f"league/{league_key}/transactions"
-            f";count={count}"
+            f";count={count}",
+            cache_ttl=300,
         )
         # Debug dump to discover Yahoo's transaction format
         try:
@@ -621,7 +654,7 @@ class YahooFantasyAPI:
 
     def _get_all_team_stats(self, path: str) -> list[TeamStats]:
         """Fetch and parse all team stats from a given endpoint."""
-        data = self._get(path)
+        data = self._get(path, cache_ttl=300)
         teams: list[TeamStats] = []
         try:
             teams_data = data["league"][1]["teams"]
@@ -638,7 +671,7 @@ class YahooFantasyAPI:
         path = f"league/{league_key}/scoreboard"
         if week is not None:
             path = f"league/{league_key}/scoreboard;week={week}"
-        data = self._get(path)
+        data = self._get(path, cache_ttl=300)
 
         matchups: list[Matchup] = []
         try:

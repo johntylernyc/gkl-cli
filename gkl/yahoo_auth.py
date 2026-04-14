@@ -6,12 +6,17 @@ Implements the Authorization Code flow with out-of-band (OOB) redirect:
 3. User pastes the code back into the terminal
 4. Exchanges the auth code for access + refresh tokens
 5. Persists tokens to disk and refreshes automatically
+
+Supports two modes controlled by the GKL_MODE environment variable:
+- "local" (default): flat-file credentials, paste-a-code flow
+- "web": env-var credentials, server-side redirect flow
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import os
 import webbrowser
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,18 +27,34 @@ import httpx
 
 AUTH_URL = "https://api.login.yahoo.com/oauth2/request_auth"
 TOKEN_URL = "https://api.login.yahoo.com/oauth2/get_token"
-REDIRECT_URI = "https://localhost:8080"
+DEFAULT_REDIRECT_URI = "https://localhost:8080"
 DEFAULT_TOKEN_PATH = Path.home() / ".config" / "gkl" / "token.json"
 DEFAULT_CREDENTIALS_PATH = Path.home() / ".config" / "gkl" / "credentials.json"
+
+
+def is_web_mode() -> bool:
+    """Check if running in web (server) mode."""
+    return os.environ.get("GKL_MODE", "local").lower() == "web"
+
+
+def get_redirect_uri() -> str:
+    """Get the OAuth redirect URI for the current mode."""
+    return os.environ.get("GKL_YAHOO_REDIRECT_URI", DEFAULT_REDIRECT_URI)
 
 
 def load_credentials(
     path: Path = DEFAULT_CREDENTIALS_PATH,
 ) -> tuple[str, str] | None:
-    """Load client_id and client_secret from a JSON file.
+    """Load client_id and client_secret from env vars or a JSON file.
 
     Returns a (client_id, client_secret) tuple, or None if unavailable.
     """
+    # Environment variables take precedence
+    env_id = os.environ.get("GKL_YAHOO_CLIENT_ID")
+    env_secret = os.environ.get("GKL_YAHOO_CLIENT_SECRET")
+    if env_id and env_secret:
+        return env_id, env_secret
+
     if not path.exists():
         return None
     try:
@@ -107,7 +128,25 @@ class YahooAuth:
         return f"Basic {creds}"
 
     def load_token(self) -> bool:
-        """Load persisted token from disk. Returns True if a valid token was loaded."""
+        """Load persisted token from env vars or disk.
+
+        Returns True if a valid token was loaded.
+        """
+        # In web mode, tokens come from environment variables
+        env_access = os.environ.get("GKL_YAHOO_ACCESS_TOKEN")
+        env_refresh = os.environ.get("GKL_YAHOO_REFRESH_TOKEN")
+        env_expires = os.environ.get("GKL_YAHOO_TOKEN_EXPIRES_AT")
+        if env_access and env_refresh and env_expires:
+            try:
+                self.token = TokenData(
+                    access_token=env_access,
+                    refresh_token=env_refresh,
+                    expires_at=float(env_expires),
+                )
+                return True
+            except (ValueError, TypeError):
+                pass
+
         if not self.token_path.exists():
             return False
         try:
@@ -118,23 +157,36 @@ class YahooAuth:
             return False
 
     def save_token(self) -> None:
-        """Persist current token to disk."""
+        """Persist current token to disk. No-op in web mode."""
         if self.token is None:
             return
+        if is_web_mode():
+            return  # tokens managed server-side in web mode
         self.token_path.parent.mkdir(parents=True, exist_ok=True)
         self.token_path.write_text(json.dumps(self.token.to_dict(), indent=2))
+
+    def get_auth_url(self) -> str:
+        """Build the Yahoo OAuth authorization URL."""
+        params = {
+            "client_id": self.client_id,
+            "redirect_uri": get_redirect_uri(),
+            "response_type": "code",
+        }
+        return f"{AUTH_URL}?{urlencode(params)}"
 
     def authorize(self) -> TokenData:
         """Run the full OAuth2 authorization code flow with OOB redirect.
 
         Opens the user's browser, then prompts them to paste the auth code.
+        Not used in web mode — the server handles the redirect flow instead.
         """
-        params = {
-            "client_id": self.client_id,
-            "redirect_uri": REDIRECT_URI,
-            "response_type": "code",
-        }
-        auth_url = f"{AUTH_URL}?{urlencode(params)}"
+        if is_web_mode():
+            raise RuntimeError(
+                "Interactive authorize() not supported in web mode. "
+                "Use the server-side OAuth callback instead."
+            )
+
+        auth_url = self.get_auth_url()
 
         print("\n=== Yahoo Fantasy Authorization ===")
         print(f"Opening browser to:\n  {auth_url}\n")
@@ -145,11 +197,11 @@ class YahooAuth:
         if not code:
             raise RuntimeError("No authorization code provided")
 
-        self.token = self._exchange_code(code)
+        self.token = self.exchange_code(code)
         self.save_token()
         return self.token
 
-    def _exchange_code(self, code: str) -> TokenData:
+    def exchange_code(self, code: str) -> TokenData:
         """Exchange an authorization code for tokens."""
         resp = httpx.post(
             TOKEN_URL,
@@ -160,7 +212,7 @@ class YahooAuth:
             data={
                 "grant_type": "authorization_code",
                 "code": code,
-                "redirect_uri": REDIRECT_URI,
+                "redirect_uri": get_redirect_uri(),
             },
         )
         resp.raise_for_status()

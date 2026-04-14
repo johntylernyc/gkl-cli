@@ -37,7 +37,7 @@ from gkl.yahoo_api import (
     YahooFantasyAPI,
 )
 from gkl.datastore import RosterDataStore
-from gkl.yahoo_auth import YahooAuth, load_credentials, save_credentials
+from gkl.yahoo_auth import YahooAuth, load_credentials, save_credentials, is_web_mode
 from gkl.stats import (
     who_wins, simulate_h2h, compute_power_rankings, aggregate_h2h_season,
     H2HResult, TeamH2HSummary, SGPCalculator,
@@ -6994,7 +6994,8 @@ class GklApp(App):
         self.register_theme(BASEBALL_THEME)
         self.theme = "baseball"
         self.run_worker(self._init_league_selection)
-        self.run_worker(self._check_for_updates)
+        if not is_web_mode():
+            self.run_worker(self._check_for_updates)
 
     async def _check_for_updates(self) -> None:
         cleanup_old_binary()
@@ -7045,6 +7046,14 @@ def main() -> None:
     if saved:
         client_id, client_secret = saved
     else:
+        if is_web_mode():
+            print(
+                "GKL_YAHOO_CLIENT_ID and GKL_YAHOO_CLIENT_SECRET must be set "
+                "in web mode.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         client_id = os.environ.get("YAHOO_CLIENT_ID")
         client_secret = os.environ.get("YAHOO_CLIENT_SECRET")
 

@@ -7,6 +7,7 @@ The player explorer queries this cache instead of making thousands of live API c
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -15,6 +16,14 @@ from gkl.yahoo_api import League, YahooFantasyAPI
 
 DB_DIR = Path.home() / ".cache" / "gkl"
 DB_PATH = DB_DIR / "roster_cache.db"
+
+
+def get_db_path() -> Path:
+    """Get the database path, respecting GKL_DB_PATH env var."""
+    env_path = os.environ.get("GKL_DB_PATH")
+    if env_path:
+        return Path(env_path)
+    return DB_PATH
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS roster_snapshots (
@@ -41,30 +50,40 @@ CREATE TABLE IF NOT EXISTS sync_status (
 );
 
 CREATE TABLE IF NOT EXISTS watchlist (
+    user_id TEXT NOT NULL DEFAULT 'local',
     league_key TEXT NOT NULL,
     player_key TEXT NOT NULL,
     player_name TEXT NOT NULL,
     player_position TEXT NOT NULL,
     team_abbr TEXT NOT NULL DEFAULT '',
     added_at TEXT NOT NULL,
-    PRIMARY KEY (league_key, player_key)
+    PRIMARY KEY (user_id, league_key, player_key)
 );
 
 CREATE TABLE IF NOT EXISTS user_prefs (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
+    user_id TEXT NOT NULL DEFAULT 'local',
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (user_id, key)
 );
 """
+
+
+def _get_user_id() -> str:
+    """Get the current user ID. 'local' for local mode, Yahoo GUID for web."""
+    return os.environ.get("GKL_USER_ID", "local")
 
 
 class RosterDataStore:
     """SQLite-backed cache for roster snapshot data."""
 
-    def __init__(self, db_path: Path = DB_PATH) -> None:
-        self.db_path = db_path
+    def __init__(self, db_path: Path | None = None, user_id: str | None = None) -> None:
+        self.db_path = db_path or get_db_path()
+        self.user_id = user_id or _get_user_id()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
         self._migrate_if_needed()
         self._conn.executescript(_SCHEMA)
 
@@ -72,8 +91,9 @@ class RosterDataStore:
         self._conn.close()
 
     def _migrate_if_needed(self) -> None:
-        """Drop old weekly-only tables if they lack the date column."""
+        """Run schema migrations for backward compatibility."""
         try:
+            # Migration 1: Drop old weekly-only tables if they lack the date column
             cols = self._conn.execute(
                 "PRAGMA table_info(roster_snapshots)"
             ).fetchall()
@@ -81,6 +101,16 @@ class RosterDataStore:
                 self._conn.executescript(
                     "DROP TABLE IF EXISTS roster_snapshots;"
                     "DROP TABLE IF EXISTS sync_status;"
+                )
+
+            # Migration 2: Add user_id to watchlist if missing
+            wl_cols = self._conn.execute(
+                "PRAGMA table_info(watchlist)"
+            ).fetchall()
+            if wl_cols and not any(c["name"] == "user_id" for c in wl_cols):
+                self._conn.executescript(
+                    "DROP TABLE IF EXISTS watchlist;"
+                    "DROP TABLE IF EXISTS user_prefs;"
                 )
         except Exception:
             pass
@@ -393,41 +423,41 @@ class RosterDataStore:
         from datetime import datetime
         self._conn.execute(
             """INSERT OR IGNORE INTO watchlist
-               (league_key, player_key, player_name, player_position,
+               (user_id, league_key, player_key, player_name, player_position,
                 team_abbr, added_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (league_key, player_key, player_name, player_position,
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (self.user_id, league_key, player_key, player_name, player_position,
              team_abbr, datetime.now().isoformat()),
         )
         self._conn.commit()
 
     def remove_from_watchlist(self, league_key: str, player_key: str) -> None:
         self._conn.execute(
-            "DELETE FROM watchlist WHERE league_key = ? AND player_key = ?",
-            (league_key, player_key),
+            "DELETE FROM watchlist WHERE user_id = ? AND league_key = ? AND player_key = ?",
+            (self.user_id, league_key, player_key),
         )
         self._conn.commit()
 
     def get_watchlist(self, league_key: str) -> list[dict]:
         rows = self._conn.execute(
             """SELECT player_key, player_name, player_position, team_abbr, added_at
-               FROM watchlist WHERE league_key = ?
+               FROM watchlist WHERE user_id = ? AND league_key = ?
                ORDER BY added_at DESC""",
-            (league_key,),
+            (self.user_id, league_key,),
         ).fetchall()
         return [dict(row) for row in rows]
 
     def is_on_watchlist(self, league_key: str, player_key: str) -> bool:
         row = self._conn.execute(
-            "SELECT 1 FROM watchlist WHERE league_key = ? AND player_key = ?",
-            (league_key, player_key),
+            "SELECT 1 FROM watchlist WHERE user_id = ? AND league_key = ? AND player_key = ?",
+            (self.user_id, league_key, player_key),
         ).fetchone()
         return row is not None
 
     def clear_watchlist(self, league_key: str) -> None:
         self._conn.execute(
-            "DELETE FROM watchlist WHERE league_key = ?",
-            (league_key,),
+            "DELETE FROM watchlist WHERE user_id = ? AND league_key = ?",
+            (self.user_id, league_key,),
         )
         self._conn.commit()
 
@@ -435,14 +465,15 @@ class RosterDataStore:
 
     def get_pref(self, key: str) -> str | None:
         row = self._conn.execute(
-            "SELECT value FROM user_prefs WHERE key = ?", (key,)
+            "SELECT value FROM user_prefs WHERE user_id = ? AND key = ?",
+            (self.user_id, key),
         ).fetchone()
         return row["value"] if row else None
 
     def set_pref(self, key: str, value: str) -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO user_prefs (key, value) VALUES (?, ?)",
-            (key, value),
+            "INSERT OR REPLACE INTO user_prefs (user_id, key, value) VALUES (?, ?, ?)",
+            (self.user_id, key, value),
         )
         self._conn.commit()
 

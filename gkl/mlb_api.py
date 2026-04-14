@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -140,9 +142,32 @@ def get_mlb_scoreboard(game_date: date | None = None) -> list[MLBGame]:
     if game_date:
         params["date"] = game_date.isoformat()
 
-    resp = httpx.get(f"{MLB_API_BASE}/schedule", params=params)
-    resp.raise_for_status()
-    data = resp.json()
+    url = f"{MLB_API_BASE}/schedule"
+
+    # Check shared cache in web mode (30s TTL for live scores)
+    data = None
+    try:
+        from gkl.web.api_cache import get_cache
+        cache = get_cache()
+        if cache is not None:
+            cached = cache.get(url, params)
+            if cached is not None:
+                data = json.loads(cached)
+    except ImportError:
+        pass
+
+    if data is None:
+        resp = httpx.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+        try:
+            from gkl.web.api_cache import get_cache
+            cache = get_cache()
+            if cache is not None:
+                cache.put(url, params, json.dumps(data), api_name="mlb", ttl=30)
+        except ImportError:
+            pass
 
     games: list[MLBGame] = []
     for date_entry in data.get("dates", []):

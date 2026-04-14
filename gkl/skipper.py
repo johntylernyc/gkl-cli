@@ -24,7 +24,12 @@ ANTHROPIC_KEY_PATH = Path.home() / ".config" / "gkl" / "anthropic.json"
 
 
 def load_anthropic_key() -> str | None:
-    """Load the Anthropic API key from disk or environment."""
+    """Load the Anthropic API key from env var or disk."""
+    # GKL_ANTHROPIC_KEY is used in web mode (injected per-user by server)
+    env_key = os.environ.get("GKL_ANTHROPIC_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    if env_key:
+        return env_key
+
     if ANTHROPIC_KEY_PATH.exists():
         try:
             data = json.loads(ANTHROPIC_KEY_PATH.read_text())
@@ -33,11 +38,13 @@ def load_anthropic_key() -> str | None:
                 return key
         except (json.JSONDecodeError, KeyError):
             pass
-    return os.environ.get("ANTHROPIC_API_KEY")
+    return None
 
 
 def save_anthropic_key(key: str) -> None:
-    """Persist the Anthropic API key to disk."""
+    """Persist the Anthropic API key to disk. No-op in web mode."""
+    if os.environ.get("GKL_MODE", "local").lower() == "web":
+        return  # managed server-side in web mode
     ANTHROPIC_KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
     ANTHROPIC_KEY_PATH.write_text(json.dumps({"api_key": key}))
 

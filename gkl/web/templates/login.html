@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>GKL Baseball</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #1a1b26;
+            color: #c0caf5;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .container {
+            text-align: center;
+            max-width: 400px;
+            padding: 2rem;
+        }
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+            color: #7aa2f7;
+        }
+        .subtitle {
+            color: #565f89;
+            margin-bottom: 2rem;
+            font-size: 1.1rem;
+        }
+        .login-btn {
+            display: inline-block;
+            background: #6441a5;
+            color: #fff;
+            padding: 0.85rem 2rem;
+            border-radius: 8px;
+            text-decoration: none;
+            font-size: 1.1rem;
+            font-weight: 500;
+            transition: background 0.2s;
+        }
+        .login-btn:hover {
+            background: #7c5cbf;
+        }
+        .note {
+            margin-top: 2rem;
+            color: #565f89;
+            font-size: 0.85rem;
+            line-height: 1.5;
+        }
+        .error {
+            background: #3b1e3a;
+            color: #f7768e;
+            padding: 0.75rem 1rem;
+            border-radius: 6px;
+            margin-bottom: 1.5rem;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>GKL Baseball</h1>
+        <p class="subtitle">Fantasy Baseball Command Center</p>
+
+        <a href="/auth/yahoo" class="login-btn">Login with Yahoo</a>
+
+        <p class="note">
+            Sign in with your Yahoo account to connect your fantasy league.
+            <br>Your credentials are encrypted and stored securely.
+        </p>
+    </div>
+</body>
+</html>
