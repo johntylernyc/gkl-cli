@@ -16,30 +16,9 @@
             color: #c0caf5;
             font-family: "Roboto Mono", monospace;
         }
-        .topbar {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 32px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 0 1rem;
-            background: #16161e;
-            border-bottom: 1px solid #2a2b3d;
-            font-size: 0.85rem;
-            z-index: 10;
-        }
-        .topbar-left { color: #7aa2f7; font-weight: 500; }
-        .topbar-right { display: flex; gap: 1rem; align-items: center; }
-        .topbar a { color: #565f89; text-decoration: none; }
-        .topbar a:hover { color: #c0caf5; }
-        .user-name { color: #9ece6a; }
-
         .textual-terminal {
             position: fixed;
-            top: 32px;
+            top: 0;
             left: 0;
             right: 0;
             bottom: 0;
@@ -47,7 +26,7 @@
         }
         .intro-dialog {
             position: fixed;
-            top: 32px;
+            top: 0;
             left: 0;
             right: 0;
             bottom: 0;
@@ -79,14 +58,6 @@
     </style>
 </head>
 <body>
-    <div class="topbar">
-        <div class="topbar-left">GKL Baseball</div>
-        <div class="topbar-right">
-            <span class="user-name">{{ user_name }}</span>
-            <a href="/logout">Logout</a>
-        </div>
-    </div>
-
     <div class="intro-dialog">Connecting...</div>
 
     <div
