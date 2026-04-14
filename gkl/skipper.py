@@ -23,12 +23,32 @@ from gkl.mlb_api import (
 ANTHROPIC_KEY_PATH = Path.home() / ".config" / "gkl" / "anthropic.json"
 
 
+def _web_key_path() -> Path | None:
+    """Get the per-user Anthropic key path in web mode."""
+    user_id = os.environ.get("GKL_USER_ID")
+    db_dir = os.environ.get("GKL_DB_PATH")
+    if not user_id or not db_dir:
+        return None
+    return Path(db_dir).parent / "anthropic_keys" / f"{user_id}.json"
+
+
 def load_anthropic_key() -> str | None:
-    """Load the Anthropic API key from env var or disk."""
+    """Load the Anthropic API key from env var, per-user file, or disk."""
     # GKL_ANTHROPIC_KEY is used in web mode (injected per-user by server)
     env_key = os.environ.get("GKL_ANTHROPIC_KEY") or os.environ.get("ANTHROPIC_API_KEY")
     if env_key:
         return env_key
+
+    # In web mode, check per-user key file on shared volume
+    web_path = _web_key_path()
+    if web_path and web_path.exists():
+        try:
+            data = json.loads(web_path.read_text())
+            key = data.get("api_key", "").strip()
+            if key:
+                return key
+        except (json.JSONDecodeError, KeyError):
+            pass
 
     if ANTHROPIC_KEY_PATH.exists():
         try:
@@ -42,9 +62,14 @@ def load_anthropic_key() -> str | None:
 
 
 def save_anthropic_key(key: str) -> None:
-    """Persist the Anthropic API key to disk. No-op in web mode."""
+    """Persist the Anthropic API key to disk."""
     if os.environ.get("GKL_MODE", "local").lower() == "web":
-        return  # managed server-side in web mode
+        # Save to per-user file on shared volume
+        web_path = _web_key_path()
+        if web_path:
+            web_path.parent.mkdir(parents=True, exist_ok=True)
+            web_path.write_text(json.dumps({"api_key": key}))
+        return
     ANTHROPIC_KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
     ANTHROPIC_KEY_PATH.write_text(json.dumps({"api_key": key}))
 
