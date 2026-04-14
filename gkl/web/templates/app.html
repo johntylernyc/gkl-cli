@@ -5,12 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>GKL Baseball</title>
     <link rel="stylesheet" href="/static/css/xterm.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <script src="/static/js/textual.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             background: #1a1b26;
             color: #c0caf5;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            font-family: "Roboto Mono", monospace;
             height: 100vh;
             display: flex;
             flex-direction: column;
@@ -24,21 +27,20 @@
             border-bottom: 1px solid #2a2b3d;
             font-size: 0.85rem;
             flex-shrink: 0;
+            z-index: 10;
         }
         .topbar-left { color: #7aa2f7; font-weight: 500; }
         .topbar-right { display: flex; gap: 1rem; align-items: center; }
-        .topbar a {
-            color: #565f89;
-            text-decoration: none;
-            transition: color 0.2s;
-        }
+        .topbar a { color: #565f89; text-decoration: none; }
         .topbar a:hover { color: #c0caf5; }
         .user-name { color: #9ece6a; }
-        #terminal-container {
+
+        /* textual.js uses these classes on body */
+        .textual-terminal {
             flex: 1;
             overflow: hidden;
         }
-        .loading {
+        .intro-dialog {
             display: flex;
             align-items: center;
             justify-content: center;
@@ -46,7 +48,10 @@
             color: #565f89;
             font-size: 1.1rem;
         }
-        .disconnected {
+        body.-first-byte .intro-dialog { display: none; }
+        body.-first-byte .textual-terminal { visibility: visible; }
+
+        .closed-dialog {
             display: none;
             position: fixed;
             top: 50%;
@@ -59,11 +64,9 @@
             text-align: center;
             z-index: 100;
         }
-        .disconnected h2 { color: #f7768e; margin-bottom: 0.5rem; }
-        .disconnected a {
-            color: #7aa2f7;
-            text-decoration: none;
-        }
+        body.-closed .closed-dialog { display: block; }
+        .closed-dialog h2 { color: #f7768e; margin-bottom: 0.5rem; }
+        .closed-dialog a { color: #7aa2f7; text-decoration: none; }
     </style>
 </head>
 <body>
@@ -75,82 +78,19 @@
         </div>
     </div>
 
-    <div id="terminal-container">
-        <div class="loading" id="loading">Connecting...</div>
-    </div>
+    <div class="intro-dialog">Connecting...</div>
 
-    <div class="disconnected" id="disconnected">
+    <div
+        id="terminal"
+        class="textual-terminal"
+        data-session-websocket-url="wss://{{ host }}/ws"
+        data-font-size="15"
+    ></div>
+
+    <div class="closed-dialog">
         <h2>Session Ended</h2>
         <p>Your terminal session has ended.</p>
         <p><a href="/app">Reconnect</a> | <a href="/logout">Logout</a></p>
     </div>
-
-    <script src="/static/js/textual.js"></script>
-    <script>
-        (function() {
-            const container = document.getElementById("terminal-container");
-            const loading = document.getElementById("loading");
-            const disconnected = document.getElementById("disconnected");
-
-            const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-            const wsUrl = `${protocol}//${location.host}/ws`;
-            const ws = new WebSocket(wsUrl);
-
-            let gotFirstByte = false;
-
-            ws.binaryType = "arraybuffer";
-
-            ws.onopen = function() {
-                loading.textContent = "Starting app...";
-                // Send initial terminal size
-                const width = Math.floor(container.clientWidth / 8);
-                const height = Math.floor(container.clientHeight / 16);
-                ws.send(JSON.stringify(["resize", {"width": width, "height": height}]));
-            };
-
-            ws.onmessage = function(event) {
-                if (!gotFirstByte) {
-                    gotFirstByte = true;
-                    loading.style.display = "none";
-                }
-            };
-
-            ws.onclose = function() {
-                disconnected.style.display = "block";
-            };
-
-            ws.onerror = function() {
-                loading.textContent = "Connection failed. Please try again.";
-            };
-
-            // Keep alive
-            setInterval(function() {
-                if (ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify(["ping", Date.now()]));
-                }
-            }, 30000);
-
-            // Handle window resize
-            window.addEventListener("resize", function() {
-                if (ws.readyState === WebSocket.OPEN) {
-                    const width = Math.floor(container.clientWidth / 8);
-                    const height = Math.floor(container.clientHeight / 16);
-                    ws.send(JSON.stringify(["resize", {"width": width, "height": height}]));
-                }
-            });
-
-            // Handle focus/blur
-            window.addEventListener("focus", function() {
-                if (ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify(["focus"]));
-                }
-            });
-            window.addEventListener("blur", function() {
-                if (ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify(["blur"]));
-                }
-            });
-        })();
-    </script>
 </body>
 </html>

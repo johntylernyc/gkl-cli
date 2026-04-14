@@ -227,9 +227,11 @@ async def app_page(request: Request) -> HTMLResponse | RedirectResponse:
         return RedirectResponse("/")
 
     template = get_templates().get_template("app.html")
+    host = request.headers.get("host", "gklbaseball.com")
     return HTMLResponse(template.render(
         user_name=session.yahoo_name or session.yahoo_email or "User",
         has_anthropic_key=session.anthropic_key is not None,
+        host=host,
     ))
 
 
