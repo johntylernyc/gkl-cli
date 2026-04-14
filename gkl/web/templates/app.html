@@ -10,23 +10,25 @@
     <script src="/static/js/textual.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { height: 100%; overflow: hidden; }
         body {
             background: #1a1b26;
             color: #c0caf5;
             font-family: "Roboto Mono", monospace;
-            height: 100vh;
-            display: flex;
-            flex-direction: column;
         }
         .topbar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 32px;
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 0.4rem 1rem;
+            padding: 0 1rem;
             background: #16161e;
             border-bottom: 1px solid #2a2b3d;
             font-size: 0.85rem;
-            flex-shrink: 0;
             z-index: 10;
         }
         .topbar-left { color: #7aa2f7; font-weight: 500; }
@@ -35,21 +37,28 @@
         .topbar a:hover { color: #c0caf5; }
         .user-name { color: #9ece6a; }
 
-        /* textual.js uses these classes on body */
         .textual-terminal {
-            flex: 1;
+            position: fixed;
+            top: 32px;
+            left: 0;
+            right: 0;
+            bottom: 0;
             overflow: hidden;
         }
         .intro-dialog {
+            position: fixed;
+            top: 32px;
+            left: 0;
+            right: 0;
+            bottom: 0;
             display: flex;
             align-items: center;
             justify-content: center;
-            height: 100%;
             color: #565f89;
             font-size: 1.1rem;
+            z-index: 5;
         }
         body.-first-byte .intro-dialog { display: none; }
-        body.-first-byte .textual-terminal { visibility: visible; }
 
         .closed-dialog {
             display: none;
