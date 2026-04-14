@@ -99,7 +99,7 @@ async def _mount_statics() -> None:
 # --- Auth routes ---
 
 
-@app.get("/")
+@app.get("/", response_model=None)
 async def index(request: Request) -> HTMLResponse | RedirectResponse:
     session = _get_session_from_request(request)
     if session:
@@ -220,7 +220,7 @@ async def set_anthropic_key(request: Request) -> RedirectResponse:
 # --- App page (terminal in browser) ---
 
 
-@app.get("/app")
+@app.get("/app", response_model=None)
 async def app_page(request: Request) -> HTMLResponse | RedirectResponse:
     session = _get_session_from_request(request)
     if not session:
