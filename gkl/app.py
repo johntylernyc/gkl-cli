@@ -7080,7 +7080,8 @@ def main() -> None:
 
     auth = YahooAuth(client_id=client_id, client_secret=client_secret)
     token = auth.get_token()
-    print("Authenticated successfully. Launching app...\n")
+    if not is_web_mode():
+        print("Authenticated successfully. Launching app...\n")
 
     api = YahooFantasyAPI(auth)
     app = GklApp(api)

@@ -306,15 +306,47 @@ async def _run_textual_subprocess(
         env=env,
     )
 
+    # Log stderr in background so we can see crash messages
+    async def _log_stderr() -> None:
+        while True:
+            line = await proc.stderr.readline()
+            if not line:
+                break
+            logger.error("subprocess stderr: %s", line.decode(errors="replace").rstrip())
+
+    stderr_task = asyncio.create_task(_log_stderr())
+
     try:
-        # Wait for the subprocess to signal readiness
-        ready_line = await asyncio.wait_for(
-            proc.stdout.readline(), timeout=30
-        )
-        if b"__GANGLION__" not in ready_line:
-            logger.warning(
-                "Subprocess did not send ready signal, got: %r", ready_line
-            )
+        # Wait for the subprocess to signal readiness via __GANGLION__
+        # Read lines until we get it or hit binary data (packet header)
+        ready = False
+        for _ in range(20):  # max 20 lines of preamble
+            try:
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=30)
+            except asyncio.TimeoutError:
+                logger.error("Subprocess did not start within 30 seconds")
+                return
+
+            if not line:
+                # Process exited
+                logger.error("Subprocess exited before sending ready signal")
+                return
+
+            if b"__GANGLION__" in line:
+                ready = True
+                break
+
+            # If first byte looks like a binary packet header, put it back
+            if line[0:1] in (b"D", b"M", b"P") and len(line) >= 5:
+                logger.warning("Got binary data before ready signal, proceeding")
+                ready = True
+                break
+
+            logger.info("subprocess preamble: %s", line.decode(errors="replace").rstrip())
+
+        if not ready:
+            logger.error("Never received ready signal from subprocess")
+            return
 
         # Bridge WebSocket <-> subprocess
         ws_to_proc = asyncio.create_task(_ws_to_process(websocket, proc))
@@ -327,11 +359,10 @@ async def _run_textual_subprocess(
         for task in pending:
             task.cancel()
 
-    except asyncio.TimeoutError:
-        logger.error("Subprocess did not start within 30 seconds")
     except WebSocketDisconnect:
         pass
     finally:
+        stderr_task.cancel()
         if proc.returncode is None:
             proc.terminate()
             try:
