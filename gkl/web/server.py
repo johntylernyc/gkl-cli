@@ -157,30 +157,33 @@ async def auth_callback(request: Request) -> RedirectResponse:
     expires_at = time() + token_data["expires_in"]
     logger.warning("Token response keys: %s", list(token_data.keys()))
 
-    # Primary user identifier from token response (always present in Yahoo OAuth2)
+    # Extract user identity from token response
     yahoo_guid = token_data.get("xoauth_yahoo_guid", "")
     yahoo_email = ""
     yahoo_name = ""
 
+    # Decode id_token JWT to get sub (Yahoo user ID) and profile claims
+    id_token_raw = token_data.get("id_token", "")
+    if id_token_raw:
+        try:
+            import base64
+            # JWT is header.payload.signature — decode payload (no verification
+            # needed since we got it directly from Yahoo's token endpoint over TLS)
+            payload_b64 = id_token_raw.split(".")[1]
+            # Add padding
+            payload_b64 += "=" * (4 - len(payload_b64) % 4)
+            id_claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+            if not yahoo_guid:
+                yahoo_guid = id_claims.get("sub", "")
+            yahoo_email = id_claims.get("email", yahoo_email)
+            yahoo_name = id_claims.get("name", yahoo_name)
+        except Exception as e:
+            logger.warning("Failed to decode id_token: %s", e)
+
     if not yahoo_guid:
-        # Last resort: hash the access token for a stable-per-session identifier
         import hashlib
         yahoo_guid = hashlib.sha256(access_token.encode()).hexdigest()[:16]
-        logger.warning("No xoauth_yahoo_guid in token response, using hash fallback")
-
-    # Optionally fetch profile for display name (non-critical)
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                "https://api.login.yahoo.com/openid/v1/userinfo",
-                headers={"Authorization": f"Bearer {access_token}"},
-            )
-            if resp.status_code == 200:
-                profile = resp.json()
-                yahoo_email = profile.get("email", "")
-                yahoo_name = profile.get("name", profile.get("nickname", ""))
-    except Exception:
-        pass  # Profile fetch is best-effort
+        logger.warning("No user ID in token response, using hash fallback")
 
     logger.warning("User authenticated: guid=%s email=%s name=%s", yahoo_guid, yahoo_email, yahoo_name)
 
