@@ -155,7 +155,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
     access_token = token_data["access_token"]
     refresh_token = token_data["refresh_token"]
     expires_at = time() + token_data["expires_in"]
-    logger.info("Token response keys: %s", list(token_data.keys()))
+    logger.warning("Token response keys: %s", list(token_data.keys()))
 
     # Primary user identifier from token response (always present in Yahoo OAuth2)
     yahoo_guid = token_data.get("xoauth_yahoo_guid", "")
@@ -182,7 +182,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
     except Exception:
         pass  # Profile fetch is best-effort
 
-    logger.info("User authenticated: guid=%s email=%s name=%s", yahoo_guid, yahoo_email, yahoo_name)
+    logger.warning("User authenticated: guid=%s email=%s name=%s", yahoo_guid, yahoo_email, yahoo_name)
 
     store = get_store()
     session = store.create_session(
