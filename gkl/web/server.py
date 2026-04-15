@@ -157,31 +157,31 @@ async def auth_callback(request: Request) -> RedirectResponse:
     expires_at = time() + token_data["expires_in"]
     logger.info("Token response keys: %s", list(token_data.keys()))
 
-    # Fetch user profile from Yahoo
-    yahoo_guid = ""
+    # Primary user identifier from token response (always present in Yahoo OAuth2)
+    yahoo_guid = token_data.get("xoauth_yahoo_guid", "")
     yahoo_email = ""
     yahoo_name = ""
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://api.login.yahoo.com/openid/v1/userinfo",
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        if resp.status_code == 200:
-            profile = resp.json()
-            yahoo_guid = profile.get("sub", "")
-            yahoo_email = profile.get("email", "")
-            yahoo_name = profile.get("name", profile.get("nickname", ""))
-        else:
-            logger.warning("Yahoo userinfo failed (%s): %s", resp.status_code, resp.text)
 
-    # Ensure we always have a unique user identifier
     if not yahoo_guid:
-        yahoo_guid = token_data.get("xoauth_yahoo_guid", "")
-    if not yahoo_guid:
-        yahoo_guid = yahoo_email
-    if not yahoo_guid:
+        # Last resort: hash the access token for a stable-per-session identifier
         import hashlib
         yahoo_guid = hashlib.sha256(access_token.encode()).hexdigest()[:16]
+        logger.warning("No xoauth_yahoo_guid in token response, using hash fallback")
+
+    # Optionally fetch profile for display name (non-critical)
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://api.login.yahoo.com/openid/v1/userinfo",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if resp.status_code == 200:
+                profile = resp.json()
+                yahoo_email = profile.get("email", "")
+                yahoo_name = profile.get("name", profile.get("nickname", ""))
+    except Exception:
+        pass  # Profile fetch is best-effort
+
     logger.info("User authenticated: guid=%s email=%s name=%s", yahoo_guid, yahoo_email, yahoo_name)
 
     store = get_store()
