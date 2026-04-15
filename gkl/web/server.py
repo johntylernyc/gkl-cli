@@ -115,6 +115,7 @@ async def auth_yahoo() -> RedirectResponse:
         "client_id": client_id,
         "redirect_uri": get_redirect_uri(),
         "response_type": "code",
+        "scope": "openid fspt-r",
     }
     return RedirectResponse(f"{AUTH_URL}?{urlencode(params)}")
 
@@ -154,6 +155,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
     access_token = token_data["access_token"]
     refresh_token = token_data["refresh_token"]
     expires_at = time() + token_data["expires_in"]
+    logger.info("Token response keys: %s", list(token_data.keys()))
 
     # Fetch user profile from Yahoo
     yahoo_guid = ""
