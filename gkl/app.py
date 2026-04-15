@@ -6287,7 +6287,8 @@ class LeagueSelectScreen(Screen):
 
 
 class ScoreboardScreen(Screen):
-    BINDINGS = [("q", "quit", "Quit"), ("r", "refresh", "Refresh"),
+    BINDINGS = [("q", "quit", "Quit" if not is_web_mode() else "Logout"),
+                ("r", "refresh", "Refresh"),
                 ("s", "standings", "League Standings"),
                 ("h", "h2h_sim", "H2H Sim"),
                 ("g", "mlb_scores", "MLB Scores"),
@@ -6969,7 +6970,10 @@ class ScoreboardScreen(Screen):
             self.notify("Only one league available", severity="information")
 
     def action_quit(self) -> None:
-        self.app.exit()
+        if is_web_mode():
+            self.app.open_url("/logout")
+        else:
+            self.app.exit()
 
 
 # --- App ---
