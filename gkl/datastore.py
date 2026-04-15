@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS user_prefs (
 
 def _get_user_id() -> str:
     """Get the current user ID. 'local' for local mode, Yahoo GUID for web."""
-    return os.environ.get("GKL_USER_ID", "local")
+    uid = os.environ.get("GKL_USER_ID", "local")
+    return uid if uid else "local"
 
 
 class RosterDataStore:

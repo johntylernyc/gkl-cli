@@ -156,6 +156,9 @@ async def auth_callback(request: Request) -> RedirectResponse:
     expires_at = time() + token_data["expires_in"]
 
     # Fetch user profile from Yahoo
+    yahoo_guid = ""
+    yahoo_email = ""
+    yahoo_name = ""
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             "https://api.login.yahoo.com/openid/v1/userinfo",
@@ -167,10 +170,17 @@ async def auth_callback(request: Request) -> RedirectResponse:
             yahoo_email = profile.get("email", "")
             yahoo_name = profile.get("name", profile.get("nickname", ""))
         else:
-            # Fallback: use the GUID from the token response
-            yahoo_guid = token_data.get("xoauth_yahoo_guid", "unknown")
-            yahoo_email = ""
-            yahoo_name = ""
+            logger.warning("Yahoo userinfo failed (%s): %s", resp.status_code, resp.text)
+
+    # Ensure we always have a unique user identifier
+    if not yahoo_guid:
+        yahoo_guid = token_data.get("xoauth_yahoo_guid", "")
+    if not yahoo_guid:
+        yahoo_guid = yahoo_email
+    if not yahoo_guid:
+        import hashlib
+        yahoo_guid = hashlib.sha256(access_token.encode()).hexdigest()[:16]
+    logger.info("User authenticated: guid=%s email=%s name=%s", yahoo_guid, yahoo_email, yahoo_name)
 
     store = get_store()
     session = store.create_session(

@@ -93,21 +93,43 @@ class SessionStore:
     ) -> Session:
         session_id = secrets.token_urlsafe(32)
         now = time()
+
+        # Carry over Anthropic key from any previous session for this user
+        existing_key_enc = None
+        if yahoo_guid:
+            row = self._conn.execute(
+                """SELECT anthropic_key_enc FROM sessions
+                   WHERE yahoo_guid = ? AND anthropic_key_enc IS NOT NULL
+                   ORDER BY last_active DESC LIMIT 1""",
+                (yahoo_guid,),
+            ).fetchone()
+            if row:
+                existing_key_enc = row["anthropic_key_enc"]
+
         self._conn.execute(
             """INSERT INTO sessions
                (session_id, yahoo_guid, yahoo_email, yahoo_name,
                 access_token_enc, refresh_token_enc, token_expires_at,
-                created_at, last_active)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                anthropic_key_enc, created_at, last_active)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session_id, yahoo_guid, yahoo_email, yahoo_name,
                 self._encrypt(access_token),
                 self._encrypt(refresh_token),
                 token_expires_at,
+                existing_key_enc,
                 now, now,
             ),
         )
         self._conn.commit()
+
+        anthropic_key = None
+        if existing_key_enc:
+            try:
+                anthropic_key = self._decrypt(existing_key_enc)
+            except Exception:
+                pass
+
         return Session(
             session_id=session_id,
             yahoo_guid=yahoo_guid,
@@ -116,7 +138,7 @@ class SessionStore:
             access_token=access_token,
             refresh_token=refresh_token,
             token_expires_at=token_expires_at,
-            anthropic_key=None,
+            anthropic_key=anthropic_key,
             created_at=now,
             last_active=now,
         )
