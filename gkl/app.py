@@ -27,6 +27,54 @@ from textual.widgets import (
     Static,
 )
 
+from textual.widgets._footer import FooterKey
+
+
+class WrappingFooter(Footer):
+    """Footer that wraps key bindings to multiple rows."""
+
+    DEFAULT_CSS = """
+    WrappingFooter {
+        dock: bottom;
+        height: auto;
+        color: $footer-foreground;
+        background: $footer-background;
+        scrollbar-size: 0 0;
+        grid-gutter: 0;
+        grid-rows: 1;
+        FooterKey.-command-palette {
+            dock: right;
+            padding-right: 1;
+            border-left: vkey $foreground 20%;
+        }
+    }
+    """
+
+    def _cap_columns(self) -> None:
+        keys = list(self.query(FooterKey))
+        if not keys:
+            return
+        # Measure total width needed: key display + description + spacing
+        total = sum(
+            len(k.key_display or "") + len(k.description or "") + 3
+            for k in keys
+        )
+        # Target ~2 rows for a typical set of bindings
+        target_per_row = max(1, (total + self.size.width - 1) // self.size.width)
+        cols = max(1, (len(keys) + target_per_row - 1) // target_per_row)
+        self.styles.grid_size_columns = cols
+
+    def bindings_changed(self, screen) -> None:
+        super().bindings_changed(screen)
+        self.call_after_refresh(self._cap_columns)
+
+    def on_mount(self) -> None:
+        self.call_after_refresh(self._cap_columns)
+
+    def on_resize(self) -> None:
+        self._cap_columns()
+
+
 from gkl.shared_cache import SharedDataCache
 from gkl.updater import (
     UpdateInfo, UpdateModal, apply_update, check_for_update,
@@ -89,6 +137,56 @@ BASEBALL_THEME = Theme(
 
 
 _compute_roto = compute_roto  # alias for backward compatibility
+
+
+# --- Player Comparison Mixin ---
+
+
+class PlayerCompareMixin:
+    """Mixin providing compare-to-roster functionality for any screen with player DataTables.
+
+    Requires the screen to have: self.api, self.league, self.categories.
+    Optionally uses self._sgp_calc if available.
+    """
+
+    def action_compare(self) -> None:
+        try:
+            focused = self.query("DataTable:focus")
+            if not focused:
+                return
+            table = focused.first()
+            if not isinstance(table, DataTable):
+                return
+        except Exception:
+            return
+
+        players = getattr(table, "_players", [])
+        row_idx = table.cursor_row
+        if row_idx < 0 or row_idx >= len(players):
+            return
+
+        self._compare_player = players[row_idx]
+
+        teams = self.api.get_team_season_stats(self.league.league_key)
+        self._compare_team_names = {t.team_key: t.name for t in teams}
+        options = [(t.team_key, t.name) for t in teams]
+        self.app.push_screen(
+            TeamSelectModal(options),
+            callback=self._on_compare_team_selected,
+        )
+
+    def _on_compare_team_selected(self, team_key: str | None) -> None:
+        if team_key is None or not hasattr(self, "_compare_player"):
+            return
+        p = self._compare_player
+        team_name = self._compare_team_names.get(team_key, team_key)
+        sgp = getattr(self, "_sgp_calc", None)
+        self.app.push_screen(
+            ComparisonScreen(
+                self.api, self.league, self.categories,
+                p, team_key, team_name, sgp,
+            )
+        )
 
 
 # --- Week Range Modal ---
@@ -184,7 +282,7 @@ class LeagueStandingsScreen(Screen):
             yield Static("", id="roto-view-label")
             yield DataTable(id="roto-table")
         yield Static("Loading standings...", id="ls-loading")
-        yield Footer()
+        yield WrappingFooter()
 
     def on_mount(self) -> None:
         self.query_one("#ls-header", Static).update(
@@ -575,7 +673,7 @@ class H2HSimulatorScreen(Screen):
         with Vertical(id="h2h-bottom"):
             yield Static("", id="h2h-bottom-label")
             yield DataTable(id="rankings-table")
-        yield Footer()
+        yield WrappingFooter()
 
     def on_mount(self) -> None:
         self.query_one("#h2h-header", Static).update(
@@ -1290,11 +1388,12 @@ class PositionSelectModal(Screen):
 # --- Roster Analysis Screen ---
 
 
-class RosterAnalysisScreen(Screen):
+class RosterAnalysisScreen(PlayerCompareMixin, Screen):
     BINDINGS = [("escape", "go_back", "Back"), ("q", "go_back", "Back"),
                 ("m", "cycle_team", "Next Team"),
                 ("1", "view_season", "Season"), ("2", "view_l14", "L14"),
                 ("3", "view_l30", "L30"),
+                ("c", "compare", "Compare"),
                 ("i", "player_detail", "Player Detail")]
     CSS = """
     #roster-header {
@@ -1397,7 +1496,7 @@ class RosterAnalysisScreen(Screen):
             yield DataTable(id="batters-table")
             yield Static(" Pitchers", classes="roster-table-section")
             yield DataTable(id="pitchers-table")
-        yield Footer()
+        yield WrappingFooter()
 
     def on_mount(self) -> None:
         self.query_one("#roster-header", Static).update(
@@ -1782,7 +1881,7 @@ class RosterAnalysisScreen(Screen):
 # --- Free Agent Browser Screen ---
 
 
-class FreeAgentScreen(Screen):
+class FreeAgentScreen(PlayerCompareMixin, Screen):
     BINDINGS = [
         ("escape", "go_back", "Back"),
         ("q", "go_back", "Back"),
@@ -1795,6 +1894,7 @@ class FreeAgentScreen(Screen):
         ("right", "next_page", "Next Page"),
         ("left", "prev_page", "Prev Page"),
         ("w", "watchlist_toggle", "Watch"),
+        ("c", "compare", "Compare"),
         ("i", "player_detail", "Player Detail"),
     ]
     CSS = """
@@ -1907,7 +2007,7 @@ class FreeAgentScreen(Screen):
             yield Static("Loading free agents...", id="fa-loading-status")
         yield VerticalScroll(id="fa-scroll")
         yield Static("", id="fa-pagination")
-        yield Footer()
+        yield WrappingFooter()
 
     def on_mount(self) -> None:
         self.query_one("#fa-header", Static).update(
@@ -2513,7 +2613,7 @@ class FreeAgentScreen(Screen):
 # --- Watchlist Screen ---
 
 
-class WatchlistScreen(Screen):
+class WatchlistScreen(PlayerCompareMixin, Screen):
     BINDINGS = [
         ("escape", "go_back", "Back"),
         ("q", "go_back", "Back"),
@@ -2590,7 +2690,7 @@ class WatchlistScreen(Screen):
             yield LoadingIndicator(id="wl-spinner")
             yield Static("Loading watchlist...", id="wl-loading-status")
         yield VerticalScroll(id="wl-scroll")
-        yield Footer()
+        yield WrappingFooter()
 
     def on_mount(self) -> None:
         self.query_one("#wl-header", Static).update(
@@ -2916,51 +3016,14 @@ class WatchlistScreen(Screen):
             replacement_by_pos=cache.replacement_by_pos if cache.is_loaded else None,
         ))
 
-    def action_compare(self) -> None:
-        try:
-            focused = self.query("DataTable:focus")
-            if not focused:
-                return
-            table = focused.first()
-            if not isinstance(table, DataTable):
-                return
-        except Exception:
-            return
-
-        players = getattr(table, "_players", [])
-        row_idx = table.cursor_row
-        if row_idx < 0 or row_idx >= len(players):
-            return
-
-        self._compare_player = players[row_idx]
-
-        # Get team list for selection
-        teams = self.api.get_team_season_stats(self.league.league_key)
-        self._team_names = {t.team_key: t.name for t in teams}
-        options = [(t.team_key, t.name) for t in teams]
-        self.app.push_screen(
-            TeamSelectModal(options),
-            callback=self._on_team_selected,
-        )
-
-    def _on_team_selected(self, team_key: str | None) -> None:
-        if team_key is None or not hasattr(self, "_compare_player"):
-            return
-        p = self._compare_player
-        team_name = self._team_names.get(team_key, team_key)
-        self.app.push_screen(
-            ComparisonScreen(
-                self.api, self.league, self.categories,
-                p, team_key, team_name, self._sgp_calc,
-            )
-        )
-
-
 class ComparisonScreen(Screen):
-    """Compare a watchlisted player against position-matched roster players."""
+    """Compare a player against position-matched roster players."""
     BINDINGS = [
         ("escape", "go_back", "Back"),
         ("q", "go_back", "Back"),
+        ("1", "view_season", "Season"),
+        ("2", "view_l14", "L14"),
+        ("3", "view_l30", "L30"),
     ]
     CSS = """
     #cmp-header {
@@ -3012,9 +3075,12 @@ class ComparisonScreen(Screen):
         self.league = league
         self.categories = categories
         self._wl_player = watchlist_player
+        self._wl_player_key = watchlist_player.player_key
+        self._wl_player_name = watchlist_player.name
         self._team_key = team_key
         self._team_name = team_name
         self._sgp_calc = sgp_calc
+        self._view = "season"
 
     @property
     def _is_batter(self) -> bool:
@@ -3029,23 +3095,51 @@ class ComparisonScreen(Screen):
             yield LoadingIndicator(id="cmp-spinner")
             yield Static("Loading comparison...", id="cmp-loading-status")
         yield VerticalScroll(id="cmp-scroll")
-        yield Footer()
+        yield WrappingFooter()
 
-    def on_mount(self) -> None:
-        self.query_one("#cmp-header", Static).update(
-            f" {self.league.name} — Player Comparison "
-        )
+    def _update_subheader(self) -> None:
+        view_labels = {"season": "Season", "l14": "Last 14 Days", "l30": "Last 30 Days"}
         sub = Text()
         sub.append(f"\n Comparing ", style="dim")
         sub.append(f"{self._wl_player.name}", style="bold #E8A735")
         sub.append(f" ({self._wl_player.position})", style="dim")
         sub.append(f" vs ", style="dim")
-        sub.append(f"{self._team_name}\n", style="bold")
+        sub.append(f"{self._team_name}", style="bold")
+        sub.append(f"  |  {view_labels.get(self._view, self._view)}", style="dim")
+        sub.append(f"  [1] Season  [2] L14  [3] L30\n", style="dim")
         self.query_one("#cmp-subheader", Static).update(sub)
+
+    def on_mount(self) -> None:
+        self.query_one("#cmp-header", Static).update(
+            f" {self.league.name} — Player Comparison "
+        )
+        self._update_subheader()
         self.run_worker(self._load_comparison)
 
     def action_go_back(self) -> None:
         self.app.pop_screen()
+
+    def action_view_season(self) -> None:
+        self._view = "season"
+        self._update_subheader()
+        self.run_worker(self._load_comparison, group="cmp-load", exclusive=True)
+
+    def action_view_l14(self) -> None:
+        self._view = "l14"
+        self._update_subheader()
+        self.run_worker(self._load_comparison, group="cmp-load", exclusive=True)
+
+    def action_view_l30(self) -> None:
+        self._view = "l30"
+        self._update_subheader()
+        self.run_worker(self._load_comparison, group="cmp-load", exclusive=True)
+
+    def _get_roster_fetcher(self):
+        if self._view == "l14":
+            return self.api.get_roster_stats_last7
+        elif self._view == "l30":
+            return self.api.get_roster_stats_last30
+        return self.api.get_roster_stats_season
 
     async def _load_comparison(self) -> None:
         try:
@@ -3057,11 +3151,29 @@ class ComparisonScreen(Screen):
         except Exception:
             pass
 
-        # Fetch the team's roster
+        fetch = self._get_roster_fetcher()
+
+        # Fetch the team's roster with the selected stat view
         roster = await asyncio.to_thread(
-            self.api.get_roster_stats_season,
-            self._team_key, self.league.current_week,
+            fetch, self._team_key, self.league.current_week,
         )
+
+        # Re-fetch the compared player's stats with the same stat view
+        stat_type = {"l14": "lastweek", "l30": "lastmonth"}.get(self._view, "season")
+        try:
+            found, _ = await asyncio.to_thread(
+                self.api.get_free_agents,
+                self.league.league_key,
+                status=None, stat_type=stat_type,
+                search=self._wl_player_name,
+                count=5,
+            )
+            for p in found:
+                if p.player_key == self._wl_player_key:
+                    self._wl_player = p
+                    break
+        except Exception:
+            pass  # fall back to existing stats
 
         # Position-match: find roster players with overlapping positions
         wl_positions = {pos.strip() for pos in self._wl_player.position.split(",")}
@@ -3509,7 +3621,7 @@ class PlayerExplorerScreen(Screen):
                 id="pe-loading-info",
             )
         yield VerticalScroll(id="pe-scroll")
-        yield Footer()
+        yield WrappingFooter()
 
     def on_mount(self) -> None:
         header = self.query_one("#pe-header", Static)
@@ -4213,7 +4325,7 @@ class PlayerDetailScreen(Screen):
             with Horizontal(classes="pd-chart-row"):
                 for i in range(4, 8):
                     yield PlotextPlot(id=f"pd-chart-{i}", classes="pd-chart")
-        yield Footer()
+        yield WrappingFooter()
 
     def on_mount(self) -> None:
         self.query_one("#pd-header", Static).update(
@@ -4641,10 +4753,11 @@ class PlayerDetailScreen(Screen):
 # --- Transactions Screen ---
 
 
-class TransactionsScreen(Screen):
+class TransactionsScreen(PlayerCompareMixin, Screen):
     BINDINGS = [
         ("escape", "go_back", "Back"),
         ("q", "go_back", "Back"),
+        ("c", "compare", "Compare"),
         ("i", "player_detail", "Player Detail"),
     ]
     CSS = """
@@ -4705,7 +4818,7 @@ class TransactionsScreen(Screen):
             yield LoadingIndicator(id="tx-spinner")
             yield Static("Loading transactions...", id="tx-loading-status")
         yield VerticalScroll(id="tx-scroll")
-        yield Footer()
+        yield WrappingFooter()
 
     def on_mount(self) -> None:
         header = self.query_one("#tx-header", Static)
@@ -5090,6 +5203,14 @@ class FantasyTeamPickerScreen(Screen):
 # --- MLB Scoreboard Screen ---
 
 
+class GameCard(Vertical, can_focus=True):
+    """A focusable game card widget that stores its MLBGame."""
+
+    def __init__(self, game: MLBGame, card_class: str, card_id: str) -> None:
+        super().__init__(classes=card_class, id=card_id)
+        self.game = game
+
+
 class MLBScoreboardScreen(Screen):
     BINDINGS = [("escape", "go_back", "Back"), ("q", "go_back", "Back"),
                 ("r", "refresh", "Refresh"),
@@ -5183,6 +5304,24 @@ class MLBScoreboardScreen(Screen):
         background: #252525;
         border: solid #FFD700;
     }
+    .game-card:focus {
+        border: solid #FFD700;
+    }
+    .game-card-live:focus {
+        border: solid #FFD700;
+    }
+    .game-card-final:focus {
+        border: solid #FFD700;
+    }
+    .game-card-roster:focus {
+        border: solid #FFFFFF;
+    }
+    .game-card-live-roster:focus {
+        border: solid #FFFFFF;
+    }
+    .game-card-final-roster:focus {
+        border: solid #FFFFFF;
+    }
     .game-line {
         height: 1;
         width: 100%;
@@ -5223,7 +5362,7 @@ class MLBScoreboardScreen(Screen):
         yield Static("", id="mlb-controls")
         yield Static("Loading...", id="mlb-loading")
         yield VerticalScroll(id="mlb-games")
-        yield Footer()
+        yield WrappingFooter()
 
     def on_mount(self) -> None:
         self._load_roster_teams()
@@ -5313,14 +5452,17 @@ class MLBScoreboardScreen(Screen):
 
         # Batch into rows of 4
         cards_per_row = 4
+        first_card = None
         for i in range(0, len(games), cards_per_row):
             row = Horizontal(classes="game-row")
             await container.mount(row)
             for game in games[i:i + cards_per_row]:
-                card = Vertical(
-                    classes=self._card_class(game),
-                    id=f"game-{game.gamePk}",
+                card = GameCard(
+                    game, self._card_class(game),
+                    card_id=f"game-{game.gamePk}",
                 )
+                if first_card is None:
+                    first_card = card
                 await row.mount(card)
                 await card.mount(Static(self._format_status(game), classes="game-status"))
                 await card.mount(Static(self._format_away(game), classes="game-line"))
@@ -5342,6 +5484,8 @@ class MLBScoreboardScreen(Screen):
                 if show_linescore:
                     await self._mount_linescore(card, game)
 
+        if first_card is not None:
+            first_card.focus()
         self._manage_refresh_timer(games)
 
     def _manage_refresh_timer(self, games: list[MLBGame]) -> None:
@@ -5389,6 +5533,48 @@ class MLBScoreboardScreen(Screen):
         home_line.append(f"  {game.home_score:>2} {game.home_hits:>2} {game.home_errors:>2}")
         await card.mount(Static(home_line, classes="linescore-line"))
 
+    def _get_cards(self) -> list[GameCard]:
+        return list(self.query(GameCard))
+
+    def _focused_card_index(self) -> int | None:
+        cards = self._get_cards()
+        focused = self.focused
+        if focused in cards:
+            return cards.index(focused)
+        return None
+
+    def key_left(self) -> None:
+        cards = self._get_cards()
+        idx = self._focused_card_index()
+        if idx is not None and idx > 0:
+            cards[idx - 1].focus()
+        elif idx is None and cards:
+            cards[0].focus()
+
+    def key_right(self) -> None:
+        cards = self._get_cards()
+        idx = self._focused_card_index()
+        if idx is not None and idx < len(cards) - 1:
+            cards[idx + 1].focus()
+        elif idx is None and cards:
+            cards[0].focus()
+
+    def key_up(self) -> None:
+        cards = self._get_cards()
+        idx = self._focused_card_index()
+        if idx is not None and idx >= 4:
+            cards[idx - 4].focus()
+        elif idx is None and cards:
+            cards[0].focus()
+
+    def key_down(self) -> None:
+        cards = self._get_cards()
+        idx = self._focused_card_index()
+        if idx is not None and idx + 4 < len(cards):
+            cards[idx + 4].focus()
+        elif idx is None and cards:
+            cards[0].focus()
+
     def on_click(self, event) -> None:
         """Open box score when a game card is clicked."""
         try:
@@ -5396,23 +5582,24 @@ class MLBScoreboardScreen(Screen):
         except Exception:
             return
         while widget is not None and widget is not self:
-            widget_id = getattr(widget, "id", None) or ""
-            if widget_id.startswith("game-"):
-                gamePk = widget_id[5:]
-                for g in self._games:
-                    if g.gamePk == gamePk:
-                        self.app.push_screen(
-                            BoxScoreScreen(g, self._roster_players_by_team, self._categories)
-                        )
-                        return
+            if isinstance(widget, GameCard):
+                self.app.push_screen(
+                    BoxScoreScreen(widget.game, self._roster_players_by_team, self._categories)
+                )
                 return
             widget = widget.parent
 
     def action_open_boxscore(self) -> None:
-        """Open full box score for the first live game or first game."""
+        """Open box score for the focused game card."""
+        focused = self.focused
+        if isinstance(focused, GameCard):
+            self.app.push_screen(
+                BoxScoreScreen(focused.game, self._roster_players_by_team, self._categories)
+            )
+            return
         if not self._games:
             return
-        # Prefer the first live game, then first game with data
+        # Fallback: first live game, then first final, then first game
         target = None
         for g in self._games:
             if g.status == "Live":
@@ -5772,7 +5959,7 @@ class BoxScoreScreen(Screen):
         yield Static("", id="box-subheader")
         yield Static("Loading box score...", id="box-loading")
         yield VerticalScroll(id="box-content")
-        yield Footer()
+        yield WrappingFooter()
 
     def on_mount(self) -> None:
         g = self._game
@@ -6141,7 +6328,7 @@ class AskSkipperScreen(Screen):
         yield VerticalScroll(id="skipper-messages")
         yield Static("Skipper is thinking...", id="skipper-status")
         yield Input(placeholder="Ask Skipper a question...", id="skipper-input")
-        yield Footer()
+        yield WrappingFooter()
 
     def on_mount(self) -> None:
         key = load_anthropic_key()
@@ -6286,7 +6473,7 @@ class LeagueSelectScreen(Screen):
 # --- Scoreboard Screen (3-pane layout) ---
 
 
-class ScoreboardScreen(Screen):
+class ScoreboardScreen(PlayerCompareMixin, Screen):
     BINDINGS = [("q", "quit", "Quit" if not is_web_mode() else "Logout"),
                 ("r", "refresh", "Refresh"),
                 ("s", "standings", "League Standings"),
@@ -6306,9 +6493,10 @@ class ScoreboardScreen(Screen):
                 ("right", "next_week", "Next Week"),
                 ("e", "select_week", "Select Week"),
                 ("L", "switch_league", "Switch League"),
+                ("c", "compare", "Compare"),
                 ("i", "player_detail", "Player Detail"),
                 ("a", "ask_skipper", "Ask Skipper"),
-                ("c", "settings", "Config")]
+                ("C", "settings", "Config")]
     CSS = """
     #board-header {
         height: 1;
@@ -6469,7 +6657,7 @@ class ScoreboardScreen(Screen):
             with Horizontal():
                 yield VerticalScroll(id="player-scroll-a")
                 yield VerticalScroll(id="player-scroll-b")
-        yield Footer()
+        yield WrappingFooter()
 
     def on_mount(self) -> None:
         self.query_one("#matchup-list", ListView).display = False

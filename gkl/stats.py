@@ -32,7 +32,6 @@ _RATE_WEIGHTS: dict[str, tuple[str, int]] = {
 # Stats pinned to always display regardless of league scoring configuration.
 # (display_name, position_type, fallback_stat_id)
 _PINNED_STATS: list[tuple[str, str, str]] = [
-    ("G", "B", "0"),
     ("AB", "B", "6"),
     ("IP", "P", "50"),
 ]
