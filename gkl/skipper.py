@@ -260,6 +260,14 @@ TOOLS = [
 ]
 
 
+AVAILABLE_MODELS = [
+    ("claude-sonnet-4-6", "Sonnet 4.6"),
+    ("claude-haiku-4-5-20251001", "Haiku 4.5"),
+    ("claude-opus-4-6", "Opus 4.6"),
+]
+DEFAULT_MODEL = "claude-sonnet-4-6"
+
+
 class Skipper:
     """Chat assistant that uses Claude + Yahoo Fantasy API tools."""
 
@@ -268,10 +276,12 @@ class Skipper:
         api: YahooFantasyAPI,
         league: League,
         categories: list[StatCategory],
+        model: str = DEFAULT_MODEL,
     ) -> None:
         self.api = api
         self.league = league
         self.categories = categories
+        self.model = model
         self._teams: list[TeamStats] | None = None
         self.history: list[dict] = []
         api_key = load_anthropic_key()
@@ -1631,7 +1641,7 @@ class Skipper:
         max_iterations = 10
         for _ in range(max_iterations):
             response = await self._client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model=self.model,
                 max_tokens=2048,
                 system=[{
                     "type": "text",

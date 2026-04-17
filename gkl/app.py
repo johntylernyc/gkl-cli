@@ -100,7 +100,7 @@ from gkl.statcast import (
     get_batter_statcast, get_pitcher_statcast, lookup_mlbam_id,
     StatcastBatter, StatcastPitcher,
 )
-from gkl.skipper import Skipper, load_anthropic_key, save_anthropic_key
+from gkl.skipper import Skipper, load_anthropic_key, save_anthropic_key, AVAILABLE_MODELS, DEFAULT_MODEL
 
 # Consistent team colors used across the entire app
 TEAM_A_COLOR = "#E8A735"  # warm amber/gold
@@ -6272,9 +6272,71 @@ class ApiKeyModal(Screen):
         self.dismiss(None)
 
 
+class ModelSelectModal(Screen):
+    """Modal for selecting a Claude model."""
+    BINDINGS = [("escape", "cancel", "Cancel")]
+    CSS = """
+    ModelSelectModal {
+        align: center middle;
+    }
+    #model-select-container {
+        width: 40;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #model-select-title {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #model-select-list {
+        height: auto;
+        max-height: 70%;
+    }
+    #model-select-list > ListItem {
+        height: 1;
+        padding: 0 1;
+    }
+    #model-select-list > ListItem.--highlight {
+        background: #3A5A3A;
+    }
+    """
+
+    def __init__(self, current_model_id: str) -> None:
+        super().__init__()
+        self._current = current_model_id
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="model-select-container"):
+            yield Static("Select Model", id="model-select-title")
+            yield ListView(id="model-select-list")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#model-select-list", ListView)
+        for model_id, label in AVAILABLE_MODELS:
+            prefix = "● " if model_id == self._current else "  "
+            item = ListItem(Label(prefix + label))
+            item._model_id = model_id
+            lv.mount(item)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        model_id = getattr(event.item, "_model_id", None)
+        if model_id:
+            self.dismiss(model_id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class AskSkipperScreen(Screen):
     """Chat screen for asking Skipper questions about your fantasy league."""
-    BINDINGS = [("escape", "go_back", "Back")]
+    BINDINGS = [("escape", "go_back", "Back"),
+                Binding("f2", "select_model", "Model (F2)", priority=True)]
     CSS = """
     #skipper-header {
         height: 1;
@@ -6282,6 +6344,12 @@ class AskSkipperScreen(Screen):
         text-style: bold;
         background: $primary;
         color: $foreground;
+    }
+    #skipper-model-bar {
+        height: 1;
+        content-align: center middle;
+        background: $surface;
+        color: $text-muted;
     }
     #skipper-messages {
         height: 1fr;
@@ -6321,16 +6389,50 @@ class AskSkipperScreen(Screen):
         self.league = league
         self.categories = categories
         self.skipper: Skipper | None = None
+        self._model_id = DEFAULT_MODEL
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static(" Ask Skipper ", id="skipper-header")
+        yield Static("", id="skipper-model-bar")
         yield VerticalScroll(id="skipper-messages")
         yield Static("Skipper is thinking...", id="skipper-status")
         yield Input(placeholder="Ask Skipper a question...", id="skipper-input")
         yield WrappingFooter()
 
+    def _update_model_bar(self) -> None:
+        label = next(
+            (lbl for mid, lbl in AVAILABLE_MODELS if mid == self._model_id),
+            self._model_id,
+        )
+        bar = Text()
+        bar.append("Model: ", style="dim")
+        bar.append(label, style="bold")
+        bar.append("  |  F2 to change", style="dim")
+        self.query_one("#skipper-model-bar", Static).update(bar)
+
+    def action_select_model(self) -> None:
+        self.app.push_screen(
+            ModelSelectModal(self._model_id),
+            callback=self._on_model_selected,
+        )
+
+    def _on_model_selected(self, model_id: str | None) -> None:
+        if model_id is None or model_id == self._model_id:
+            return
+        self._model_id = model_id
+        self._update_model_bar()
+        if self.skipper:
+            self.skipper.model = model_id
+        label = next(
+            (lbl for mid, lbl in AVAILABLE_MODELS if mid == model_id),
+            model_id,
+        )
+        self.notify(f"Switched to {label}")
+        self.query_one("#skipper-input", Input).focus()
+
     def on_mount(self) -> None:
+        self._update_model_bar()
         key = load_anthropic_key()
         if key:
             self._init_skipper(key)
@@ -6346,7 +6448,7 @@ class AskSkipperScreen(Screen):
 
     def _init_skipper(self, key: str) -> None:
         try:
-            self.skipper = Skipper(self.api, self.league, self.categories)
+            self.skipper = Skipper(self.api, self.league, self.categories, model=self._model_id)
             messages = self.query_one("#skipper-messages", VerticalScroll)
             messages.mount(
                 Static(
