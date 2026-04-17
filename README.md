@@ -12,7 +12,7 @@ The main screen shows head-to-head matchups for the current week with live scori
 
 **Key bindings:** `w` weekly | `d` daily | `n` season | `←→` change week | `e` select week
 
-![Matchup Scoreboard](docs/screenshots/scoreboard.svg)
+![Matchup Scoreboard](docs/screenshots/scoreboard2svg)
 
 ### Roto Standings
 
@@ -20,7 +20,7 @@ Full roto standings with per-category rankings and point totals across all teams
 
 **Key binding:** `s` from main screen
 
-![Roto Standings](docs/screenshots/roto-standings.svg)
+![Roto Standings](docs/screenshots/roto-standings2.svg)
 
 ### Head-to-Head Simulator
 
@@ -28,7 +28,7 @@ Simulates your roster against every other team in the league for any given week.
 
 **Key binding:** `h` from main screen
 
-![H2H Simulator](docs/screenshots/h2h-simulator.svg)
+![H2H Simulator](docs/screenshots/h2h-simulator2.svg)
 
 ### Roster Analysis
 
@@ -44,7 +44,7 @@ Switch between season, last 14 days, and last 30 days. View any team in the leag
 
 **Key binding:** `t` from main screen
 
-![Roster Analysis](docs/screenshots/roster-analysis.svg)
+![Roster Analysis](docs/screenshots/roster-analysis2.svg)
 
 ### Free Agent Browser
 
@@ -58,7 +58,7 @@ Browse available free agents with the same stats + Statcast data as the roster v
 
 **Key binding:** `f` from main screen
 
-![Free Agents](docs/screenshots/free-agents.svg)
+![Free Agents](docs/screenshots/free-agents2.svg)
 
 ### League Transactions
 
@@ -70,7 +70,7 @@ Explore transaction activity across the league with three views:
 
 **Key binding:** `x` from main screen
 
-![Transactions](docs/screenshots/transactions.svg)
+![Transactions](docs/screenshots/transactions2.svg)
 
 ### Player Explorer
 
@@ -84,7 +84,7 @@ Search pulls from the Yahoo Fantasy API and caches roster data locally for fast 
 
 **Key binding:** `p` from main screen
 
-![Player Explorer](docs/screenshots/player-explorer.svg)
+![Player Explorer](docs/screenshots/player-explorer2.svg)
 
 ### Watchlist
 
@@ -94,7 +94,7 @@ Track free agents you're interested in and compare them head-to-head against pla
 
 **Viewing the watchlist:** Press `l` from the main screen to see all watchlisted players with full stats, Statcast metrics, SGP values, and Yahoo rankings.
 
-![Watchlist](docs/screenshots/watchlist.svg)
+![Watchlist](docs/screenshots/watchlist2.svg)
 
 ### Player Comparison
 
@@ -108,7 +108,7 @@ Highlight any player on any screen and press `c` to compare them against a fanta
 - **Directional awareness:** Correctly handles stats where lower is better (ERA, WHIP for pitchers) vs. higher is better (HR, RBI, K%)
 - **Stat view switching:** Press `1` for season, `2` for last 14 days, or `3` for last 30 days — all players in the comparison update to the same time window
 
-![Player Comparison](docs/screenshots/comparison.svg)
+![Player Comparison](docs/screenshots/compare-player.svg)
 
 ### MLB Live Scoreboard
 
@@ -124,7 +124,7 @@ Real-time MLB game scores with inline linescores, pitching matchups, and fantasy
 
 **Key binding:** `g` from main screen
 
-![MLB Scoreboard](docs/screenshots/mlb-scoreboard.svg)
+![MLB Scoreboard](docs/screenshots/mlb-scoreboard2.svg)
 
 ### Box Score
 
@@ -132,7 +132,7 @@ Full box score view for any MLB game with batting and pitching stats. Fantasy ro
 
 **Key binding:** `Enter` on a game card in the MLB Scoreboard, or click on a game card
 
-![Box Score](docs/screenshots/box-score.svg)
+![Box Score](docs/screenshots/mlb-scoreboard2a.svg)
 
 ### Ask Skipper (AI Assistant)
 
