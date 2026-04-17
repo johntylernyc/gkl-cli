@@ -1,6 +1,6 @@
 # GKL TUI — Fantasy Baseball Command Center
 
-A terminal-based application for Yahoo Fantasy Baseball leagues. Combines league data, advanced analytics, and real-time MLB scores into a single interface you can run from any terminal.
+A terminal-based application for Yahoo Fantasy Baseball leagues. Combines league data, advanced analytics, and real-time MLB scores into a single interface you can run from any terminal — or access from the web at [gklbaseball.com](https://gklbaseball.com).
 
 Built with [Textual](https://github.com/Textualize/textual) for the terminal UI.
 
@@ -98,23 +98,61 @@ Track free agents you're interested in and compare them head-to-head against pla
 
 ### Player Comparison
 
-From the Watchlist screen, highlight a player and press `c` to compare them against a fantasy team's roster:
+Highlight any player on any screen and press `c` to compare them against a fantasy team's roster:
 
-- **Position matching:** Automatically finds all roster players who share the same position(s) as the watchlisted player
-- **Side-by-side stats:** League stats and Statcast metrics for both the watchlisted player and each roster player
-- **Delta rows:** The difference for every stat between the two players — green means the watchlisted player is better, red means worse
+- **Available everywhere:** Compare from the Scoreboard, Roster, Free Agents, Transactions, or Watchlist screens — anywhere a player is highlighted in a table
+- **Position matching:** Automatically finds all roster players who share the same position(s) as the selected player
+- **Side-by-side stats:** League stats and Statcast metrics for both the selected player and each roster player
+- **Delta rows:** The difference for every stat between the two players — green means the selected player is better, red means worse
 - **SGP delta:** Net standings gain/loss if you made the swap — the most actionable number for roster decisions
 - **Directional awareness:** Correctly handles stats where lower is better (ERA, WHIP for pitchers) vs. higher is better (HR, RBI, K%)
+- **Stat view switching:** Press `1` for season, `2` for last 14 days, or `3` for last 30 days — all players in the comparison update to the same time window
 
 ![Player Comparison](docs/screenshots/comparison.svg)
 
 ### MLB Live Scoreboard
 
-Real-time MLB game scores and linescore data pulled from the MLB Stats API. Shows today's games with current inning, score, and pitching matchups.
+Real-time MLB game scores with inline linescores, pitching matchups, and fantasy roster integration. Features:
+
+- **Arrow key navigation:** Move between game cards with arrow keys in a grid layout, with a gold highlight on the focused card
+- **Box score on Enter:** Press Enter on any game card to open a full box score with batting and pitching lines
+- **Fantasy roster highlights:** Games with your fantasy players are marked with a gold border and star icons showing which of your players are in each game
+- **Inline linescores:** Live and final games show inning-by-inning run scoring directly on the card
+- **Auto-refresh:** Scoreboard automatically refreshes every 45 seconds when live games are in progress
+- **Day navigation:** Browse past and future dates with `,`/`.` keys, or press `t` to jump back to today
+- **MLB.TV integration:** Press `m` to open any game's MLB.TV stream in your browser
 
 **Key binding:** `g` from main screen
 
 ![MLB Scoreboard](docs/screenshots/mlb-scoreboard.svg)
+
+### Box Score
+
+Full box score view for any MLB game with batting and pitching stats. Fantasy roster players are highlighted so you can quickly spot your players' performances.
+
+**Key binding:** `Enter` on a game card in the MLB Scoreboard, or click on a game card
+
+![Box Score](docs/screenshots/box-score.svg)
+
+### Ask Skipper (AI Assistant)
+
+Chat with an AI assistant that has full context on your league — rosters, standings, stats, and matchups. Ask questions about your team, get trade analysis, or explore strategy. Powered by Claude.
+
+Requires an Anthropic API key (entered on first use and saved locally).
+
+**Key binding:** `a` from main screen
+
+![Ask Skipper](docs/screenshots/ask-skipper.svg)
+
+### Settings
+
+Configure application preferences including your default team selection.
+
+**Key binding:** `C` (shift+c) from main screen
+
+### Web Access
+
+In addition to the terminal app, GKL is deployed as a web application at [gklbaseball.com](https://gklbaseball.com). Log in with your Yahoo account to access all the same features from any browser — no installation required.
 
 ## Installation
 
@@ -180,11 +218,16 @@ From the main scoreboard:
 | `p` | Player Explorer |
 | `l` | Watchlist |
 | `g` | MLB Scoreboard |
+| `a` | Ask Skipper (AI) |
+| `c` | Compare player to roster |
+| `i` | Player Detail |
 | `w` | Weekly stats view |
 | `d` | Daily stats view |
 | `n` | Season stats view |
 | `←` `→` | Previous/next week |
 | `e` | Select specific week |
+| `L` | Switch league |
+| `C` | Settings |
 | `r` | Refresh data |
 | `q` | Quit |
 
