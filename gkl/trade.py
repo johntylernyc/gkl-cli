@@ -26,6 +26,8 @@ class TradeTarget:
     team_name: str
     sgp: float | None          # target player's SGP
     net_sgp: float             # target SGP − outgoing SGP (positive = upgrade)
+    roto_delta: float = 0.0    # change in roto points for team A
+    h2h_win_delta: int = 0     # change in hypothetical H2H wins for team A
 
 
 @dataclass
@@ -801,28 +803,48 @@ def find_trade_targets(
     outgoing_player: PlayerStats,
     my_team_key: str,
     all_rosters: dict[str, list[PlayerStats]],
+    all_teams: list[TeamStats],
     team_names: dict[str, str],
+    categories: list[StatCategory],
     sgp_calc: SGPCalculator | None,
     max_results: int = 25,
 ) -> list[TradeTarget]:
     """Find the best trade targets for a player you want to trade away.
 
-    Scans all opposing rosters for players who share at least one position
-    with the outgoing player, scores them by net SGP improvement, and
-    returns a ranked list.
+    Scans all opposing rosters for position-eligible players. For each
+    candidate, computes:
+    - Net SGP (target SGP − outgoing SGP)
+    - Roto points delta (how the trade changes your roto total)
+    - H2H win delta (how many more/fewer hypothetical matchups you'd win)
 
-    Args:
-        outgoing_player: The player being traded away.
-        my_team_key: The user's team key (excluded from search).
-        all_rosters: {team_key: roster} for all teams in the league.
-        team_names: {team_key: team_name} mapping.
-        sgp_calc: SGP calculator (may be None; targets still ranked by SGP if available).
-        max_results: Maximum number of targets to return.
+    Returns a ranked list sorted by roto points delta.
     """
     outgoing_positions = {pos.strip() for pos in outgoing_player.position.split(",")}
     outgoing_sgp = sgp_calc.player_sgp(outgoing_player) if sgp_calc else None
 
-    targets: list[TradeTarget] = []
+    scored = [c for c in categories if not c.is_only_display]
+    my_roster = all_rosters.get(my_team_key, [])
+    my_team = next((t for t in all_teams if t.team_key == my_team_key), None)
+    if my_team is None:
+        return []
+
+    # Compute baseline roto and H2H for my team (before any trade)
+    baseline_roto = compute_roto(all_teams, scored)
+    baseline_pts = 0.0
+    for r in baseline_roto:
+        if r["team_key"] == my_team_key:
+            baseline_pts = r["total"]
+            break
+
+    baseline_h2h = simulate_h2h(all_teams, scored)
+    baseline_pr = compute_power_rankings(baseline_h2h, all_teams)
+    baseline_wins = 0
+    for s in baseline_pr:
+        if s.team_key == my_team_key:
+            baseline_wins = s.total_wins
+            break
+
+    candidates: list[TradeTarget] = []
 
     for team_key, roster in all_rosters.items():
         if team_key == my_team_key:
@@ -831,11 +853,9 @@ def find_trade_targets(
         team_name = team_names.get(team_key, team_key)
 
         for player in roster:
-            # Skip players on IL/NA
             if player.selected_position in ("IL", "IL+", "NA"):
                 continue
 
-            # Check position overlap
             player_positions = {pos.strip() for pos in player.position.split(",")}
             if not (outgoing_positions & player_positions):
                 continue
@@ -849,7 +869,7 @@ def find_trade_targets(
             else:
                 net = 0.0
 
-            targets.append(TradeTarget(
+            candidates.append(TradeTarget(
                 player=player,
                 team_key=team_key,
                 team_name=team_name,
@@ -857,6 +877,43 @@ def find_trade_targets(
                 net_sgp=net,
             ))
 
-    # Sort by net SGP descending (best upgrades first)
-    targets.sort(key=lambda t: t.net_sgp, reverse=True)
-    return targets[:max_results]
+    # Pre-filter to top candidates by SGP before running expensive simulations
+    candidates.sort(key=lambda t: t.net_sgp, reverse=True)
+    candidates = candidates[:max_results * 2]  # keep extra for re-ranking
+
+    # Compute roto and H2H deltas for each candidate
+    for target in candidates:
+        # Apply trade to my team
+        trade_team = apply_trade_to_team(
+            my_team, my_roster,
+            players_out=[outgoing_player],
+            players_in=[target.player],
+            categories=categories,
+        )
+
+        # Build modified team list
+        teams_after = []
+        for t in all_teams:
+            if t.team_key == my_team_key:
+                teams_after.append(trade_team)
+            else:
+                teams_after.append(t)
+
+        # Roto delta
+        roto_after = compute_roto(teams_after, scored)
+        for r in roto_after:
+            if r["team_key"] == my_team_key:
+                target.roto_delta = r["total"] - baseline_pts
+                break
+
+        # H2H win delta
+        h2h_after = simulate_h2h(teams_after, scored)
+        pr_after = compute_power_rankings(h2h_after, teams_after)
+        for s in pr_after:
+            if s.team_key == my_team_key:
+                target.h2h_win_delta = s.total_wins - baseline_wins
+                break
+
+    # Sort by roto delta descending
+    candidates.sort(key=lambda t: t.roto_delta, reverse=True)
+    return candidates[:max_results]

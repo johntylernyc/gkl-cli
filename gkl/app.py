@@ -6986,11 +6986,17 @@ class TradeAnalyzerScreen(Screen):
             # Include my roster
             all_rosters[self._team_a_key] = self._roster_a
 
-            self._trade_targets = find_trade_targets(
+            self.query_one("#trade-loading-status", Static).update(
+                "Computing roto and H2H impact for each target..."
+            )
+            self._trade_targets = await asyncio.to_thread(
+                find_trade_targets,
                 self._block_player,
                 self._team_a_key,
                 all_rosters,
+                cache.all_teams,
                 cache.team_names,
+                self.categories,
                 cache.sgp_calc,
             )
 
@@ -7031,17 +7037,19 @@ class TradeAnalyzerScreen(Screen):
         target_table.cursor_type = "row"
         target_table.zebra_stripes = True
         target_table._players = self._trade_targets
-        target_table.add_columns("Player", "Pos", "Team", "SGP", "Net SGP")
+        target_table.add_columns("Player", "Pos", "Team", "SGP", "ΔSGP", "ΔRoto", "ΔH2H")
 
         for t in self._trade_targets:
             sgp_str = f"{t.sgp:+.1f}" if t.sgp is not None else "N/A"
+
             net_str = f"{t.net_sgp:+.1f}"
-            if t.net_sgp > 0:
-                net_style = "bold green"
-            elif t.net_sgp < 0:
-                net_style = "bold red"
-            else:
-                net_style = "dim"
+            net_style = "bold green" if t.net_sgp > 0 else "bold red" if t.net_sgp < 0 else "dim"
+
+            roto_str = f"{t.roto_delta:+.1f}"
+            roto_style = "bold green" if t.roto_delta > 0.1 else "bold red" if t.roto_delta < -0.1 else "dim"
+
+            h2h_str = f"{t.h2h_win_delta:+d}" if t.h2h_win_delta != 0 else "—"
+            h2h_style = "bold green" if t.h2h_win_delta > 0 else "bold red" if t.h2h_win_delta < 0 else "dim"
 
             target_table.add_row(
                 Text(t.player.name[:20], style="bold"),
@@ -7049,6 +7057,8 @@ class TradeAnalyzerScreen(Screen):
                 Text(t.team_name[:15], style="dim"),
                 Text(sgp_str, justify="right"),
                 Text(net_str, style=net_style, justify="right"),
+                Text(roto_str, style=roto_style, justify="right"),
+                Text(h2h_str, style=h2h_style, justify="right"),
             )
 
     def _run_block_analysis(self, target) -> None:
