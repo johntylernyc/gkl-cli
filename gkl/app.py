@@ -6929,48 +6929,81 @@ class TradeAnalyzerScreen(Screen):
 
         # --- Roto Impact ---
         await scroll.mount(Static(
-            Text(" ROTO STANDINGS IMPACT ", style="bold"),
+            Text(" ROTO STANDINGS ", style="bold"),
             classes="trade-section-label",
         ))
 
         roto_line = Text()
         rank_delta = impact.roto_rank_before_a - impact.roto_rank_after_a  # positive = improved
         pts_delta = impact.roto_points_after_a - impact.roto_points_before_a
-        roto_line.append(f"  Before: ", style="dim")
+        roto_line.append(f"  Rank: ", style="dim")
         roto_line.append(f"#{impact.roto_rank_before_a}", style="bold")
-        roto_line.append(f" ({impact.roto_points_before_a:.1f} pts)", style="dim")
-        roto_line.append(f"   →   After: ", style="dim")
+        roto_line.append(f"  →  ", style="dim")
         roto_line.append(f"#{impact.roto_rank_after_a}", style="bold")
-        roto_line.append(f" ({impact.roto_points_after_a:.1f} pts)", style="dim")
         if rank_delta > 0:
-            roto_line.append(f"   ▲ {rank_delta} spots", style="bold green")
+            roto_line.append(f"  ▲ {rank_delta}", style="bold green")
         elif rank_delta < 0:
-            roto_line.append(f"   ▼ {abs(rank_delta)} spots", style="bold red")
-        else:
-            roto_line.append(f"   — no change", style="dim")
+            roto_line.append(f"  ▼ {abs(rank_delta)}", style="bold red")
         await scroll.mount(Static(roto_line, classes="trade-result-label"))
+
+        roto_pts = Text()
+        roto_pts.append(f"  Points: ", style="dim")
+        roto_pts.append(f"{impact.roto_points_before_a:.1f}", style="bold")
+        roto_pts.append(f"  →  ", style="dim")
+        roto_pts.append(f"{impact.roto_points_after_a:.1f}", style="bold")
+        if pts_delta > 0:
+            roto_pts.append(f"  +{pts_delta:.1f}", style="bold green")
+        elif pts_delta < 0:
+            roto_pts.append(f"  {pts_delta:.1f}", style="bold red")
+        await scroll.mount(Static(roto_pts, classes="trade-result-label"))
+
+        # Explain if rank drops despite points gain
+        if rank_delta < 0 and pts_delta > 0:
+            note = Text()
+            note.append(f"  Note: ", style="dim italic")
+            note.append(f"your points improve but the trade partner gains more, "
+                        f"pushing them ahead of you", style="dim italic")
+            await scroll.mount(Static(note, classes="trade-result-label"))
 
         await scroll.mount(Static(""))  # spacer
 
-        # --- H2H Power Ranking Impact ---
+        # --- H2H Hypothetical Impact ---
         await scroll.mount(Static(
-            Text(" H2H POWER RANKING IMPACT ", style="bold"),
+            Text(" H2H HYPOTHETICAL ", style="bold"),
             classes="trade-section-label",
         ))
 
+        h2h_desc = Text()
+        h2h_desc.append(
+            "  Simulates your season stats vs every other team — "
+            "how many would you beat?",
+            style="dim italic",
+        )
+        await scroll.mount(Static(h2h_desc, classes="trade-result-label"))
+
         h2h_line = Text()
-        h2h_line.append(f"  Before: ", style="dim")
+        h2h_line.append(f"  Record: ", style="dim")
         h2h_line.append(f"{impact.h2h_before_a.record_str}", style="bold")
-        h2h_line.append(f" ({impact.h2h_before_a.win_pct:.3f})", style="dim")
-        h2h_line.append(f"   →   After: ", style="dim")
+        h2h_line.append(f"  →  ", style="dim")
         h2h_line.append(f"{impact.h2h_after_a.record_str}", style="bold")
-        h2h_line.append(f" ({impact.h2h_after_a.win_pct:.3f})", style="dim")
         win_delta = impact.h2h_after_a.total_wins - impact.h2h_before_a.total_wins
         if win_delta > 0:
-            h2h_line.append(f"   +{win_delta}W", style="bold green")
+            h2h_line.append(f"  +{win_delta}W", style="bold green")
         elif win_delta < 0:
-            h2h_line.append(f"   {win_delta}W", style="bold red")
+            h2h_line.append(f"  {win_delta}W", style="bold red")
         await scroll.mount(Static(h2h_line, classes="trade-result-label"))
+
+        h2h_pct = Text()
+        h2h_pct.append(f"  Win %: ", style="dim")
+        h2h_pct.append(f"{impact.h2h_before_a.win_pct:.1%}", style="bold")
+        h2h_pct.append(f"  →  ", style="dim")
+        h2h_pct.append(f"{impact.h2h_after_a.win_pct:.1%}", style="bold")
+        pct_delta = impact.h2h_after_a.win_pct - impact.h2h_before_a.win_pct
+        if pct_delta > 0.001:
+            h2h_pct.append(f"  +{pct_delta:.1%}", style="bold green")
+        elif pct_delta < -0.001:
+            h2h_pct.append(f"  {pct_delta:.1%}", style="bold red")
+        await scroll.mount(Static(h2h_pct, classes="trade-result-label"))
 
         await scroll.mount(Static(""))  # spacer
 
