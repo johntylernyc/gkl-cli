@@ -77,11 +77,13 @@ class H2HHypothetical:
 
 @dataclass
 class RotoEntry:
-    """One team's roto ranking."""
+    """One team's roto ranking with batting/pitching breakdown."""
     team_key: str
     name: str
     rank: int
     total: float
+    batting: float = 0.0
+    pitching: float = 0.0
 
 @dataclass
 class TradeImpact:
@@ -396,9 +398,16 @@ def compute_trade_impact(
         else:
             teams_after.append(t)
 
-    # Roto rankings
+    # Roto rankings — overall, batting, pitching
     roto_before = compute_roto(teams_before, scored)
     roto_after = compute_roto(teams_after, scored)
+
+    bat_cats = [c for c in scored if c.position_type == "B"]
+    pitch_cats = [c for c in scored if c.position_type == "P"]
+    roto_bat_before = compute_roto(teams_before, bat_cats)
+    roto_bat_after = compute_roto(teams_after, bat_cats)
+    roto_pitch_before = compute_roto(teams_before, pitch_cats)
+    roto_pitch_after = compute_roto(teams_after, pitch_cats)
 
     def _roto_rank(results: list[dict], team_key: str) -> tuple[int, float]:
         for i, r in enumerate(results, 1):
@@ -406,18 +415,40 @@ def compute_trade_impact(
                 return i, r["total"]
         return 0, 0.0
 
+    def _roto_pts(results: list[dict], team_key: str) -> float:
+        for r in results:
+            if r["team_key"] == team_key:
+                return r["total"]
+        return 0.0
+
     rank_before_a, pts_before_a = _roto_rank(roto_before, side_a.team_key)
     rank_after_a, pts_after_a = _roto_rank(roto_after, side_a.team_key)
     rank_before_b, pts_before_b = _roto_rank(roto_before, side_b.team_key)
     rank_after_b, pts_after_b = _roto_rank(roto_after, side_b.team_key)
 
-    # Build full league roto standings for display
+    # Build full league roto standings ordered by AFTER-trade total
+    # Include batting/pitching subtotals
+    bat_before_by_key = {r["team_key"]: r["total"] for r in roto_bat_before}
+    bat_after_by_key = {r["team_key"]: r["total"] for r in roto_bat_after}
+    pitch_before_by_key = {r["team_key"]: r["total"] for r in roto_pitch_before}
+    pitch_after_by_key = {r["team_key"]: r["total"] for r in roto_pitch_after}
+    before_by_key = {r["team_key"]: r["total"] for r in roto_before}
+
     standings_before = [
-        RotoEntry(team_key=r["team_key"], name=r["name"], rank=i, total=r["total"])
+        RotoEntry(
+            team_key=r["team_key"], name=r["name"], rank=i, total=r["total"],
+            batting=bat_before_by_key.get(r["team_key"], 0),
+            pitching=pitch_before_by_key.get(r["team_key"], 0),
+        )
         for i, r in enumerate(roto_before, 1)
     ]
+    # After standings sorted by after-trade total (compute_roto already sorts)
     standings_after = [
-        RotoEntry(team_key=r["team_key"], name=r["name"], rank=i, total=r["total"])
+        RotoEntry(
+            team_key=r["team_key"], name=r["name"], rank=i, total=r["total"],
+            batting=bat_after_by_key.get(r["team_key"], 0),
+            pitching=pitch_after_by_key.get(r["team_key"], 0),
+        )
         for i, r in enumerate(roto_after, 1)
     ]
 

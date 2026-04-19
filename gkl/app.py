@@ -6982,7 +6982,7 @@ class TradeAnalyzerScreen(Screen):
 
         # --- Roto Standings Table ---
         await scroll.mount(Static(
-            Text(" ROTO STANDINGS ", style="bold"),
+            Text(" ROTO STANDINGS (POST-TRADE) ", style="bold"),
             classes="trade-section-label",
         ))
 
@@ -6991,19 +6991,26 @@ class TradeAnalyzerScreen(Screen):
         await scroll.mount(roto_table)
         roto_table.cursor_type = "none"
         roto_table.zebra_stripes = True
-        roto_table.add_columns("", "Team", "Before", "After", "Δ")
+        roto_table.add_columns(
+            "", "Team",
+            "Ovr", "Δ",
+            "│",
+            "Bat", "Δ",
+            "│",
+            "Pit", "Δ",
+        )
 
-        # Build a lookup from after standings
-        after_by_key = {r.team_key: r for r in impact.roto_standings_after}
+        # Build before lookup
+        before_by_key = {r.team_key: r for r in impact.roto_standings_before}
 
-        for rb in impact.roto_standings_before:
-            ra = after_by_key.get(rb.team_key, rb)
+        # Iterate in after-trade order (already sorted by compute_roto)
+        for ra in impact.roto_standings_after:
+            rb = before_by_key.get(ra.team_key, ra)
             rank_change = rb.rank - ra.rank  # positive = improved
-            pts_change = ra.total - rb.total
 
             # Highlight the two traded teams
-            is_team_a = rb.team_key == self._team_a_key
-            is_team_b = rb.team_key == self._team_b_key
+            is_team_a = ra.team_key == self._team_a_key
+            is_team_b = ra.team_key == self._team_b_key
             if is_team_a:
                 name_style = f"bold {TEAM_A_COLOR}"
             elif is_team_b:
@@ -7022,12 +7029,41 @@ class TradeAnalyzerScreen(Screen):
                 rank_str = "—"
                 rank_style = "dim"
 
+            # Batting delta
+            bat_delta = ra.batting - rb.batting
+            if bat_delta > 0.1:
+                bat_d_str = f"+{bat_delta:.0f}"
+                bat_d_style = "green"
+            elif bat_delta < -0.1:
+                bat_d_str = f"{bat_delta:.0f}"
+                bat_d_style = "red"
+            else:
+                bat_d_str = "—"
+                bat_d_style = "dim"
+
+            # Pitching delta
+            pitch_delta = ra.pitching - rb.pitching
+            if pitch_delta > 0.1:
+                pitch_d_str = f"+{pitch_delta:.0f}"
+                pitch_d_style = "green"
+            elif pitch_delta < -0.1:
+                pitch_d_str = f"{pitch_delta:.0f}"
+                pitch_d_style = "red"
+            else:
+                pitch_d_str = "—"
+                pitch_d_style = "dim"
+
             roto_table.add_row(
-                Text(f"#{rb.rank}", style="dim"),
-                Text(rb.name[:20], style=name_style),
-                Text(f"{rb.total:.1f}", justify="right"),
-                Text(f"{ra.total:.1f}", justify="right"),
+                Text(f"#{ra.rank}", style="bold" if is_team_a or is_team_b else "dim"),
+                Text(ra.name[:18], style=name_style),
+                Text(f"{ra.total:.0f}", justify="right", style="bold"),
                 Text(rank_str, style=rank_style, justify="right"),
+                Text("│", style="dim"),
+                Text(f"{ra.batting:.0f}", justify="right"),
+                Text(bat_d_str, style=bat_d_style, justify="right"),
+                Text("│", style="dim"),
+                Text(f"{ra.pitching:.0f}", justify="right"),
+                Text(pitch_d_str, style=pitch_d_style, justify="right"),
             )
 
         # --- H2H Weekly Replay ---
