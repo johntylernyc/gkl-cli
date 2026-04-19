@@ -173,13 +173,17 @@ This is going to be a fairly complex feature, so think through it well. While de
 
 **Decisions:**
 
-21. **Category multi-select modal with toggle pattern.** Users select categories to improve via a ListView where Enter toggles selection (★ marker). Enter confirms, Escape cancels. Each category shows position type (bat/pit) and direction (higher ↑ / lower ↓).
+21. **Category multi-select modal with toggle pattern.** Users select categories to improve via a ListView where Enter toggles selection (★ marker). `d` confirms and runs discovery. Escape cancels. Each category shows position type (bat/pit) and direction (higher ↑ / lower ↓).
 
-22. **Scenario = target + suggested offer.** Discovery results pair each target player with a suggested trade piece from the user's roster. The offer is chosen by closest SGP value match with position overlap — a realistic deal, not a fleece attempt.
+22. **Scenario = target + suggested offer, cross-position preferred.** Discovery results pair each target player with a suggested trade piece from the user's roster. Offers prefer cross-position trades (batter for pitcher and vice versa) since both sides fill different needs — this produces more realistic and mutually beneficial deals than same-position swaps.
 
-23. **Scoring: category strength → SGP pre-filter → roto delta ranking.** Opposing players are scored by raw value in target categories, pre-filtered to top candidates, then each scenario gets a full roto simulation. Final list sorted by ΔRoto.
+23. **Scoring: category strength → SGP pre-filter → roto delta ranking.** Opposing players are scored by raw value in target categories, pre-filtered to top candidates, then each scenario gets a full roto + H2H simulation. Final list sorted by ΔRoto.
 
 24. **Selecting a scenario transitions to full analysis.** Same pattern as Trading Block — sets up the two-team trade and runs the full Phase 1 analysis with H2H replay.
+
+25. **Partner roto filter applied to both Trading Block and Discovery.** Deals where the trade partner loses >15 roto points are filtered out as unrealistic. A "Partner" column shows the partner's roto impact — green means they benefit (more likely to accept), red means they lose significantly.
+
+26. **Bench players included as trade pieces.** Initially excluded BN players from offers, but pitchers rotate through the bench in daily roster leagues and bench depth is valid trade currency. All non-IL/NA players are now considered.
 
 ### Tasks
 
@@ -190,15 +194,60 @@ This is going to be a fairly complex feature, so think through it well. While de
 | 31 | Add discovery mode to `TradeModeSelectorModal` | ✅ Done |
 | 32 | Wire discovery flow in `TradeAnalyzerScreen` | ✅ Done |
 | 33 | Add scenario selection → full analysis transition | ✅ Done |
+| 34 | Fix category modal confirm key (Enter → d) | ✅ Done |
+| 35 | Improve offer logic: cross-position preference | ✅ Done |
+| 36 | Add partner roto filter + column to both modes | ✅ Done |
+| 37 | Include bench players in offers | ✅ Done |
+| 38 | Add ΔRoto, ΔWin%, Partner columns to discovery results | ✅ Done |
+| 39 | Widen trade mode selector modal | ✅ Done |
+
+### Post-Phase Improvements (completed 2026-04-19)
+
+**Full stat columns in roster tables:**
+- Roster tables in the left pane now show all league scoring categories (batting + pitching) for each player
+- Batting stats dimmed for pitchers, pitching stats dimmed for batters
+- Press `1` for season stats, `2` for last 30 days — both teams re-fetch and re-render
+- Left pane widened to 60% (right pane 40%) to accommodate stat columns
+
+**Detailed error reporting for AI summary:**
+- API errors now include the full error body for debugging
+
+### Tasks
+
+| # | Task | Status |
+|---|------|--------|
+| 40 | Add full stat columns to roster tables | ✅ Done |
+| 41 | Add season/L30 view toggle (1/2) | ✅ Done |
+| 42 | Adjust pane split to 60/40 | ✅ Done |
+| 43 | Improve AI error messages | ✅ Done |
 
 ---
 
-## Feature Summary
+## Spec Coverage
 
-All five phases are complete:
+Checking the original requirements against what's been built:
 
-1. **Analyze Proposed Trade** — select players from two rosters, see category impact, roto standings, H2H replay
-2. **H2H Weekly Replay** — per-player weekly stats replayed against actual matchup opponents
-3. **Trading Block** — select a player to trade, system finds and ranks targets by ΔSGP/ΔRoto/ΔWin%
-4. **AI Summary** — Claude-powered narrative analysis with pros/cons and trade talking points
-5. **Trade Discovery** — select categories to improve, system finds scenarios pairing targets with suggested offers 
+### Capabilities (all delivered ✅)
+- ✅ Analyze a proposed trade
+- ✅ Find potential trading partners (Trading Block + Discovery)
+- ✅ Contextualize in raw stats + roto/H2H impact
+
+### Analysis insights (lines 34-39)
+- ✅ (a) How trade affects stats season to date — Category Impact table
+- ✅ (b) Roto standings impact — Full league table with batting/pitching breakdown
+- ✅ (c) H2H matchup changes — Weekly replay with per-player weekly stats
+- ⬜ (d) Projected roto ranking through end of season — not yet implemented
+- ⬜ (e) Projected W/L/T for remaining H2H matchups — not yet implemented
+
+### Three modes (all delivered ✅)
+- ✅ Trade Discovery (category-based search)
+- ✅ Trading Block (player-based search)
+- ✅ Analyze Proposed Trade (manual player selection)
+
+### AI Summary (all delivered ✅)
+- ✅ Pros/cons
+- ✅ How to sell the deal
+- ✅ How to decline/counter
+
+### Remaining work
+Items (d) and (e) from the original spec require projecting each player's stats forward through the remaining season weeks and re-simulating roto standings and H2H matchups with those projections. The infrastructure for future-week projections exists in the scoreboard feature (`_project_weekly_stats`) and could be adapted for the trade analyzer. These are enhancements that would add value but the core feature is fully functional without them. 
