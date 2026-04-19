@@ -942,3 +942,73 @@ def find_trade_targets(
     # Sort by roto delta descending
     candidates.sort(key=lambda t: t.roto_delta, reverse=True)
     return candidates[:max_results]
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: AI Trade Summary
+# ---------------------------------------------------------------------------
+
+def build_trade_summary_prompt(
+    impact: TradeImpact,
+    side_a_name: str,
+    side_b_name: str,
+    side_a_players: list[PlayerStats],
+    side_b_players: list[PlayerStats],
+    h2h_replay: H2HReplay | None = None,
+) -> str:
+    """Build a prompt for Claude to analyze a trade."""
+    lines = [
+        "You are a fantasy baseball analyst. Analyze this trade concisely.",
+        "",
+        f"**{side_a_name}** sends: {', '.join(f'{p.name} ({p.position})' for p in side_a_players)}",
+        f"**{side_b_name}** sends: {', '.join(f'{p.name} ({p.position})' for p in side_b_players)}",
+        "",
+        "Category impact for " + side_a_name + ":",
+    ]
+    for ci in impact.cat_impacts:
+        if ci.delta != 0:
+            direction = "+" if ci.favorable else "-"
+            lines.append(f"  {ci.display_name}: {ci.before} → {ci.after} ({direction})")
+
+    lines.append("")
+    lines.append(f"Roto standings: #{impact.roto_rank_before_a} → #{impact.roto_rank_after_a} "
+                 f"({impact.roto_points_before_a:.1f} → {impact.roto_points_after_a:.1f} pts)")
+
+    if h2h_replay:
+        lines.append(f"H2H record: {h2h_replay.actual_season_w}-{h2h_replay.actual_season_l}-{h2h_replay.actual_season_t}"
+                     f" → {h2h_replay.trade_season_w}-{h2h_replay.trade_season_l}-{h2h_replay.trade_season_t}")
+        flips = [w for w in h2h_replay.weeks if w.changed]
+        if flips:
+            lines.append(f"Matchup flips: {len(flips)} weeks changed outcome")
+
+    lines.append(f"\nTrade partner ({side_b_name}):")
+    lines.append(f"  Roto: #{impact.roto_rank_before_b} → #{impact.roto_rank_after_b}")
+
+    lines.append("")
+    lines.append("Provide:")
+    lines.append("1. **Verdict**: One sentence — is this a good trade for " + side_a_name + "?")
+    lines.append("2. **Pros** (2-3 bullets)")
+    lines.append("3. **Cons** (2-3 bullets)")
+    lines.append("4. **Pitch**: 2-3 sentences to sell this deal to " + side_b_name)
+    lines.append("5. **Counter**: If declining, 2-3 sentences suggesting what you'd want instead")
+    lines.append("")
+    lines.append("Be specific — reference actual stat changes and standings impact. Keep it under 200 words total.")
+
+    return "\n".join(lines)
+
+
+async def get_trade_ai_summary(
+    prompt: str,
+    api_key: str,
+    model: str = "claude-sonnet-4-6",
+) -> str:
+    """Call Claude for a trade analysis summary."""
+    import anthropic
+
+    client = anthropic.AsyncAnthropic(api_key=api_key)
+    response = await client.messages.create(
+        model=model,
+        max_tokens=512,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.content[0].text

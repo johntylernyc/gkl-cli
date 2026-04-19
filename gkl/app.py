@@ -7216,6 +7216,11 @@ class TradeAnalyzerScreen(Screen):
             )
 
             await self._render_results(impact, h2h_replay, h2h_hypo)
+
+            # AI summary if API key is available
+            api_key = load_anthropic_key()
+            if api_key:
+                await self._render_ai_summary(impact, h2h_replay, api_key)
         except Exception as e:
             self.notify(f"Analysis failed: {e}", severity="error")
         finally:
@@ -7487,6 +7492,48 @@ class TradeAnalyzerScreen(Screen):
         elif b_win_delta < 0:
             partner_h2h.append(f"  {b_win_delta}W", style="red")
         await scroll.mount(Static(partner_h2h, classes="trade-result-label"))
+
+    async def _render_ai_summary(self, impact, h2h_replay, api_key: str) -> None:
+        from gkl.trade import build_trade_summary_prompt, get_trade_ai_summary
+        from gkl.skipper import DEFAULT_MODEL
+
+        scroll = self.query_one("#trade-right-scroll", VerticalScroll)
+
+        await scroll.mount(Static(""))
+        await scroll.mount(Static(
+            Text(" AI ANALYSIS ", style="bold"),
+            classes="trade-section-label",
+        ))
+
+        loading = Static(
+            Text("  Generating analysis...", style="dim italic"),
+            classes="trade-result-label",
+        )
+        await scroll.mount(loading)
+        scroll.scroll_end(animate=False)
+
+        try:
+            players_out_a = [p for p in self._roster_a if p.player_key in self._selected_a]
+            players_out_b = [p for p in self._roster_b if p.player_key in self._selected_b]
+
+            prompt = build_trade_summary_prompt(
+                impact, self._team_a_name, self._team_b_name,
+                players_out_a, players_out_b, h2h_replay,
+            )
+            summary = await get_trade_ai_summary(prompt, api_key, DEFAULT_MODEL)
+
+            await loading.remove()
+            await scroll.mount(Static(
+                Text(f"  {summary}"),
+                classes="trade-result-label",
+            ))
+        except Exception as e:
+            await loading.remove()
+            await scroll.mount(Static(
+                Text(f"  Could not generate AI analysis: {e}", style="dim italic"),
+                classes="trade-result-label",
+            ))
+        scroll.scroll_end(animate=False)
 
     def action_go_back(self) -> None:
         self.app.pop_screen()
