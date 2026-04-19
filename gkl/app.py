@@ -6907,9 +6907,7 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
             score_line.append(f"{m.team_a.name[:18]:<18}", style=f"bold {TEAM_A_COLOR}")
             if is_future:
                 aw, bw, t = self._compute_projected_record(m)
-                score_line.append(f"{aw:>2}", style=f"{TEAM_A_COLOR}")
-                score_line.append(f"-{t}-", style="dim")
-                score_line.append(f"{bw:<2}", style=f"{TEAM_B_COLOR}")
+                score_line.append(f"  {aw}W-{bw}L-{t}T  ", style="dim")
             else:
                 score_line.append(f"{m.team_a.points:>5.0f}", style=f"{TEAM_A_COLOR}")
                 score_line.append("  ")
