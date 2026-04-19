@@ -33,6 +33,20 @@ class TradeTarget:
 
 
 @dataclass
+class TradeScenario:
+    """A discovery result: target player + suggested trade piece."""
+    target: PlayerStats         # player to acquire
+    target_team_key: str
+    target_team_name: str
+    target_sgp: float | None
+    offer: PlayerStats          # suggested player to trade away
+    offer_sgp: float | None
+    net_sgp: float              # target SGP − offer SGP
+    roto_delta: float = 0.0
+    category_scores: dict[str, float] = field(default_factory=dict)  # stat_id -> target's value
+
+
+@dataclass
 class TradeSide:
     team_key: str
     team_name: str
@@ -1012,3 +1026,185 @@ async def get_trade_ai_summary(
         messages=[{"role": "user", "content": prompt}],
     )
     return response.content[0].text
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Trade Discovery
+# ---------------------------------------------------------------------------
+
+def _player_category_value(player: PlayerStats, stat_id: str) -> float:
+    """Get a player's value for a specific stat category."""
+    val = player.stats.get(stat_id, "0")
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _find_best_offer(
+    my_roster: list[PlayerStats],
+    target: PlayerStats,
+    target_sgp: float | None,
+    sgp_calc: SGPCalculator | None,
+) -> PlayerStats | None:
+    """Find the best player to offer from my roster for a given target.
+
+    Looks for a player with:
+    1. Position overlap with the target (so the other manager can slot them in)
+    2. Closest SGP value to the target (realistic trade, not a fleece)
+    """
+    target_positions = {pos.strip() for pos in target.position.split(",")}
+
+    candidates: list[tuple[PlayerStats, float, float]] = []
+    for p in my_roster:
+        if p.selected_position in ("IL", "IL+", "NA"):
+            continue
+        player_positions = {pos.strip() for pos in p.position.split(",")}
+        if not (target_positions & player_positions):
+            continue
+        p_sgp = sgp_calc.player_sgp(p) if sgp_calc else None
+        if p_sgp is None:
+            continue
+        # Distance from target's value — prefer close matches
+        gap = abs(p_sgp - (target_sgp or 0))
+        candidates.append((p, p_sgp, gap))
+
+    if not candidates:
+        # Fall back: any player with SGP, no position filter
+        for p in my_roster:
+            if p.selected_position in ("IL", "IL+", "NA"):
+                continue
+            p_sgp = sgp_calc.player_sgp(p) if sgp_calc else None
+            if p_sgp is None:
+                continue
+            gap = abs(p_sgp - (target_sgp or 0))
+            candidates.append((p, p_sgp, gap))
+
+    if not candidates:
+        return None
+
+    # Sort by SGP gap — closest value match first
+    candidates.sort(key=lambda x: x[2])
+    return candidates[0][0]
+
+
+def discover_trades(
+    my_team_key: str,
+    target_stat_ids: list[str],
+    all_rosters: dict[str, list[PlayerStats]],
+    all_teams: list[TeamStats],
+    team_names: dict[str, str],
+    categories: list[StatCategory],
+    sgp_calc: SGPCalculator | None,
+    max_results: int = 20,
+) -> list[TradeScenario]:
+    """Discover trade scenarios that improve specific stat categories.
+
+    Scans all opposing rosters for players who are strong in the target
+    categories, pairs each with a suggested trade offer from the user's
+    roster, and ranks by roto points improvement.
+
+    Args:
+        my_team_key: The user's team key.
+        target_stat_ids: Stat IDs the user wants to improve.
+        all_rosters: {team_key: roster} for all teams.
+        all_teams: Season team stats for all teams.
+        team_names: {team_key: name} mapping.
+        categories: League scoring categories.
+        sgp_calc: SGP calculator.
+        max_results: Max scenarios to return.
+    """
+    scored = [c for c in categories if not c.is_only_display]
+    my_roster = all_rosters.get(my_team_key, [])
+    my_team = next((t for t in all_teams if t.team_key == my_team_key), None)
+    if my_team is None:
+        return []
+
+    # Score each opposing player by how strong they are in target categories
+    # relative to the league. Use percentile rank within their position group.
+    candidates: list[tuple[PlayerStats, str, str, float, float]] = []
+    # (player, team_key, team_name, category_score, sgp)
+
+    for team_key, roster in all_rosters.items():
+        if team_key == my_team_key:
+            continue
+        team_name = team_names.get(team_key, team_key)
+        for player in roster:
+            if player.selected_position in ("IL", "IL+", "NA"):
+                continue
+            p_sgp = sgp_calc.player_sgp(player) if sgp_calc else None
+
+            # Score: sum of the player's values in target categories
+            # For "higher is better" stats, raw value. For "lower is better", negate.
+            cat_score = 0.0
+            cat_values: dict[str, float] = {}
+            for sid in target_stat_ids:
+                cat = next((c for c in scored if c.stat_id == sid), None)
+                if not cat:
+                    continue
+                val = _player_category_value(player, sid)
+                cat_values[sid] = val
+                if cat.sort_order == "1":
+                    cat_score += val
+                else:
+                    cat_score -= val  # lower is better → high negative = good
+
+            if cat_score == 0:
+                continue
+
+            candidates.append((player, team_key, team_name, cat_score, p_sgp or 0.0))
+
+    # Sort by category score descending — players strongest in target cats first
+    candidates.sort(key=lambda x: x[3], reverse=True)
+    # Keep top candidates
+    candidates = candidates[:max_results * 3]
+
+    # For each candidate, find a trade offer and compute roto delta
+    scenarios: list[TradeScenario] = []
+    baseline_roto = compute_roto(all_teams, scored)
+    baseline_pts = 0.0
+    for r in baseline_roto:
+        if r["team_key"] == my_team_key:
+            baseline_pts = r["total"]
+            break
+
+    for player, team_key, team_name, cat_score, p_sgp in candidates:
+        offer = _find_best_offer(my_roster, player, p_sgp, sgp_calc)
+        if offer is None:
+            continue
+
+        offer_sgp = sgp_calc.player_sgp(offer) if sgp_calc else None
+        net = (p_sgp - (offer_sgp or 0)) if p_sgp else 0.0
+
+        # Compute roto delta
+        trade_team = apply_trade_to_team(
+            my_team, my_roster,
+            players_out=[offer],
+            players_in=[player],
+            categories=categories,
+        )
+        teams_after = [
+            trade_team if t.team_key == my_team_key else t
+            for t in all_teams
+        ]
+        roto_after = compute_roto(teams_after, scored)
+        roto_delta = 0.0
+        for r in roto_after:
+            if r["team_key"] == my_team_key:
+                roto_delta = r["total"] - baseline_pts
+                break
+
+        scenarios.append(TradeScenario(
+            target=player,
+            target_team_key=team_key,
+            target_team_name=team_name,
+            target_sgp=p_sgp if p_sgp else None,
+            offer=offer,
+            offer_sgp=offer_sgp,
+            net_sgp=net,
+            roto_delta=roto_delta,
+        ))
+
+    # Sort by roto delta
+    scenarios.sort(key=lambda s: s.roto_delta, reverse=True)
+    return scenarios[:max_results]

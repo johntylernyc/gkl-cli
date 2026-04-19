@@ -167,6 +167,38 @@ This is going to be a fairly complex feature, so think through it well. While de
 | 27 | Fix empty AI content (remove/mount → update in-place) | ✅ Done |
 | 28 | Fix clipped multiline content (height: 1 → auto) | ✅ Done |
 
-### Phase 5: Trade Discovery (not started)
+### Phase 5: Trade Discovery (completed 2026-04-19)
 
-**Goal:** User selects categories/positions to improve. System scans all rosters for players who would improve those areas and identifies which of the user's players could be reasonable trade currency. 
+**Status:** Implemented on `feature/trade-analyzer` branch.
+
+**Decisions:**
+
+21. **Category multi-select modal with toggle pattern.** Users select categories to improve via a ListView where Enter toggles selection (★ marker). Enter confirms, Escape cancels. Each category shows position type (bat/pit) and direction (higher ↑ / lower ↓).
+
+22. **Scenario = target + suggested offer.** Discovery results pair each target player with a suggested trade piece from the user's roster. The offer is chosen by closest SGP value match with position overlap — a realistic deal, not a fleece attempt.
+
+23. **Scoring: category strength → SGP pre-filter → roto delta ranking.** Opposing players are scored by raw value in target categories, pre-filtered to top candidates, then each scenario gets a full roto simulation. Final list sorted by ΔRoto.
+
+24. **Selecting a scenario transitions to full analysis.** Same pattern as Trading Block — sets up the two-team trade and runs the full Phase 1 analysis with H2H replay.
+
+### Tasks
+
+| # | Task | Status |
+|---|------|--------|
+| 29 | Add `discover_trades()` to `trade.py` | ✅ Done |
+| 30 | Add `CategorySelectModal` | ✅ Done |
+| 31 | Add discovery mode to `TradeModeSelectorModal` | ✅ Done |
+| 32 | Wire discovery flow in `TradeAnalyzerScreen` | ✅ Done |
+| 33 | Add scenario selection → full analysis transition | ✅ Done |
+
+---
+
+## Feature Summary
+
+All five phases are complete:
+
+1. **Analyze Proposed Trade** — select players from two rosters, see category impact, roto standings, H2H replay
+2. **H2H Weekly Replay** — per-player weekly stats replayed against actual matchup opponents
+3. **Trading Block** — select a player to trade, system finds and ranks targets by ΔSGP/ΔRoto/ΔWin%
+4. **AI Summary** — Claude-powered narrative analysis with pros/cons and trade talking points
+5. **Trade Discovery** — select categories to improve, system finds scenarios pairing targets with suggested offers 

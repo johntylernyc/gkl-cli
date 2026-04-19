@@ -6626,6 +6626,7 @@ class TradeModeSelectorModal(Screen):
         modes = [
             ("analyze", "Analyze Trade\n  Select players from two rosters"),
             ("block", "Trading Block\n  Find targets for a player you want to trade"),
+            ("discover", "Trade Discovery\n  Find trades to improve specific categories"),
         ]
         for mode_id, label in modes:
             item = ListItem(Label(label))
@@ -6636,6 +6637,100 @@ class TradeModeSelectorModal(Screen):
         mode = getattr(event.item, "_mode", None)
         if mode:
             self.dismiss(mode)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class CategorySelectModal(Screen):
+    """Modal for selecting stat categories to improve (multi-select)."""
+    BINDINGS = [("escape", "cancel", "Cancel"), ("enter", "confirm", "Confirm")]
+    CSS = """
+    CategorySelectModal {
+        align: center middle;
+    }
+    #cat-select-container {
+        width: 50;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #cat-select-title {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #cat-select-hint {
+        height: 1;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    #cat-select-list {
+        height: auto;
+        max-height: 70%;
+    }
+    #cat-select-list > ListItem {
+        height: 1;
+        padding: 0 1;
+    }
+    #cat-select-list > ListItem.--highlight {
+        background: #3A5A3A;
+    }
+    """
+
+    def __init__(self, categories: list[StatCategory]) -> None:
+        super().__init__()
+        self._categories = [c for c in categories if not c.is_only_display]
+        self._selected: set[str] = set()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="cat-select-container"):
+            yield Static("Select Categories to Improve", id="cat-select-title")
+            yield Static("[Space] toggle  [Enter] confirm", id="cat-select-hint")
+            yield ListView(id="cat-select-list")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#cat-select-list", ListView)
+        for cat in self._categories:
+            direction = "higher ↑" if cat.sort_order == "1" else "lower ↓"
+            ptype = "bat" if cat.position_type == "B" else "pit"
+            label = f"  {cat.display_name:<8} ({ptype}, {direction})"
+            item = ListItem(Label(label))
+            item._stat_id = cat.stat_id
+            lv.mount(item)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        stat_id = getattr(event.item, "_stat_id", None)
+        if stat_id is None:
+            return
+        if stat_id in self._selected:
+            self._selected.discard(stat_id)
+        else:
+            self._selected.add(stat_id)
+        self._refresh_labels()
+
+    def _refresh_labels(self) -> None:
+        lv = self.query_one("#cat-select-list", ListView)
+        for i, cat in enumerate(self._categories):
+            direction = "higher ↑" if cat.sort_order == "1" else "lower ↓"
+            ptype = "bat" if cat.position_type == "B" else "pit"
+            marker = "★" if cat.stat_id in self._selected else " "
+            label = f"{marker} {cat.display_name:<8} ({ptype}, {direction})"
+            try:
+                item = lv.children[i]
+                item.query_one(Label).update(label)
+            except Exception:
+                pass
+
+    def action_confirm(self) -> None:
+        if self._selected:
+            self.dismiss(list(self._selected))
+        else:
+            self.notify("Select at least one category", severity="warning")
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -6728,7 +6823,7 @@ class TradeAnalyzerScreen(Screen):
         self.api = api
         self.league = league
         self.categories = categories
-        self._mode = "analyze"  # "analyze" or "block"
+        self._mode = "analyze"  # "analyze", "block", or "discover"
         self._team_a_key: str | None = None
         self._team_a_name: str = ""
         self._team_b_key: str | None = None
@@ -6740,6 +6835,9 @@ class TradeAnalyzerScreen(Screen):
         # Trading Block state
         self._block_player: PlayerStats | None = None
         self._trade_targets: list = []  # list[TradeTarget]
+        # Trade Discovery state
+        self._discover_cats: list[str] = []
+        self._discover_scenarios: list = []  # list[TradeScenario]
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -6771,10 +6869,22 @@ class TradeAnalyzerScreen(Screen):
 
     def _update_subheader(self) -> None:
         sub = Text()
-        mode_label = "Analyze Trade" if self._mode == "analyze" else "Trading Block"
-        sub.append(f" [{mode_label}] ", style="bold italic")
+        mode_labels = {"analyze": "Analyze Trade", "block": "Trading Block", "discover": "Trade Discovery"}
+        sub.append(f" [{mode_labels.get(self._mode, self._mode)}] ", style="bold italic")
 
-        if self._mode == "block":
+        if self._mode == "discover":
+            if self._discover_cats:
+                scored = [c for c in self.categories if not c.is_only_display]
+                cat_names = [c.display_name for c in scored if c.stat_id in self._discover_cats]
+                sub.append(f" Improving: ", style="dim")
+                sub.append(", ".join(cat_names), style=f"bold {TEAM_A_COLOR}")
+                sub.append("  |  [m] Mode", style="dim")
+            elif self._team_a_key:
+                sub.append(f" {self._team_a_name}", style=f"bold {TEAM_A_COLOR}")
+                sub.append("  |  Select categories to improve  [m] Mode", style="dim")
+            else:
+                sub.append(" Select your team...", style="dim")
+        elif self._mode == "block":
             if self._block_player:
                 sub.append(f" Trading: ", style="dim")
                 sub.append(f"{self._block_player.name}", style=f"bold {TEAM_A_COLOR}")
@@ -6903,6 +7013,12 @@ class TradeAnalyzerScreen(Screen):
         if row_idx < 0 or row_idx >= len(players):
             return
 
+        if self._mode == "discover":
+            if table_id == "scenario-table" and row_idx < len(self._discover_scenarios):
+                scenario = self._discover_scenarios[row_idx]
+                self._run_scenario_analysis(scenario)
+            return
+
         if self._mode == "block":
             if table_id == "roster-table-a":
                 # Select the player to trade
@@ -6944,6 +7060,8 @@ class TradeAnalyzerScreen(Screen):
         self._mode = mode
         self._block_player = None
         self._trade_targets = []
+        self._discover_cats = []
+        self._discover_scenarios = []
         self._selected_a.clear()
         self._selected_b.clear()
         self._team_b_key = None
@@ -6956,6 +7074,109 @@ class TradeAnalyzerScreen(Screen):
             await scroll.remove_children()
             await self._render_left_pane()
         self.run_worker(_clear, group="render-left", exclusive=True)
+
+        if mode == "discover" and self._team_a_key:
+            self.app.push_screen(
+                CategorySelectModal(self.categories),
+                callback=self._on_categories_selected,
+            )
+
+    def _on_categories_selected(self, stat_ids: list[str] | None) -> None:
+        if not stat_ids:
+            return
+        self._discover_cats = stat_ids
+        self._update_subheader()
+        self.run_worker(self._run_discovery, group="trade-discovery", exclusive=True)
+
+    async def _run_discovery(self) -> None:
+        from gkl.trade import discover_trades
+
+        self.query_one("#trade-loading").display = True
+        self.query_one("#trade-loading-status", Static).update("Fetching all team rosters...")
+        self.query_one("#trade-right-scroll").display = False
+
+        try:
+            cache = self.app.shared_cache
+            await cache.ensure_loaded(self.api, self.league, self.categories)
+
+            import asyncio
+            teams = cache.all_teams
+
+            # Fetch season rosters for all teams in parallel
+            roster_tasks = [
+                asyncio.to_thread(
+                    self.api.get_roster_stats_season, t.team_key, self.league.current_week
+                )
+                for t in teams if t.team_key != self._team_a_key
+            ]
+            roster_results = await asyncio.gather(*roster_tasks)
+            all_rosters: dict[str, list] = {}
+            non_my_teams = [t for t in teams if t.team_key != self._team_a_key]
+            for t, roster in zip(non_my_teams, roster_results):
+                all_rosters[t.team_key] = roster
+            all_rosters[self._team_a_key] = self._roster_a
+
+            self.query_one("#trade-loading-status", Static).update(
+                "Finding trade scenarios..."
+            )
+            self._discover_scenarios = await asyncio.to_thread(
+                discover_trades,
+                self._team_a_key,
+                self._discover_cats,
+                all_rosters,
+                cache.all_teams,
+                cache.team_names,
+                self.categories,
+                cache.sgp_calc,
+            )
+
+            await self._render_discovery_results()
+        except Exception as e:
+            self.notify(f"Discovery failed: {e}", severity="error")
+        finally:
+            self.query_one("#trade-loading").display = False
+            self.query_one("#trade-right-scroll").display = True
+
+    async def _render_discovery_results(self) -> None:
+        from gkl.trade import TradeScenario
+
+        scroll = self.query_one("#trade-right-scroll", VerticalScroll)
+        await scroll.remove_children()
+
+        if not self._discover_scenarios:
+            await scroll.mount(Static(
+                Text("  No trade scenarios found for the selected categories.", style="dim"),
+            ))
+            return
+
+        scored = [c for c in self.categories if not c.is_only_display]
+        cat_names = [c.display_name for c in scored if c.stat_id in self._discover_cats]
+        header = Text()
+        header.append(f" Improving: ", style="dim")
+        header.append(", ".join(cat_names), style=f"bold {TEAM_A_COLOR}")
+        header.append(f"\n Select a scenario to see full trade analysis.", style="dim italic")
+        await scroll.mount(Static(header, classes="trade-result-label"))
+
+        scenario_table = DataTable(classes="trade-impact-table", id="scenario-table")
+        await scroll.mount(scenario_table)
+        scenario_table.cursor_type = "row"
+        scenario_table.zebra_stripes = True
+        scenario_table._players = self._discover_scenarios
+        scenario_table.add_columns("You Get", "From", "You Send", "ΔSGP", "ΔRoto")
+
+        for s in self._discover_scenarios:
+            net_str = f"{s.net_sgp:+.1f}"
+            net_style = "bold green" if s.net_sgp > 0 else "bold red" if s.net_sgp < 0 else "dim"
+            roto_str = f"{s.roto_delta:+.1f}"
+            roto_style = "bold green" if s.roto_delta > 0.1 else "bold red" if s.roto_delta < -0.1 else "dim"
+
+            scenario_table.add_row(
+                Text(f"{s.target.name[:18]} ({s.target.position[:6]})", style="bold"),
+                Text(s.target_team_name[:14], style="dim"),
+                Text(f"{s.offer.name[:18]} ({s.offer.position[:6]})", style=f"{TEAM_A_COLOR}"),
+                Text(net_str, style=net_style, justify="right"),
+                Text(roto_str, style=roto_style, justify="right"),
+            )
 
     async def _scan_trade_targets(self) -> None:
         """Scan all rosters for trade targets matching the block player."""
@@ -7119,6 +7340,27 @@ class TradeAnalyzerScreen(Screen):
                 target.team_key, self.league.current_week
             )
             # Switch to analyze mode view for the left pane
+            self._mode = "analyze"
+            self._update_subheader()
+            await self._render_left_pane()
+            await self._run_analysis()
+
+        self.run_worker(_load_and_analyze, group="trade-analysis", exclusive=True)
+
+    def _run_scenario_analysis(self, scenario) -> None:
+        """Run full trade analysis for a Trade Discovery scenario."""
+        from gkl.trade import TradeScenario
+        scenario: TradeScenario
+
+        self._team_b_key = scenario.target_team_key
+        self._team_b_name = scenario.target_team_name
+        self._selected_a = {scenario.offer.player_key}
+        self._selected_b = {scenario.target.player_key}
+
+        async def _load_and_analyze():
+            self._roster_b = self.api.get_roster_stats_season(
+                scenario.target_team_key, self.league.current_week
+            )
             self._mode = "analyze"
             self._update_subheader()
             await self._render_left_pane()
