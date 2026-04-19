@@ -111,33 +111,50 @@ This is going to be a fairly complex feature, so think through it well. While de
 | 15 | Move weekly replay above trade partner impact | ✅ Done |
 | 16 | Relabel H2H sections for clarity | ✅ Done |
 
-### Phase 3: Trading Block (in progress)
+### Phase 3: Trading Block (completed 2026-04-19)
 
-**Goal:** User selects a specific player they want to trade. System finds the best possible incoming players across all rosters and ranks them by net improvement.
+**Status:** Implemented on `feature/trade-analyzer` branch.
 
-**Scope:** Trading Block only. Trade Discovery (category/position-based search) deferred to a future phase.
+**Decisions:**
 
-**User flow:**
-1. From the Trade Analyzer screen, press `m` to switch mode → select "Trading Block"
-2. Select your team (if not already selected)
-3. Your roster appears in the left pane — highlight a player and press Enter to mark them as the trade piece
-4. System fetches all opposing rosters, finds position-eligible players on each team
-5. Scores each candidate by net SGP improvement (incoming SGP − outgoing SGP)
-6. Right pane shows a ranked list of trade targets with: player name, team, position, SGP, net SGP delta
-7. Selecting a target from the list runs the full Phase 1 analysis (category impact, roto, H2H replay)
+10. **Three metrics per trade target, not just SGP.** SGP alone is a black box. Each target now shows: ΔSGP (player-level value swap), ΔRoto (actual roto points change from full league re-ranking), and ΔWin% (actual H2H record change). These three independent signals give confidence when they agree and flag caution when they diverge.
 
-**Scoring approach:**
-- Use `SGPCalculator.player_sgp()` for both the outgoing and incoming player
-- Net SGP = incoming SGP − outgoing SGP (positive = upgrade)
-- Filter to position-eligible players only (must share at least one position with the outgoing player)
-- Show SGP values for context alongside the ranking
+11. **H2H win% uses actual weekly replay, not season-aggregate simulation.** For each candidate, the system runs `replay_h2h_with_trade` using per-player weekly stats from every completed week. This means fetching weekly rosters for all 18 teams × all weeks — expensive in API calls but produces the true change in H2H record rather than an approximation.
 
-**Implementation:**
-- Add `find_trade_targets()` to `gkl/trade.py` — scans all rosters, returns ranked list
-- Add mode switching to `TradeAnalyzerScreen` via `TradeModeSelectorModal`
-- Trading Block mode reuses the left pane for roster display + single player selection
-- Right pane switches between target list (before selection) and full analysis (after selection)
+12. **Pre-filter by SGP before running expensive simulations.** Position-eligible candidates are first sorted by net SGP, then the top 50 are kept for full roto + H2H simulation. This limits the computation cost while ensuring the best candidates aren't missed.
 
-### Phase 4: AI Summary (not started)
+13. **Target list sorted by roto points delta.** After computing all three metrics, candidates are ranked by ΔRoto (most impactful trades first). ΔRoto is the most holistic measure since it reflects actual standings movement.
 
-**Goal:** Claude-powered narrative analysis of the trade — pros/cons, talking points to sell the deal, counter-offer suggestions. 
+14. **Selecting a target transitions to full analyze mode.** When a target is selected from the trading block list, the screen switches to analyze mode with both rosters shown in the left pane (traded players starred) and the full Phase 1 analysis in the right pane.
+
+15. **IL/NA players excluded from scan.** Players on the injured list or not active are filtered out — they can't contribute immediately and would distort the analysis.
+
+### Tasks
+
+| # | Task | Status |
+|---|------|--------|
+| 17 | Add `find_trade_targets()` to `trade.py` | ✅ Done |
+| 18 | Add `TradeModeSelectorModal` | ✅ Done |
+| 19 | Add Trading Block mode UI flow | ✅ Done |
+| 20 | Add roto delta + H2H win% to target scoring | ✅ Done |
+| 21 | Use actual weekly replay for H2H win% | ✅ Done |
+| 22 | Fix `all_teams` undefined variable | ✅ Done |
+| 23 | Show both rosters when selecting a target | ✅ Done |
+
+### Phase 4: AI Summary (in progress)
+
+**Goal:** When an Anthropic API key is available, provide a Claude-powered narrative analysis of the trade:
+- Pros and cons summary
+- 2-3 sentences on how to sell the deal to the other manager
+- 2-3 sentences on how to decline or counter if you were proposed the trade
+
+**Approach:**
+- Check `load_anthropic_key()` for API key availability
+- Format the `TradeImpact` data (category deltas, roto movement, H2H replay results) into a structured prompt
+- Use the Anthropic SDK directly (lightweight call, not full Skipper tool suite)
+- Display the AI summary in a section at the bottom of the analysis results
+- Use the model from `DEFAULT_MODEL` in `skipper.py`
+
+### Phase 5: Trade Discovery (not started)
+
+**Goal:** User selects categories/positions to improve. System scans all rosters for players who would improve those areas and identifies which of the user's players could be reasonable trade currency. 
