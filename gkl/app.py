@@ -6936,12 +6936,12 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         is_future = self._is_future_week()
 
         if is_future:
-            # Column headers for projected scores + standings
+            # Column headers — fixed widths matching data rows
             hdr = Text()
-            hdr.append(f"{'':>3} {'':18}  {'':18}", style="dim")
-            hdr.append(f"  {'proj':>7}", style="italic dim #E8A735")
-            hdr.append(f"  {'roto':>4}", style="dim")
-            hdr.append(f"  {'h2h':>7}", style="dim")
+            hdr.append(f"   {'':18}  {'':18}", style="dim")
+            hdr.append("  proj   ", style="italic dim #E8A735")
+            hdr.append(" roto  ", style="dim")
+            hdr.append("   h2h    ", style="dim")
             hdr_item = ListItem(Label(hdr, classes="matchup-row"))
             hdr_item._matchup_index = None
             lv.mount(hdr_item)
@@ -6955,29 +6955,28 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
             score_line.append(f"{m.team_b.name[:18]:<18}", style=f"bold {TEAM_B_COLOR}")
             if is_future:
                 aw, bw, t = self._compute_projected_record(m)
-                # Projected record
-                score_line.append("  ")
-                score_line.append(f"{aw:>2}", style=f"bold {TEAM_A_COLOR}")
+                # Projected record — 9 char column
+                score_line.append(f"{aw:>3}", style=f"bold {TEAM_A_COLOR}")
                 score_line.append("-", style="dim")
                 score_line.append(f"{bw}", style=f"bold {TEAM_B_COLOR}")
                 score_line.append("-", style="dim")
-                score_line.append(f"{t}", style="dim")
-                # Roto rank
-                roto_a = self._roto_rank.get(m.team_a.team_key, "")
-                roto_b = self._roto_rank.get(m.team_b.team_key, "")
-                score_line.append("  ")
-                score_line.append(f"{roto_a}", style=f"{TEAM_A_COLOR}")
+                score_line.append(f"{t:<3}", style="dim")
+
+                # Roto rank — 6 char column
+                roto_a = self._roto_rank.get(m.team_a.team_key, "-")
+                roto_b = self._roto_rank.get(m.team_b.team_key, "-")
+                score_line.append(f"{roto_a:>3}", style=f"{TEAM_A_COLOR}")
                 score_line.append("/", style="dim")
-                score_line.append(f"{roto_b}", style=f"{TEAM_B_COLOR}")
-                # H2H record
+                score_line.append(f"{roto_b:<3}", style=f"{TEAM_B_COLOR}")
+
+                # H2H record — 10 char column
                 h2h_a = self._h2h_record.get(m.team_a.team_key, {})
                 h2h_b = self._h2h_record.get(m.team_b.team_key, {})
                 rec_a = f"{h2h_a.get('wins', 0)}-{h2h_a.get('losses', 0)}"
                 rec_b = f"{h2h_b.get('wins', 0)}-{h2h_b.get('losses', 0)}"
-                score_line.append("  ")
-                score_line.append(f"{rec_a}", style=f"{TEAM_A_COLOR}")
+                score_line.append(f"{rec_a:>5}", style=f"{TEAM_A_COLOR}")
                 score_line.append("/", style="dim")
-                score_line.append(f"{rec_b}", style=f"{TEAM_B_COLOR}")
+                score_line.append(f"{rec_b:<5}", style=f"{TEAM_B_COLOR}")
             else:
                 score_line.append(f"{m.team_a.points:>5.0f}", style=f"{TEAM_A_COLOR}")
                 score_line.append("  ")
@@ -7008,7 +7007,9 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         self._selected_idx = idx
         async def _update(i: int = idx) -> None:
             await self._show_matchup_detail(i)
-            if not self._is_future_week():
+            if self._is_future_week():
+                await self._load_future_player_stats(i)
+            else:
                 await self._load_player_stats(i)
         self.run_worker(_update, group="matchup-detail", exclusive=True)
 
@@ -7178,6 +7179,61 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
 
         self.query_one("#bottom-pane").display = True
         self._update_player_view_header(m)
+
+        batting_cats, bat_unscored = build_stat_columns(self.categories, "B")
+        pitching_cats, pitch_unscored = build_stat_columns(self.categories, "P")
+
+        batting_positions = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF",
+                             "OF", "Util", "DH", "IF", "BN"}
+
+        for container_id, team, players, color in [
+            ("#player-scroll-a", m.team_a, players_a, TEAM_A_COLOR),
+            ("#player-scroll-b", m.team_b, players_b, TEAM_B_COLOR),
+        ]:
+            container = self.query_one(container_id, VerticalScroll)
+            await container.remove_children()
+
+            await container.mount(
+                Static(Text(f" {team.name} ", style=f"bold {color}"),
+                       classes="team-roster-label")
+            )
+
+            batters = [p for p in players if
+                       any(pos in batting_positions for pos in p.position.split(","))]
+            pitchers = [p for p in players if p not in batters]
+
+            if batters:
+                await container.mount(
+                    Static(" Batters", classes="roster-section-label"))
+                bat_table = DataTable()
+                await container.mount(bat_table)
+                self._fill_player_table(bat_table, batters, batting_cats, bat_unscored)
+
+            if pitchers:
+                await container.mount(
+                    Static(" Pitchers", classes="roster-section-label"))
+                pitch_table = DataTable()
+                await container.mount(pitch_table)
+                self._fill_player_table(pitch_table, pitchers, pitching_cats, pitch_unscored)
+
+    async def _load_future_player_stats(self, idx: int) -> None:
+        """Load season-long player stats for both teams in a future week matchup."""
+        if not self.league:
+            return
+        m = self.matchups[idx]
+        week = self.league.current_week
+
+        players_a = self.api.get_roster_stats_season(m.team_a.team_key, week)
+        players_b = self.api.get_roster_stats_season(m.team_b.team_key, week)
+
+        self.query_one("#bottom-pane").display = True
+
+        # Update player view header to indicate season stats
+        view_label = self.query_one("#player-view-label", Static)
+        lbl = Text()
+        lbl.append(" Season Stats ", style="bold")
+        lbl.append(" (projected week — showing season totals)", style="dim")
+        view_label.update(lbl)
 
         batting_cats, bat_unscored = build_stat_columns(self.categories, "B")
         pitching_cats, pitch_unscored = build_stat_columns(self.categories, "P")
