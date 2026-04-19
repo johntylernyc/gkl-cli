@@ -27,7 +27,9 @@ class TradeTarget:
     sgp: float | None          # target player's SGP
     net_sgp: float             # target SGP − outgoing SGP (positive = upgrade)
     roto_delta: float = 0.0    # change in roto points for team A
-    h2h_win_delta: int = 0     # change in hypothetical H2H wins for team A
+    h2h_win_pct_before: float = 0.0  # baseline win % vs all opponents
+    h2h_win_pct_after: float = 0.0   # post-trade win % vs all opponents
+    h2h_win_pct_delta: float = 0.0   # change in win %
 
 
 @dataclass
@@ -807,6 +809,9 @@ def find_trade_targets(
     team_names: dict[str, str],
     categories: list[StatCategory],
     sgp_calc: SGPCalculator | None,
+    week_matchups: dict[int, list] | None = None,
+    all_weekly_rosters: dict[str, dict[int, list[PlayerStats]]] | None = None,
+    current_week: int = 1,
     max_results: int = 25,
 ) -> list[TradeTarget]:
     """Find the best trade targets for a player you want to trade away.
@@ -815,10 +820,13 @@ def find_trade_targets(
     candidate, computes:
     - Net SGP (target SGP − outgoing SGP)
     - Roto points delta (how the trade changes your roto total)
-    - H2H win delta (how many more/fewer hypothetical matchups you'd win)
+    - H2H win % delta (per-week hypothetical vs all opponents when
+      weekly data is available, otherwise season-aggregate)
 
     Returns a ranked list sorted by roto points delta.
     """
+    from gkl.yahoo_api import Matchup
+
     outgoing_positions = {pos.strip() for pos in outgoing_player.position.split(",")}
     outgoing_sgp = sgp_calc.player_sgp(outgoing_player) if sgp_calc else None
 
@@ -828,7 +836,10 @@ def find_trade_targets(
     if my_team is None:
         return []
 
-    # Compute baseline roto and H2H for my team (before any trade)
+    has_weekly = bool(week_matchups and all_weekly_rosters)
+    weekly_roster_a = all_weekly_rosters.get(my_team_key, {}) if all_weekly_rosters else {}
+
+    # Compute baseline roto for my team (before any trade)
     baseline_roto = compute_roto(all_teams, scored)
     baseline_pts = 0.0
     for r in baseline_roto:
@@ -836,13 +847,20 @@ def find_trade_targets(
             baseline_pts = r["total"]
             break
 
-    baseline_h2h = simulate_h2h(all_teams, scored)
-    baseline_pr = compute_power_rankings(baseline_h2h, all_teams)
-    baseline_wins = 0
-    for s in baseline_pr:
-        if s.team_key == my_team_key:
-            baseline_wins = s.total_wins
-            break
+    # Compute baseline H2H actual record (before any trade)
+    baseline_replay = None
+    if has_weekly:
+        # Use empty trade (no players swapped) to get actual record
+        baseline_replay = replay_h2h_with_trade(
+            my_team_key, my_team_key,
+            set(), set(),  # no players traded
+            week_matchups, weekly_roster_a, {},
+            categories, current_week,
+        )
+        total_games = baseline_replay.actual_season_w + baseline_replay.actual_season_l + baseline_replay.actual_season_t
+        baseline_win_pct = baseline_replay.actual_season_w / total_games if total_games else 0.0
+    else:
+        baseline_win_pct = 0.0
 
     candidates: list[TradeTarget] = []
 
@@ -906,13 +924,20 @@ def find_trade_targets(
                 target.roto_delta = r["total"] - baseline_pts
                 break
 
-        # H2H win delta
-        h2h_after = simulate_h2h(teams_after, scored)
-        pr_after = compute_power_rankings(h2h_after, teams_after)
-        for s in pr_after:
-            if s.team_key == my_team_key:
-                target.h2h_win_delta = s.total_wins - baseline_wins
-                break
+        # H2H win % delta — replay actual weekly matchups with trade applied
+        target.h2h_win_pct_before = baseline_win_pct
+        if has_weekly:
+            weekly_roster_b = all_weekly_rosters.get(target.team_key, {})
+            replay = replay_h2h_with_trade(
+                my_team_key, target.team_key,
+                {outgoing_player.player_key}, {target.player.player_key},
+                week_matchups,
+                weekly_roster_a, weekly_roster_b,
+                categories, current_week,
+            )
+            total = replay.trade_season_w + replay.trade_season_l + replay.trade_season_t
+            target.h2h_win_pct_after = replay.trade_season_w / total if total else 0.0
+            target.h2h_win_pct_delta = target.h2h_win_pct_after - baseline_win_pct
 
     # Sort by roto delta descending
     candidates.sort(key=lambda t: t.roto_delta, reverse=True)

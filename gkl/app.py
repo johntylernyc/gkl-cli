@@ -6962,16 +6962,21 @@ class TradeAnalyzerScreen(Screen):
         from gkl.trade import find_trade_targets
 
         self.query_one("#trade-loading").display = True
-        self.query_one("#trade-loading-status", Static).update("Scanning rosters for trade targets...")
+        self.query_one("#trade-loading-status", Static).update("Fetching all team rosters...")
         self.query_one("#trade-right-scroll").display = False
 
         try:
             cache = self.app.shared_cache
             await cache.ensure_loaded(self.api, self.league, self.categories)
 
-            # Fetch all rosters in parallel
             import asyncio
             teams = cache.all_teams
+            weeks = list(range(1, self.league.current_week + 1))
+
+            # Fetch season rosters for all teams in parallel
+            self.query_one("#trade-loading-status", Static).update(
+                "Fetching season rosters for all teams..."
+            )
             roster_tasks = [
                 asyncio.to_thread(
                     self.api.get_roster_stats_season, t.team_key, self.league.current_week
@@ -6979,12 +6984,41 @@ class TradeAnalyzerScreen(Screen):
                 for t in teams if t.team_key != self._team_a_key
             ]
             roster_results = await asyncio.gather(*roster_tasks)
-            all_rosters = {}
+            all_rosters: dict[str, list] = {}
             non_my_teams = [t for t in teams if t.team_key != self._team_a_key]
             for t, roster in zip(non_my_teams, roster_results):
                 all_rosters[t.team_key] = roster
-            # Include my roster
             all_rosters[self._team_a_key] = self._roster_a
+
+            # Fetch weekly matchups
+            self.query_one("#trade-loading-status", Static).update(
+                "Fetching weekly matchup data..."
+            )
+            for w in weeks:
+                if w not in cache.week_matchups:
+                    try:
+                        wm = self.api.get_scoreboard(self.league.league_key, week=w)
+                        cache.week_matchups[w] = wm
+                    except Exception:
+                        pass
+
+            # Fetch weekly rosters for team A and all opposing teams
+            self.query_one("#trade-loading-status", Static).update(
+                "Fetching weekly player stats for all teams..."
+            )
+            all_weekly_rosters: dict[str, dict[int, list]] = {}
+            for tk in all_rosters:
+                all_weekly_rosters[tk] = {}
+
+            for w in weeks:
+                week_tasks = [
+                    asyncio.to_thread(self.api.get_roster_stats, tk, w)
+                    for tk in all_rosters
+                ]
+                week_results = await asyncio.gather(*week_tasks, return_exceptions=True)
+                for tk, result in zip(all_rosters.keys(), week_results):
+                    if not isinstance(result, Exception):
+                        all_weekly_rosters[tk][w] = result
 
             self.query_one("#trade-loading-status", Static).update(
                 "Computing roto and H2H impact for each target..."
@@ -6994,10 +7028,13 @@ class TradeAnalyzerScreen(Screen):
                 self._block_player,
                 self._team_a_key,
                 all_rosters,
-                cache.all_teams,
+                all_teams,
                 cache.team_names,
                 self.categories,
                 cache.sgp_calc,
+                cache.week_matchups,
+                all_weekly_rosters,
+                self.league.current_week,
             )
 
             await self._render_target_list()
@@ -7037,7 +7074,7 @@ class TradeAnalyzerScreen(Screen):
         target_table.cursor_type = "row"
         target_table.zebra_stripes = True
         target_table._players = self._trade_targets
-        target_table.add_columns("Player", "Pos", "Team", "SGP", "ΔSGP", "ΔRoto", "ΔH2H")
+        target_table.add_columns("Player", "Pos", "Team", "SGP", "ΔSGP", "ΔRoto", "ΔWin%")
 
         for t in self._trade_targets:
             sgp_str = f"{t.sgp:+.1f}" if t.sgp is not None else "N/A"
@@ -7048,8 +7085,12 @@ class TradeAnalyzerScreen(Screen):
             roto_str = f"{t.roto_delta:+.1f}"
             roto_style = "bold green" if t.roto_delta > 0.1 else "bold red" if t.roto_delta < -0.1 else "dim"
 
-            h2h_str = f"{t.h2h_win_delta:+d}" if t.h2h_win_delta != 0 else "—"
-            h2h_style = "bold green" if t.h2h_win_delta > 0 else "bold red" if t.h2h_win_delta < 0 else "dim"
+            if abs(t.h2h_win_pct_delta) > 0.001:
+                h2h_str = f"{t.h2h_win_pct_delta:+.1%}"
+                h2h_style = "bold green" if t.h2h_win_pct_delta > 0 else "bold red"
+            else:
+                h2h_str = "—"
+                h2h_style = "dim"
 
             target_table.add_row(
                 Text(t.player.name[:20], style="bold"),
