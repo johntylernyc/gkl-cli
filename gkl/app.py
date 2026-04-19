@@ -6744,6 +6744,8 @@ class TradeAnalyzerScreen(Screen):
         ("b", "select_team_b", "Team B"),
         ("a", "analyze", "Analyze"),
         ("m", "switch_mode", "Mode"),
+        ("1", "trade_view_season", "Season"),
+        ("2", "trade_view_last30", "L30"),
     ]
     CSS = """
     #trade-header {
@@ -6838,6 +6840,8 @@ class TradeAnalyzerScreen(Screen):
         # Trade Discovery state
         self._discover_cats: list[str] = []
         self._discover_scenarios: list = []  # list[TradeScenario]
+        # Stat view for roster tables
+        self._trade_view = "season"  # "season" or "last30"
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -6906,6 +6910,11 @@ class TradeAnalyzerScreen(Screen):
                 sub.append("  |  [b] Select trade partner  [m] Mode", style="dim")
             else:
                 sub.append(" Select your team...", style="dim")
+        # Show stat view toggle
+        if self._team_a_key:
+            view_label = "Season" if self._trade_view == "season" else "Last 30"
+            sub.append(f"  |  {view_label}", style="bold")
+            sub.append(" [1/2]", style="dim")
         self.query_one("#trade-subheader", Static).update(sub)
 
     def _on_team_a_selected(self, team_key: str | None) -> None:
@@ -6986,10 +6995,19 @@ class TradeAnalyzerScreen(Screen):
         scored = [c for c in self.categories if not c.is_only_display]
         batting_cats = [c for c in scored if c.position_type == "B"]
         pitching_cats = [c for c in scored if c.position_type == "P"]
-
-        table.add_columns("", "Player", "Pos", "Team")
         batting_positions = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF",
                              "OF", "Util", "DH", "IF", "BN"}
+
+        # Build columns: marker, player, pos, then stat columns
+        cols: list[str | Text] = ["", "Player", "Pos"]
+        # Use batting cats for all players — pitchers show pitching cats
+        # Combine all stat cols since table is shared
+        for cat in batting_cats:
+            cols.append(cat.display_name)
+        cols.append("│")
+        for cat in pitching_cats:
+            cols.append(cat.display_name)
+        table.add_columns(*cols)
 
         for p in roster:
             is_batter = any(
@@ -6997,12 +7015,22 @@ class TradeAnalyzerScreen(Screen):
             )
             marker = "★" if p.player_key in selected else " "
             marker_style = "bold #FFD700" if p.player_key in selected else "dim"
-            table.add_row(
+
+            row: list[Text] = [
                 Text(marker, style=marker_style),
-                Text(p.name[:20], style="bold"),
-                Text(p.selected_position or p.position[:8], style="dim"),
-                Text(p.team_abbr, style="dim"),
-            )
+                Text(p.name[:18], style="bold"),
+                Text(p.selected_position or p.position[:6], style="dim"),
+            ]
+            for cat in batting_cats:
+                val = get_stat_value(p.stats, cat.stat_id, cat.display_name)
+                style = "" if is_batter else "dim"
+                row.append(Text(str(val), style=style, justify="right"))
+            row.append(Text("│", style="dim"))
+            for cat in pitching_cats:
+                val = get_stat_value(p.stats, cat.stat_id, cat.display_name)
+                style = "" if not is_batter else "dim"
+                row.append(Text(str(val), style=style, justify="right"))
+            table.add_row(*row)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Handle Enter on a roster or target table row."""
@@ -7795,6 +7823,34 @@ class TradeAnalyzerScreen(Screen):
         except Exception as e:
             ai_content.update(Text(f"  Could not generate AI analysis: {e}", style="dim italic"))
         scroll.scroll_end(animate=False)
+
+    def action_trade_view_season(self) -> None:
+        if self._trade_view == "season":
+            return
+        self._trade_view = "season"
+        self.run_worker(self._reload_trade_rosters, group="trade-view", exclusive=True)
+
+    def action_trade_view_last30(self) -> None:
+        if self._trade_view == "last30":
+            return
+        self._trade_view = "last30"
+        self.run_worker(self._reload_trade_rosters, group="trade-view", exclusive=True)
+
+    async def _reload_trade_rosters(self) -> None:
+        """Reload rosters with the current stat view and re-render."""
+        import asyncio
+        if self._trade_view == "last30":
+            fetch = self.api.get_roster_stats_last30
+        else:
+            fetch = self.api.get_roster_stats_season
+
+        if self._team_a_key:
+            self._roster_a = await asyncio.to_thread(
+                fetch, self._team_a_key, self.league.current_week)
+        if self._team_b_key:
+            self._roster_b = await asyncio.to_thread(
+                fetch, self._team_b_key, self.league.current_week)
+        await self._render_left_pane()
 
     def action_go_back(self) -> None:
         self.app.pop_screen()
