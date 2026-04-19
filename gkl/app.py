@@ -6900,24 +6900,35 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         lv.clear()
         lv.display = True
         is_future = self._is_future_week()
+
+        if is_future:
+            # Column header for projected scores
+            hdr = Text()
+            hdr.append(f"{'':>3} {'':18}  {'':18}  ", style="dim")
+            hdr.append("projected", style="italic dim #E8A735")
+            lv.mount(ListItem(Label(hdr, classes="matchup-row")))
+
         for i, m in enumerate(self.matchups):
             num = str(i + 1) if i < 9 else "0" if i == 9 else ""
             score_line = Text()
             score_line.append(f"{num:>2} ", style="bold dim")
             score_line.append(f"{m.team_a.name[:18]:<18}", style=f"bold {TEAM_A_COLOR}")
+            score_line.append("  ")
+            score_line.append(f"{m.team_b.name[:18]:<18}", style=f"bold {TEAM_B_COLOR}")
             if is_future:
                 aw, bw, t = self._compute_projected_record(m)
-                score_line.append(f" {aw:>2} ", style=f"bold {TEAM_A_COLOR}")
+                score_line.append("  ")
+                score_line.append(f"{aw:>2}", style=f"bold {TEAM_A_COLOR}")
+                score_line.append("-", style="dim")
                 if t:
-                    score_line.append(f" {t} ", style="dim")
+                    score_line.append(f"{t}", style="dim")
                 else:
-                    score_line.append(" - ", style="dim")
-                score_line.append(f" {bw:<2} ", style=f"bold {TEAM_B_COLOR}")
+                    score_line.append("0", style="dim")
+                score_line.append("-", style="dim")
+                score_line.append(f"{bw}", style=f"bold {TEAM_B_COLOR}")
             else:
                 score_line.append(f"{m.team_a.points:>5.0f}", style=f"{TEAM_A_COLOR}")
                 score_line.append("  ")
-            score_line.append(f"{m.team_b.name[:18]:<18}", style=f"bold {TEAM_B_COLOR}")
-            if not is_future:
                 score_line.append(f"{m.team_b.points:>5.0f}", style=f"{TEAM_B_COLOR}")
 
             mgr_line = Text()
@@ -6927,7 +6938,7 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
             item = ListItem(
                 Label(score_line, classes="matchup-row"),
                 Label(mgr_line, classes="matchup-row"),
-                Label("─" * 52, classes="matchup-divider"),
+                Label("─" * 56, classes="matchup-divider"),
             )
             item._matchup_index = i
             lv.mount(item)
