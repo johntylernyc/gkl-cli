@@ -87,6 +87,7 @@ from gkl.yahoo_api import (
 from gkl.datastore import RosterDataStore
 from gkl.yahoo_auth import YahooAuth, load_credentials, save_credentials, is_web_mode
 from gkl.stats import (
+    RATE_STATS,
     who_wins, simulate_h2h, compute_power_rankings, aggregate_h2h_season,
     H2HResult, TeamH2HSummary, SGPCalculator,
     build_stat_columns, get_stat_value, compute_roto,
@@ -6577,6 +6578,1290 @@ class LeagueSelectScreen(Screen):
         self.app.exit()
 
 
+# --- Trade Analyzer Screen ---
+
+
+class TradeModeSelectorModal(Screen):
+    """Modal for selecting trade analyzer mode."""
+    BINDINGS = [("escape", "cancel", "Cancel")]
+    CSS = """
+    TradeModeSelectorModal {
+        align: center middle;
+    }
+    #trade-mode-container {
+        width: 60;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #trade-mode-title {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #trade-mode-list {
+        height: auto;
+        max-height: 80%;
+    }
+    #trade-mode-list > ListItem {
+        height: 3;
+        padding: 0 1;
+    }
+    #trade-mode-list > ListItem.--highlight {
+        background: #3A5A3A;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="trade-mode-container"):
+            yield Static("Trade Analyzer Mode", id="trade-mode-title")
+            yield ListView(id="trade-mode-list")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#trade-mode-list", ListView)
+        modes = [
+            ("analyze", "Analyze Trade\n  Select players from two rosters"),
+            ("block", "Trading Block\n  Find targets for a player you want to trade"),
+            ("discover", "Trade Discovery\n  Find trades to improve specific categories"),
+        ]
+        for mode_id, label in modes:
+            item = ListItem(Label(label))
+            item._mode = mode_id
+            lv.mount(item)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        mode = getattr(event.item, "_mode", None)
+        if mode:
+            self.dismiss(mode)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class CategorySelectModal(Screen):
+    """Modal for selecting stat categories to improve (multi-select)."""
+    BINDINGS = [("escape", "cancel", "Cancel"), ("d", "confirm", "Done")]
+    CSS = """
+    CategorySelectModal {
+        align: center middle;
+    }
+    #cat-select-container {
+        width: 50;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #cat-select-title {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #cat-select-hint {
+        height: 1;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    #cat-select-list {
+        height: auto;
+        max-height: 70%;
+    }
+    #cat-select-list > ListItem {
+        height: 1;
+        padding: 0 1;
+    }
+    #cat-select-list > ListItem.--highlight {
+        background: #3A5A3A;
+    }
+    """
+
+    def __init__(self, categories: list[StatCategory]) -> None:
+        super().__init__()
+        self._categories = [c for c in categories if not c.is_only_display]
+        self._selected: set[str] = set()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="cat-select-container"):
+            yield Static("Select Categories to Improve", id="cat-select-title")
+            yield Static("[Enter] toggle selection  |  [d] done — run discovery  |  [Esc] cancel", id="cat-select-hint")
+            yield ListView(id="cat-select-list")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#cat-select-list", ListView)
+        for cat in self._categories:
+            direction = "higher ↑" if cat.sort_order == "1" else "lower ↓"
+            ptype = "bat" if cat.position_type == "B" else "pit"
+            label = f"  {cat.display_name:<8} ({ptype}, {direction})"
+            item = ListItem(Label(label))
+            item._stat_id = cat.stat_id
+            lv.mount(item)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        stat_id = getattr(event.item, "_stat_id", None)
+        if stat_id is None:
+            return
+        if stat_id in self._selected:
+            self._selected.discard(stat_id)
+        else:
+            self._selected.add(stat_id)
+        self._refresh_labels()
+
+    def _refresh_labels(self) -> None:
+        lv = self.query_one("#cat-select-list", ListView)
+        for i, cat in enumerate(self._categories):
+            direction = "higher ↑" if cat.sort_order == "1" else "lower ↓"
+            ptype = "bat" if cat.position_type == "B" else "pit"
+            marker = "★" if cat.stat_id in self._selected else " "
+            label = f"{marker} {cat.display_name:<8} ({ptype}, {direction})"
+            try:
+                item = lv.children[i]
+                item.query_one(Label).update(label)
+            except Exception:
+                pass
+
+    def action_confirm(self) -> None:
+        if self._selected:
+            self.dismiss(list(self._selected))
+        else:
+            self.notify("Select at least one category", severity="warning")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class TradeAnalyzerScreen(Screen):
+    """Analyze the impact of a trade between two teams."""
+    BINDINGS = [
+        ("escape", "go_back", "Back"),
+        ("q", "go_back", "Back"),
+        ("b", "select_team_b", "Team B"),
+        ("a", "analyze", "Analyze"),
+        ("m", "switch_mode", "Mode"),
+        ("1", "trade_view_season", "Season"),
+        ("2", "trade_view_last30", "L30"),
+    ]
+    CSS = """
+    #trade-header {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #trade-subheader {
+        height: 1;
+        content-align: center middle;
+        background: $surface;
+        color: $text-muted;
+    }
+    #trade-split {
+        height: 1fr;
+    }
+    #trade-left {
+        width: 60%;
+        border-right: solid $primary;
+    }
+    #trade-right {
+        width: 40%;
+    }
+    #trade-left-scroll {
+        height: 1fr;
+    }
+    #trade-right-scroll {
+        height: 1fr;
+        padding: 0 1;
+    }
+    .trade-team-label {
+        height: 1;
+        text-style: bold;
+        padding: 0 1;
+    }
+    .trade-section-label {
+        height: 1;
+        text-style: bold;
+        background: #2A2A2A;
+        padding: 0 1;
+        color: $text-muted;
+    }
+    .trade-roster-table {
+        height: auto;
+        max-height: 45%;
+        background: $panel;
+    }
+    .trade-result-label {
+        height: auto;
+        padding: 0 1;
+    }
+    .trade-impact-table {
+        height: auto;
+        background: $panel;
+    }
+    DataTable > .datatable--cursor {
+        background: #3A5A3A;
+        color: #E8E4DF;
+    }
+    #trade-loading {
+        height: auto;
+        content-align: center middle;
+        padding: 1 0;
+    }
+    #trade-loading-status {
+        height: 1;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    """
+
+    def __init__(self, api: YahooFantasyAPI, league: League,
+                 categories: list[StatCategory]) -> None:
+        super().__init__()
+        self.api = api
+        self.league = league
+        self.categories = categories
+        self._mode = "analyze"  # "analyze", "block", or "discover"
+        self._team_a_key: str | None = None
+        self._team_a_name: str = ""
+        self._team_b_key: str | None = None
+        self._team_b_name: str = ""
+        self._roster_a: list[PlayerStats] = []
+        self._roster_b: list[PlayerStats] = []
+        self._selected_a: set[str] = set()  # player_keys checked for trade
+        self._selected_b: set[str] = set()
+        # Trading Block state
+        self._block_player: PlayerStats | None = None
+        self._trade_targets: list = []  # list[TradeTarget]
+        # Trade Discovery state
+        self._discover_cats: list[str] = []
+        self._discover_scenarios: list = []  # list[TradeScenario]
+        # Stat view for roster tables
+        self._trade_view = "season"  # "season" or "last30"
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("", id="trade-header")
+        yield Static("", id="trade-subheader")
+        with Horizontal(id="trade-split"):
+            with Vertical(id="trade-left"):
+                yield VerticalScroll(id="trade-left-scroll")
+            with Vertical(id="trade-right"):
+                with Vertical(id="trade-loading"):
+                    yield LoadingIndicator()
+                    yield Static("Analyzing trade...", id="trade-loading-status")
+                yield VerticalScroll(id="trade-right-scroll")
+        yield WrappingFooter()
+
+    def on_mount(self) -> None:
+        self.query_one("#trade-header", Static).update(
+            f" {self.league.name} — Trade Analyzer "
+        )
+        self.query_one("#trade-loading").display = False
+        self._update_subheader()
+        # Auto-select Team A
+        teams = self.api.get_team_season_stats(self.league.league_key)
+        options = [(t.team_key, t.name) for t in teams]
+        self.app.push_screen(
+            TeamSelectModal(options),
+            callback=self._on_team_a_selected,
+        )
+
+    def _update_subheader(self) -> None:
+        sub = Text()
+        mode_labels = {"analyze": "Analyze Trade", "block": "Trading Block", "discover": "Trade Discovery"}
+        sub.append(f" [{mode_labels.get(self._mode, self._mode)}] ", style="bold italic")
+
+        if self._mode == "discover":
+            if self._discover_cats:
+                scored = [c for c in self.categories if not c.is_only_display]
+                cat_names = [c.display_name for c in scored if c.stat_id in self._discover_cats]
+                sub.append(f" Improving: ", style="dim")
+                sub.append(", ".join(cat_names), style=f"bold {TEAM_A_COLOR}")
+                sub.append("  |  [m] Mode", style="dim")
+            elif self._team_a_key:
+                sub.append(f" {self._team_a_name}", style=f"bold {TEAM_A_COLOR}")
+                sub.append("  |  Select categories to improve  [m] Mode", style="dim")
+            else:
+                sub.append(" Select your team...", style="dim")
+        elif self._mode == "block":
+            if self._block_player:
+                sub.append(f" Trading: ", style="dim")
+                sub.append(f"{self._block_player.name}", style=f"bold {TEAM_A_COLOR}")
+                sub.append(f" ({self._block_player.position})", style="dim")
+                sub.append("  |  [Enter] Select target  [m] Mode", style="dim")
+            elif self._team_a_key:
+                sub.append(f" {self._team_a_name}", style=f"bold {TEAM_A_COLOR}")
+                sub.append("  |  [Enter] Select player to trade  [m] Mode", style="dim")
+            else:
+                sub.append(" Select your team...", style="dim")
+        else:
+            if self._team_a_key and self._team_b_key:
+                sub.append(f" {self._team_a_name}", style=f"bold {TEAM_A_COLOR}")
+                sub.append("  ↔  ", style="dim")
+                sub.append(f"{self._team_b_name} ", style=f"bold {TEAM_B_COLOR}")
+                sub.append("  |  [a] Analyze  [b] Team B  [m] Mode", style="dim")
+            elif self._team_a_key:
+                sub.append(f" {self._team_a_name}", style=f"bold {TEAM_A_COLOR}")
+                sub.append("  |  [b] Select trade partner  [m] Mode", style="dim")
+            else:
+                sub.append(" Select your team...", style="dim")
+        # Show stat view toggle
+        if self._team_a_key:
+            view_label = "Season" if self._trade_view == "season" else "Last 30"
+            sub.append(f"  |  {view_label}", style="bold")
+            sub.append(" [1/2]", style="dim")
+        self.query_one("#trade-subheader", Static).update(sub)
+
+    def _on_team_a_selected(self, team_key: str | None) -> None:
+        if not team_key:
+            self.app.pop_screen()
+            return
+        teams = self.api.get_team_season_stats(self.league.league_key)
+        self._team_a_key = team_key
+        self._team_a_name = next(
+            (t.name for t in teams if t.team_key == team_key), team_key
+        )
+        self._update_subheader()
+        self.run_worker(self._load_roster_a)
+
+    async def _load_roster_a(self) -> None:
+        self._roster_a = self.api.get_roster_stats_season(
+            self._team_a_key, self.league.current_week
+        )
+        self._selected_a.clear()
+        await self._render_left_pane()
+
+    def action_select_team_b(self) -> None:
+        if not self._team_a_key:
+            return
+        teams = self.api.get_team_season_stats(self.league.league_key)
+        options = [(t.team_key, t.name) for t in teams
+                   if t.team_key != self._team_a_key]
+        self.app.push_screen(
+            TeamSelectModal(options),
+            callback=self._on_team_b_selected,
+        )
+
+    def _on_team_b_selected(self, team_key: str | None) -> None:
+        if not team_key:
+            return
+        teams = self.api.get_team_season_stats(self.league.league_key)
+        self._team_b_key = team_key
+        self._team_b_name = next(
+            (t.name for t in teams if t.team_key == team_key), team_key
+        )
+        self._update_subheader()
+        self.run_worker(self._load_roster_b)
+
+    async def _load_roster_b(self) -> None:
+        self._roster_b = self.api.get_roster_stats_season(
+            self._team_b_key, self.league.current_week
+        )
+        self._selected_b.clear()
+        await self._render_left_pane()
+
+    async def _render_left_pane(self) -> None:
+        scroll = self.query_one("#trade-left-scroll", VerticalScroll)
+        await scroll.remove_children()
+
+        if self._roster_a:
+            label_a = Text(f" {self._team_a_name} ", style=f"bold {TEAM_A_COLOR}")
+            await scroll.mount(Static(label_a, classes="trade-team-label"))
+            table_a = DataTable(classes="trade-roster-table", id="roster-table-a")
+            await scroll.mount(table_a)
+            self._fill_trade_roster(table_a, self._roster_a, self._selected_a)
+
+        if self._roster_b:
+            await scroll.mount(Static(""))  # spacer
+            label_b = Text(f" {self._team_b_name} ", style=f"bold {TEAM_B_COLOR}")
+            await scroll.mount(Static(label_b, classes="trade-team-label"))
+            table_b = DataTable(classes="trade-roster-table", id="roster-table-b")
+            await scroll.mount(table_b)
+            self._fill_trade_roster(table_b, self._roster_b, self._selected_b)
+
+    def _fill_trade_roster(
+        self, table: DataTable, roster: list[PlayerStats], selected: set[str],
+    ) -> None:
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table._players = roster
+        table.clear(columns=True)
+
+        scored = [c for c in self.categories if not c.is_only_display]
+        batting_cats = [c for c in scored if c.position_type == "B"]
+        pitching_cats = [c for c in scored if c.position_type == "P"]
+        batting_positions = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF",
+                             "OF", "Util", "DH", "IF", "BN"}
+
+        # Build columns: marker, player, pos, then stat columns
+        cols: list[str | Text] = ["", "Player", "Pos"]
+        # Use batting cats for all players — pitchers show pitching cats
+        # Combine all stat cols since table is shared
+        for cat in batting_cats:
+            cols.append(cat.display_name)
+        cols.append("│")
+        for cat in pitching_cats:
+            cols.append(cat.display_name)
+        table.add_columns(*cols)
+
+        for p in roster:
+            is_batter = any(
+                pos in batting_positions for pos in p.position.split(",")
+            )
+            marker = "★" if p.player_key in selected else " "
+            marker_style = "bold #FFD700" if p.player_key in selected else "dim"
+
+            row: list[Text] = [
+                Text(marker, style=marker_style),
+                Text(p.name[:18], style="bold"),
+                Text(p.selected_position or p.position[:6], style="dim"),
+            ]
+            for cat in batting_cats:
+                val = get_stat_value(p.stats, cat.stat_id, cat.display_name)
+                style = "" if is_batter else "dim"
+                row.append(Text(str(val), style=style, justify="right"))
+            row.append(Text("│", style="dim"))
+            for cat in pitching_cats:
+                val = get_stat_value(p.stats, cat.stat_id, cat.display_name)
+                style = "" if not is_batter else "dim"
+                row.append(Text(str(val), style=style, justify="right"))
+            table.add_row(*row)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Handle Enter on a roster or target table row."""
+        table = event.data_table
+        table_id = getattr(table, "id", "")
+        players = getattr(table, "_players", [])
+        row_idx = event.cursor_row
+        if row_idx < 0 or row_idx >= len(players):
+            return
+
+        if self._mode == "discover":
+            if table_id == "scenario-table" and row_idx < len(self._discover_scenarios):
+                scenario = self._discover_scenarios[row_idx]
+                self._run_scenario_analysis(scenario)
+            return
+
+        if self._mode == "block":
+            if table_id == "roster-table-a":
+                # Select the player to trade
+                p = players[row_idx]
+                self._block_player = p
+                self._update_subheader()
+                self.run_worker(self._scan_trade_targets, group="trade-scan", exclusive=True)
+            elif table_id == "target-table":
+                # Select a target → run full analysis
+                target = self._trade_targets[row_idx]
+                self._run_block_analysis(target)
+            return
+
+        # Analyze mode: toggle selection
+        p = players[row_idx]
+        if table_id == "roster-table-a":
+            if p.player_key in self._selected_a:
+                self._selected_a.discard(p.player_key)
+            else:
+                self._selected_a.add(p.player_key)
+        elif table_id == "roster-table-b":
+            if p.player_key in self._selected_b:
+                self._selected_b.discard(p.player_key)
+            else:
+                self._selected_b.add(p.player_key)
+
+        # Re-render left pane to update markers
+        self.run_worker(self._render_left_pane, group="render-left", exclusive=True)
+
+    def action_switch_mode(self) -> None:
+        self.app.push_screen(
+            TradeModeSelectorModal(),
+            callback=self._on_mode_selected,
+        )
+
+    def _on_mode_selected(self, mode: str | None) -> None:
+        if mode is None or mode == self._mode:
+            return
+        self._mode = mode
+        self._block_player = None
+        self._trade_targets = []
+        self._discover_cats = []
+        self._discover_scenarios = []
+        self._selected_a.clear()
+        self._selected_b.clear()
+        self._team_b_key = None
+        self._team_b_name = ""
+        self._roster_b = []
+        self._update_subheader()
+        # Clear right pane
+        async def _clear():
+            scroll = self.query_one("#trade-right-scroll", VerticalScroll)
+            await scroll.remove_children()
+            await self._render_left_pane()
+        self.run_worker(_clear, group="render-left", exclusive=True)
+
+        if mode == "discover" and self._team_a_key:
+            self.app.push_screen(
+                CategorySelectModal(self.categories),
+                callback=self._on_categories_selected,
+            )
+
+    def _on_categories_selected(self, stat_ids: list[str] | None) -> None:
+        if not stat_ids:
+            return
+        self._discover_cats = stat_ids
+        self._update_subheader()
+        self.run_worker(self._run_discovery, group="trade-discovery", exclusive=True)
+
+    async def _run_discovery(self) -> None:
+        from gkl.trade import discover_trades
+
+        self.query_one("#trade-loading").display = True
+        self.query_one("#trade-loading-status", Static).update("Fetching all team rosters...")
+        self.query_one("#trade-right-scroll").display = False
+
+        try:
+            cache = self.app.shared_cache
+            await cache.ensure_loaded(self.api, self.league, self.categories)
+
+            import asyncio
+            teams = cache.all_teams
+
+            # Fetch season rosters for all teams in parallel
+            roster_tasks = [
+                asyncio.to_thread(
+                    self.api.get_roster_stats_season, t.team_key, self.league.current_week
+                )
+                for t in teams if t.team_key != self._team_a_key
+            ]
+            roster_results = await asyncio.gather(*roster_tasks)
+            all_rosters: dict[str, list] = {}
+            non_my_teams = [t for t in teams if t.team_key != self._team_a_key]
+            for t, roster in zip(non_my_teams, roster_results):
+                all_rosters[t.team_key] = roster
+            all_rosters[self._team_a_key] = self._roster_a
+
+            self.query_one("#trade-loading-status", Static).update(
+                "Finding trade scenarios..."
+            )
+            self._discover_scenarios = await asyncio.to_thread(
+                discover_trades,
+                self._team_a_key,
+                self._discover_cats,
+                all_rosters,
+                cache.all_teams,
+                cache.team_names,
+                self.categories,
+                cache.sgp_calc,
+            )
+
+            await self._render_discovery_results()
+        except Exception as e:
+            self.notify(f"Discovery failed: {e}", severity="error")
+        finally:
+            self.query_one("#trade-loading").display = False
+            self.query_one("#trade-right-scroll").display = True
+
+    async def _render_discovery_results(self) -> None:
+        from gkl.trade import TradeScenario
+
+        scroll = self.query_one("#trade-right-scroll", VerticalScroll)
+        await scroll.remove_children()
+
+        if not self._discover_scenarios:
+            await scroll.mount(Static(
+                Text("  No trade scenarios found for the selected categories.", style="dim"),
+            ))
+            return
+
+        scored = [c for c in self.categories if not c.is_only_display]
+        cat_names = [c.display_name for c in scored if c.stat_id in self._discover_cats]
+        header = Text()
+        header.append(f" Improving: ", style="dim")
+        header.append(", ".join(cat_names), style=f"bold {TEAM_A_COLOR}")
+        header.append(f"\n Select a scenario to see full trade analysis.", style="dim italic")
+        await scroll.mount(Static(header, classes="trade-result-label"))
+
+        scenario_table = DataTable(classes="trade-impact-table", id="scenario-table")
+        await scroll.mount(scenario_table)
+        scenario_table.cursor_type = "row"
+        scenario_table.zebra_stripes = True
+        scenario_table._players = self._discover_scenarios
+        scenario_table.add_columns("You Get", "From", "You Send", "ΔSGP", "ΔRoto", "ΔWin%", "Partner")
+
+        for s in self._discover_scenarios:
+            net_str = f"{s.net_sgp:+.1f}"
+            net_style = "bold green" if s.net_sgp > 0 else "bold red" if s.net_sgp < 0 else "dim"
+
+            roto_str = f"{s.roto_delta:+.1f}"
+            roto_style = "bold green" if s.roto_delta > 0.1 else "bold red" if s.roto_delta < -0.1 else "dim"
+
+            if abs(s.h2h_win_pct_delta) > 0.001:
+                h2h_str = f"{s.h2h_win_pct_delta:+.1%}"
+                h2h_style = "bold green" if s.h2h_win_pct_delta > 0 else "bold red"
+            else:
+                h2h_str = "—"
+                h2h_style = "dim"
+
+            # Partner roto delta — shows if the deal is realistic
+            partner_str = f"{s.partner_roto_delta:+.0f}"
+            if s.partner_roto_delta > 0.1:
+                partner_style = "green"  # partner benefits — good for acceptance
+            elif s.partner_roto_delta < -5:
+                partner_style = "red"  # partner loses a lot — unlikely to accept
+            else:
+                partner_style = "dim"
+
+            scenario_table.add_row(
+                Text(f"{s.target.name[:16]} ({s.target.position[:5]})", style="bold"),
+                Text(s.target_team_name[:12], style="dim"),
+                Text(f"{s.offer.name[:16]} ({s.offer.position[:5]})", style=f"{TEAM_A_COLOR}"),
+                Text(net_str, style=net_style, justify="right"),
+                Text(roto_str, style=roto_style, justify="right"),
+                Text(h2h_str, style=h2h_style, justify="right"),
+                Text(partner_str, style=partner_style, justify="right"),
+            )
+
+    async def _scan_trade_targets(self) -> None:
+        """Scan all rosters for trade targets matching the block player."""
+        from gkl.trade import find_trade_targets
+
+        self.query_one("#trade-loading").display = True
+        self.query_one("#trade-loading-status", Static).update("Fetching all team rosters...")
+        self.query_one("#trade-right-scroll").display = False
+
+        try:
+            cache = self.app.shared_cache
+            await cache.ensure_loaded(self.api, self.league, self.categories)
+
+            import asyncio
+            teams = cache.all_teams
+            weeks = list(range(1, self.league.current_week + 1))
+
+            # Fetch season rosters for all teams in parallel
+            self.query_one("#trade-loading-status", Static).update(
+                "Fetching season rosters for all teams..."
+            )
+            roster_tasks = [
+                asyncio.to_thread(
+                    self.api.get_roster_stats_season, t.team_key, self.league.current_week
+                )
+                for t in teams if t.team_key != self._team_a_key
+            ]
+            roster_results = await asyncio.gather(*roster_tasks)
+            all_rosters: dict[str, list] = {}
+            non_my_teams = [t for t in teams if t.team_key != self._team_a_key]
+            for t, roster in zip(non_my_teams, roster_results):
+                all_rosters[t.team_key] = roster
+            all_rosters[self._team_a_key] = self._roster_a
+
+            # Fetch weekly matchups
+            self.query_one("#trade-loading-status", Static).update(
+                "Fetching weekly matchup data..."
+            )
+            for w in weeks:
+                if w not in cache.week_matchups:
+                    try:
+                        wm = self.api.get_scoreboard(self.league.league_key, week=w)
+                        cache.week_matchups[w] = wm
+                    except Exception:
+                        pass
+
+            # Fetch weekly rosters for team A and all opposing teams
+            self.query_one("#trade-loading-status", Static).update(
+                "Fetching weekly player stats for all teams..."
+            )
+            all_weekly_rosters: dict[str, dict[int, list]] = {}
+            for tk in all_rosters:
+                all_weekly_rosters[tk] = {}
+
+            for w in weeks:
+                week_tasks = [
+                    asyncio.to_thread(self.api.get_roster_stats, tk, w)
+                    for tk in all_rosters
+                ]
+                week_results = await asyncio.gather(*week_tasks, return_exceptions=True)
+                for tk, result in zip(all_rosters.keys(), week_results):
+                    if not isinstance(result, Exception):
+                        all_weekly_rosters[tk][w] = result
+
+            self.query_one("#trade-loading-status", Static).update(
+                "Computing roto and H2H impact for each target..."
+            )
+            self._trade_targets = await asyncio.to_thread(
+                find_trade_targets,
+                self._block_player,
+                self._team_a_key,
+                all_rosters,
+                cache.all_teams,
+                cache.team_names,
+                self.categories,
+                cache.sgp_calc,
+                cache.week_matchups,
+                all_weekly_rosters,
+                self.league.current_week,
+            )
+
+            await self._render_target_list()
+        except Exception as e:
+            self.notify(f"Scan failed: {e}", severity="error")
+        finally:
+            self.query_one("#trade-loading").display = False
+            self.query_one("#trade-right-scroll").display = True
+
+    async def _render_target_list(self) -> None:
+        """Render the ranked trade target list in the right pane."""
+        scroll = self.query_one("#trade-right-scroll", VerticalScroll)
+        await scroll.remove_children()
+
+        if not self._trade_targets:
+            await scroll.mount(Static(
+                Text("  No position-eligible trade targets found.", style="dim"),
+            ))
+            return
+
+        out_sgp = None
+        if self._block_player:
+            cache = self.app.shared_cache
+            if cache.sgp_calc:
+                out_sgp = cache.sgp_calc.player_sgp(self._block_player)
+
+        header = Text()
+        header.append(f" Trading: ", style="dim")
+        header.append(f"{self._block_player.name}", style=f"bold {TEAM_A_COLOR}")
+        if out_sgp is not None:
+            header.append(f" (SGP: {out_sgp:+.1f})", style="dim")
+        header.append(f"\n Select a target to see full trade analysis.", style="dim italic")
+        await scroll.mount(Static(header, classes="trade-result-label"))
+
+        target_table = DataTable(classes="trade-impact-table", id="target-table")
+        await scroll.mount(target_table)
+        target_table.cursor_type = "row"
+        target_table.zebra_stripes = True
+        target_table._players = self._trade_targets
+        target_table.add_columns("Player", "Pos", "Team", "SGP", "ΔSGP", "ΔRoto", "ΔWin%", "Partner")
+
+        for t in self._trade_targets:
+            sgp_str = f"{t.sgp:+.1f}" if t.sgp is not None else "N/A"
+
+            net_str = f"{t.net_sgp:+.1f}"
+            net_style = "bold green" if t.net_sgp > 0 else "bold red" if t.net_sgp < 0 else "dim"
+
+            roto_str = f"{t.roto_delta:+.1f}"
+            roto_style = "bold green" if t.roto_delta > 0.1 else "bold red" if t.roto_delta < -0.1 else "dim"
+
+            if abs(t.h2h_win_pct_delta) > 0.001:
+                h2h_str = f"{t.h2h_win_pct_delta:+.1%}"
+                h2h_style = "bold green" if t.h2h_win_pct_delta > 0 else "bold red"
+            else:
+                h2h_str = "—"
+                h2h_style = "dim"
+
+            partner_str = f"{t.partner_roto_delta:+.0f}"
+            if t.partner_roto_delta > 0.1:
+                partner_style = "green"
+            elif t.partner_roto_delta < -5:
+                partner_style = "red"
+            else:
+                partner_style = "dim"
+
+            target_table.add_row(
+                Text(t.player.name[:20], style="bold"),
+                Text(t.player.position[:12], style="dim"),
+                Text(t.team_name[:15], style="dim"),
+                Text(sgp_str, justify="right"),
+                Text(net_str, style=net_style, justify="right"),
+                Text(roto_str, style=roto_style, justify="right"),
+                Text(h2h_str, style=h2h_style, justify="right"),
+                Text(partner_str, style=partner_style, justify="right"),
+            )
+
+    def _run_block_analysis(self, target) -> None:
+        """Run full trade analysis for a Trading Block target selection."""
+        from gkl.trade import TradeTarget
+        target: TradeTarget
+
+        # Set up as if it were an Analyze Trade
+        self._team_b_key = target.team_key
+        self._team_b_name = target.team_name
+        self._selected_a = {self._block_player.player_key}
+        self._selected_b = {target.player.player_key}
+
+        # Fetch team B roster, update left pane, and run analysis
+        async def _load_and_analyze():
+            self._roster_b = self.api.get_roster_stats_season(
+                target.team_key, self.league.current_week
+            )
+            # Switch to analyze mode view for the left pane
+            self._mode = "analyze"
+            self._update_subheader()
+            await self._render_left_pane()
+            await self._run_analysis()
+
+        self.run_worker(_load_and_analyze, group="trade-analysis", exclusive=True)
+
+    def _run_scenario_analysis(self, scenario) -> None:
+        """Run full trade analysis for a Trade Discovery scenario."""
+        from gkl.trade import TradeScenario
+        scenario: TradeScenario
+
+        self._team_b_key = scenario.target_team_key
+        self._team_b_name = scenario.target_team_name
+        self._selected_a = {scenario.offer.player_key}
+        self._selected_b = {scenario.target.player_key}
+
+        async def _load_and_analyze():
+            self._roster_b = self.api.get_roster_stats_season(
+                scenario.target_team_key, self.league.current_week
+            )
+            self._mode = "analyze"
+            self._update_subheader()
+            await self._render_left_pane()
+            await self._run_analysis()
+
+        self.run_worker(_load_and_analyze, group="trade-analysis", exclusive=True)
+
+    def action_analyze(self) -> None:
+        if not self._selected_a or not self._selected_b:
+            self.notify("Select players from both teams first", severity="warning")
+            return
+        if not self._team_a_key or not self._team_b_key:
+            self.notify("Select both teams first", severity="warning")
+            return
+        self.run_worker(self._run_analysis, group="trade-analysis", exclusive=True)
+
+    async def _run_analysis(self) -> None:
+        from gkl.trade import TradeSide, compute_trade_impact
+
+        # Show loading
+        self.query_one("#trade-loading").display = True
+        self.query_one("#trade-right-scroll").display = False
+
+        try:
+            cache = self.app.shared_cache
+            await cache.ensure_loaded(self.api, self.league, self.categories)
+
+            players_out_a = [p for p in self._roster_a if p.player_key in self._selected_a]
+            players_out_b = [p for p in self._roster_b if p.player_key in self._selected_b]
+
+            side_a = TradeSide(self._team_a_key, self._team_a_name, players_out_a)
+            side_b = TradeSide(self._team_b_key, self._team_b_name, players_out_b)
+
+            import asyncio
+            impact = await asyncio.to_thread(
+                compute_trade_impact,
+                cache.all_teams,
+                self._roster_a,
+                self._roster_b,
+                side_a, side_b,
+                self.categories,
+            )
+
+            # Fetch weekly matchups and per-player rosters for H2H replay
+            self.query_one("#trade-loading-status", Static).update(
+                "Loading weekly data for H2H replay..."
+            )
+            weeks = list(range(1, self.league.current_week + 1))
+            # Fetch weekly matchups
+            for w in weeks:
+                if w not in cache.week_matchups:
+                    try:
+                        wm = self.api.get_scoreboard(self.league.league_key, week=w)
+                        cache.week_matchups[w] = wm
+                    except Exception:
+                        pass
+
+            # Fetch per-player weekly rosters for both teams (parallel per week)
+            weekly_roster_a: dict[int, list] = {}
+            weekly_roster_b: dict[int, list] = {}
+            for w in weeks:
+                try:
+                    ra, rb = await asyncio.gather(
+                        asyncio.to_thread(
+                            self.api.get_roster_stats, self._team_a_key, w),
+                        asyncio.to_thread(
+                            self.api.get_roster_stats, self._team_b_key, w),
+                    )
+                    weekly_roster_a[w] = ra
+                    weekly_roster_b[w] = rb
+                except Exception:
+                    pass
+
+            from gkl.trade import replay_h2h_with_trade, compute_h2h_hypothetical
+            side_a_keys = {p.player_key for p in players_out_a}
+            side_b_keys = {p.player_key for p in players_out_b}
+            h2h_replay = await asyncio.to_thread(
+                replay_h2h_with_trade,
+                self._team_a_key,
+                self._team_b_key,
+                side_a_keys, side_b_keys,
+                cache.week_matchups,
+                weekly_roster_a, weekly_roster_b,
+                self.categories,
+                self.league.current_week,
+            )
+            h2h_hypo = await asyncio.to_thread(
+                compute_h2h_hypothetical,
+                self._team_a_key,
+                side_a_keys, side_b_keys,
+                cache.week_matchups,
+                weekly_roster_a, weekly_roster_b,
+                self.categories,
+                self.league.current_week,
+            )
+
+            await self._render_results(impact, h2h_replay, h2h_hypo)
+
+            # AI summary if API key is available
+            api_key = load_anthropic_key()
+            if api_key:
+                await self._render_ai_summary(impact, h2h_replay, api_key)
+        except Exception as e:
+            self.notify(f"Analysis failed: {e}", severity="error")
+        finally:
+            self.query_one("#trade-loading").display = False
+            self.query_one("#trade-right-scroll").display = True
+
+    async def _render_results(self, impact, h2h_replay=None, h2h_hypo=None) -> None:
+        from gkl.trade import TradeImpact, H2HReplay, H2HHypothetical
+        impact: TradeImpact
+
+        scroll = self.query_one("#trade-right-scroll", VerticalScroll)
+        await scroll.remove_children()
+
+        # --- Stat Impact Table ---
+        await scroll.mount(Static(
+            Text(" CATEGORY IMPACT ", style="bold"),
+            classes="trade-section-label",
+        ))
+
+        cat_table = DataTable(classes="trade-impact-table")
+        await scroll.mount(cat_table)
+        cat_table.cursor_type = "none"
+        cat_table.zebra_stripes = True
+        cat_table.add_columns("Category", "Before", "After", "Delta")
+
+        for ci in impact.cat_impacts:
+            if ci.delta == 0:
+                delta_style = "dim"
+                delta_str = "—"
+            elif ci.favorable:
+                delta_style = "bold green"
+                # Format delta based on stat type
+                if ci.stat_id in RATE_STATS:
+                    delta_str = f"{ci.delta:+.3f}"
+                else:
+                    delta_str = f"{ci.delta:+.0f}"
+            else:
+                delta_style = "bold red"
+                if ci.stat_id in RATE_STATS:
+                    delta_str = f"{ci.delta:+.3f}"
+                else:
+                    delta_str = f"{ci.delta:+.0f}"
+
+            cat_table.add_row(
+                Text(f" {ci.display_name}", style="bold"),
+                Text(ci.before, justify="right"),
+                Text(ci.after, justify="right"),
+                Text(delta_str, style=delta_style, justify="right"),
+            )
+
+        await scroll.mount(Static(""))  # spacer
+
+        # --- Roto Standings Table ---
+        await scroll.mount(Static(
+            Text(" ROTO STANDINGS (POST-TRADE) ", style="bold"),
+            classes="trade-section-label",
+        ))
+
+        from gkl.trade import RotoEntry
+        roto_table = DataTable(classes="trade-impact-table")
+        await scroll.mount(roto_table)
+        roto_table.cursor_type = "none"
+        roto_table.zebra_stripes = True
+        roto_table.add_columns(
+            "", "Team",
+            "Ovr", "Δ",
+            "│",
+            "Bat", "Δ",
+            "│",
+            "Pit", "Δ",
+        )
+
+        # Build before lookup
+        before_by_key = {r.team_key: r for r in impact.roto_standings_before}
+
+        # Iterate in after-trade order (already sorted by compute_roto)
+        for ra in impact.roto_standings_after:
+            rb = before_by_key.get(ra.team_key, ra)
+            rank_change = rb.rank - ra.rank  # positive = improved
+
+            # Highlight the two traded teams
+            is_team_a = ra.team_key == self._team_a_key
+            is_team_b = ra.team_key == self._team_b_key
+            if is_team_a:
+                name_style = f"bold {TEAM_A_COLOR}"
+            elif is_team_b:
+                name_style = f"bold {TEAM_B_COLOR}"
+            else:
+                name_style = ""
+
+            # Rank movement indicator
+            if rank_change > 0:
+                rank_str = f"▲{rank_change}"
+                rank_style = "bold green"
+            elif rank_change < 0:
+                rank_str = f"▼{abs(rank_change)}"
+                rank_style = "bold red"
+            else:
+                rank_str = "—"
+                rank_style = "dim"
+
+            # Batting delta
+            bat_delta = ra.batting - rb.batting
+            if bat_delta > 0.1:
+                bat_d_str = f"+{bat_delta:.0f}"
+                bat_d_style = "green"
+            elif bat_delta < -0.1:
+                bat_d_str = f"{bat_delta:.0f}"
+                bat_d_style = "red"
+            else:
+                bat_d_str = "—"
+                bat_d_style = "dim"
+
+            # Pitching delta
+            pitch_delta = ra.pitching - rb.pitching
+            if pitch_delta > 0.1:
+                pitch_d_str = f"+{pitch_delta:.0f}"
+                pitch_d_style = "green"
+            elif pitch_delta < -0.1:
+                pitch_d_str = f"{pitch_delta:.0f}"
+                pitch_d_style = "red"
+            else:
+                pitch_d_str = "—"
+                pitch_d_style = "dim"
+
+            roto_table.add_row(
+                Text(f"#{ra.rank}", style="bold" if is_team_a or is_team_b else "dim"),
+                Text(ra.name[:18], style=name_style),
+                Text(f"{ra.total:.0f}", justify="right", style="bold"),
+                Text(rank_str, style=rank_style, justify="right"),
+                Text("│", style="dim"),
+                Text(f"{ra.batting:.0f}", justify="right"),
+                Text(bat_d_str, style=bat_d_style, justify="right"),
+                Text("│", style="dim"),
+                Text(f"{ra.pitching:.0f}", justify="right"),
+                Text(pitch_d_str, style=pitch_d_style, justify="right"),
+            )
+
+        # --- H2H Weekly Replay ---
+        if h2h_replay and h2h_replay.weeks:
+            await scroll.mount(Static(""))  # spacer
+
+            await scroll.mount(Static(
+                Text(" H2H WEEKLY REPLAY ", style="bold"),
+                classes="trade-section-label",
+            ))
+
+            replay_desc = Text()
+            replay_desc.append(
+                "  Replays each completed week's actual matchup with the trade\n"
+                "  applied to your team's weekly stats.",
+                style="dim italic",
+            )
+            await scroll.mount(Static(replay_desc, classes="trade-result-label"))
+
+            replay_table = DataTable(classes="trade-impact-table")
+            await scroll.mount(replay_table)
+            replay_table.cursor_type = "none"
+            replay_table.zebra_stripes = True
+            replay_table.add_columns("Wk", "Opponent", "Actual", "W/ Trade", "")
+
+            for wr in h2h_replay.weeks:
+                actual_str = f"{wr.actual_wins}-{wr.actual_losses}-{wr.actual_ties}"
+                trade_str = f"{wr.trade_wins}-{wr.trade_losses}-{wr.trade_ties}"
+
+                if wr.changed:
+                    if wr.trade_result == "W" and wr.actual_result != "W":
+                        change_str = "▲ FLIP"
+                        change_style = "bold green"
+                    elif wr.trade_result == "L" and wr.actual_result != "L":
+                        change_str = "▼ FLIP"
+                        change_style = "bold red"
+                    else:
+                        change_str = "~ FLIP"
+                        change_style = "bold #E8A735"
+                else:
+                    change_str = ""
+                    change_style = "dim"
+
+                replay_table.add_row(
+                    Text(f"{wr.week}", justify="right"),
+                    Text(wr.opponent_name[:18]),
+                    Text(f"{actual_str} {wr.actual_result}", justify="right"),
+                    Text(f"{trade_str} {wr.trade_result}", justify="right"),
+                    Text(change_str, style=change_style),
+                )
+
+            # Season summary
+            await scroll.mount(Static(""))
+            summary = Text()
+            summary.append(f"  Season record: ", style="dim")
+            summary.append(
+                f"{h2h_replay.actual_season_w}-{h2h_replay.actual_season_l}-{h2h_replay.actual_season_t}",
+                style="bold",
+            )
+            summary.append(f"  →  ", style="dim")
+            summary.append(
+                f"{h2h_replay.trade_season_w}-{h2h_replay.trade_season_l}-{h2h_replay.trade_season_t}",
+                style="bold",
+            )
+            sw_delta = h2h_replay.trade_season_w - h2h_replay.actual_season_w
+            if sw_delta > 0:
+                summary.append(f"  +{sw_delta}W", style="bold green")
+            elif sw_delta < 0:
+                summary.append(f"  {sw_delta}W", style="bold red")
+            await scroll.mount(Static(summary, classes="trade-result-label"))
+
+        # --- H2H Hypothetical (per-week vs all opponents) ---
+        if h2h_hypo:
+            await scroll.mount(Static(""))  # spacer
+
+            await scroll.mount(Static(
+                Text(" H2H HYPOTHETICAL (ALL OPPONENTS, ALL WEEKS) ", style="bold"),
+                classes="trade-section-label",
+            ))
+
+            n_matchups = h2h_hypo.before_w + h2h_hypo.before_l + h2h_hypo.before_t
+            n_opponents = self.league.num_teams - 1
+            n_weeks = self.league.current_week
+            hypo_desc = Text()
+            hypo_desc.append(
+                f"  For each of the {n_weeks} completed weeks, simulates your\n"
+                f"  weekly stats vs all {n_opponents} other teams ({n_matchups} total matchups).",
+                style="dim italic",
+            )
+            await scroll.mount(Static(hypo_desc, classes="trade-result-label"))
+
+            hypo_before = Text()
+            hypo_before.append(f"  Before: ", style="dim")
+            hypo_before.append(f"{h2h_hypo.before_w}-{h2h_hypo.before_l}-{h2h_hypo.before_t}", style="bold")
+            b_pct = h2h_hypo.before_w / n_matchups if n_matchups else 0
+            hypo_before.append(f" ({b_pct:.1%})", style="dim")
+            await scroll.mount(Static(hypo_before, classes="trade-result-label"))
+
+            hypo_after = Text()
+            hypo_after.append(f"  After:  ", style="dim")
+            hypo_after.append(f"{h2h_hypo.after_w}-{h2h_hypo.after_l}-{h2h_hypo.after_t}", style="bold")
+            a_pct = h2h_hypo.after_w / n_matchups if n_matchups else 0
+            hypo_after.append(f" ({a_pct:.1%})", style="dim")
+            hw_delta = h2h_hypo.after_w - h2h_hypo.before_w
+            if hw_delta > 0:
+                hypo_after.append(f"  +{hw_delta}W", style="bold green")
+            elif hw_delta < 0:
+                hypo_after.append(f"  {hw_delta}W", style="bold red")
+            await scroll.mount(Static(hypo_after, classes="trade-result-label"))
+
+        await scroll.mount(Static(""))  # spacer
+
+        # --- Trade Partner Impact ---
+        await scroll.mount(Static(
+            Text(f" IMPACT ON {self._team_b_name.upper()} ", style="bold"),
+            classes="trade-section-label",
+        ))
+
+        partner_roto = Text()
+        b_rank_delta = impact.roto_rank_before_b - impact.roto_rank_after_b
+        partner_roto.append(f"  Roto: #{impact.roto_rank_before_b} → #{impact.roto_rank_after_b}", style="dim")
+        if b_rank_delta > 0:
+            partner_roto.append(f"  ▲ {b_rank_delta}", style="green")
+        elif b_rank_delta < 0:
+            partner_roto.append(f"  ▼ {abs(b_rank_delta)}", style="red")
+        await scroll.mount(Static(partner_roto, classes="trade-result-label"))
+
+        partner_h2h = Text()
+        partner_h2h.append(f"  H2H: {impact.h2h_before_b.record_str} → {impact.h2h_after_b.record_str}", style="dim")
+        b_win_delta = impact.h2h_after_b.total_wins - impact.h2h_before_b.total_wins
+        if b_win_delta > 0:
+            partner_h2h.append(f"  +{b_win_delta}W", style="green")
+        elif b_win_delta < 0:
+            partner_h2h.append(f"  {b_win_delta}W", style="red")
+        await scroll.mount(Static(partner_h2h, classes="trade-result-label"))
+
+    async def _render_ai_summary(self, impact, h2h_replay, api_key: str) -> None:
+        from gkl.trade import build_trade_summary_prompt, get_trade_ai_summary
+        from gkl.skipper import DEFAULT_MODEL
+
+        scroll = self.query_one("#trade-right-scroll", VerticalScroll)
+
+        await scroll.mount(Static(""))
+        await scroll.mount(Static(
+            Text(" AI ANALYSIS ", style="bold"),
+            classes="trade-section-label",
+        ))
+
+        ai_content = Static(
+            Text("  Generating analysis...", style="dim italic"),
+            classes="trade-result-label",
+        )
+        await scroll.mount(ai_content)
+        scroll.scroll_end(animate=False)
+
+        try:
+            players_out_a = [p for p in self._roster_a if p.player_key in self._selected_a]
+            players_out_b = [p for p in self._roster_b if p.player_key in self._selected_b]
+
+            prompt = build_trade_summary_prompt(
+                impact, self._team_a_name, self._team_b_name,
+                players_out_a, players_out_b, h2h_replay,
+            )
+            summary = await get_trade_ai_summary(prompt, api_key, DEFAULT_MODEL)
+            ai_content.update(Text(f"  {summary}"))
+        except Exception as e:
+            err_msg = str(e)
+            # Include more detail for API errors
+            if hasattr(e, 'message'):
+                err_msg = e.message
+            elif hasattr(e, 'body'):
+                err_msg = f"{e} — {e.body}"
+            ai_content.update(Text(f"  Could not generate AI analysis: {err_msg}", style="dim italic"))
+        scroll.scroll_end(animate=False)
+
+    def action_trade_view_season(self) -> None:
+        if self._trade_view == "season":
+            return
+        self._trade_view = "season"
+        self.run_worker(self._reload_trade_rosters, group="trade-view", exclusive=True)
+
+    def action_trade_view_last30(self) -> None:
+        if self._trade_view == "last30":
+            return
+        self._trade_view = "last30"
+        self.run_worker(self._reload_trade_rosters, group="trade-view", exclusive=True)
+
+    async def _reload_trade_rosters(self) -> None:
+        """Reload rosters with the current stat view and re-render."""
+        import asyncio
+        if self._trade_view == "last30":
+            fetch = self.api.get_roster_stats_last30
+        else:
+            fetch = self.api.get_roster_stats_season
+
+        if self._team_a_key:
+            self._roster_a = await asyncio.to_thread(
+                fetch, self._team_a_key, self.league.current_week)
+        if self._team_b_key:
+            self._roster_b = await asyncio.to_thread(
+                fetch, self._team_b_key, self.league.current_week)
+        await self._render_left_pane()
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
+
+
 # --- Scoreboard Screen (3-pane layout) ---
 
 
@@ -6603,6 +7888,7 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
                 ("c", "compare", "Compare"),
                 ("i", "player_detail", "Player Detail"),
                 ("a", "ask_skipper", "Ask Skipper"),
+                ("T", "trade_analyzer", "Trade Analyzer"),
                 ("C", "settings", "Config")]
     CSS = """
     #board-header {
@@ -6823,7 +8109,6 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
 
         Also computes roto ranks and H2H records for display.
         """
-        from gkl.stats import RATE_STATS
         season_teams = self.api.get_team_season_stats(self.league.league_key)
         season_by_key = {t.team_key: t for t in season_teams}
         weeks_played = max(self.league.current_week - 1, 1)
@@ -7404,6 +8689,12 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         if self.league:
             self.app.push_screen(
                 AskSkipperScreen(self.api, self.league, self.categories)
+            )
+
+    def action_trade_analyzer(self) -> None:
+        if self.league:
+            self.app.push_screen(
+                TradeAnalyzerScreen(self.api, self.league, self.categories)
             )
 
     def action_mlb_scores(self) -> None:
