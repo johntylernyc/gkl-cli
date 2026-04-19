@@ -6927,83 +6927,88 @@ class TradeAnalyzerScreen(Screen):
 
         await scroll.mount(Static(""))  # spacer
 
-        # --- Roto Impact ---
+        # --- Roto Standings Table ---
         await scroll.mount(Static(
             Text(" ROTO STANDINGS ", style="bold"),
             classes="trade-section-label",
         ))
 
-        roto_line = Text()
-        rank_delta = impact.roto_rank_before_a - impact.roto_rank_after_a  # positive = improved
-        pts_delta = impact.roto_points_after_a - impact.roto_points_before_a
-        roto_line.append(f"  Rank: ", style="dim")
-        roto_line.append(f"#{impact.roto_rank_before_a}", style="bold")
-        roto_line.append(f"  →  ", style="dim")
-        roto_line.append(f"#{impact.roto_rank_after_a}", style="bold")
-        if rank_delta > 0:
-            roto_line.append(f"  ▲ {rank_delta}", style="bold green")
-        elif rank_delta < 0:
-            roto_line.append(f"  ▼ {abs(rank_delta)}", style="bold red")
-        await scroll.mount(Static(roto_line, classes="trade-result-label"))
+        from gkl.trade import RotoEntry
+        roto_table = DataTable(classes="trade-impact-table")
+        await scroll.mount(roto_table)
+        roto_table.cursor_type = "none"
+        roto_table.zebra_stripes = True
+        roto_table.add_columns("", "Team", "Before", "After", "Δ")
 
-        roto_pts = Text()
-        roto_pts.append(f"  Points: ", style="dim")
-        roto_pts.append(f"{impact.roto_points_before_a:.1f}", style="bold")
-        roto_pts.append(f"  →  ", style="dim")
-        roto_pts.append(f"{impact.roto_points_after_a:.1f}", style="bold")
-        if pts_delta > 0:
-            roto_pts.append(f"  +{pts_delta:.1f}", style="bold green")
-        elif pts_delta < 0:
-            roto_pts.append(f"  {pts_delta:.1f}", style="bold red")
-        await scroll.mount(Static(roto_pts, classes="trade-result-label"))
+        # Build a lookup from after standings
+        after_by_key = {r.team_key: r for r in impact.roto_standings_after}
 
-        # Explain if rank drops despite points gain
-        if rank_delta < 0 and pts_delta > 0:
-            note = Text()
-            note.append(f"  Note: ", style="dim italic")
-            note.append(f"your points improve but the trade partner gains more, "
-                        f"pushing them ahead of you", style="dim italic")
-            await scroll.mount(Static(note, classes="trade-result-label"))
+        for rb in impact.roto_standings_before:
+            ra = after_by_key.get(rb.team_key, rb)
+            rank_change = rb.rank - ra.rank  # positive = improved
+            pts_change = ra.total - rb.total
+
+            # Highlight the two traded teams
+            is_team_a = rb.team_key == self._team_a_key
+            is_team_b = rb.team_key == self._team_b_key
+            if is_team_a:
+                name_style = f"bold {TEAM_A_COLOR}"
+            elif is_team_b:
+                name_style = f"bold {TEAM_B_COLOR}"
+            else:
+                name_style = ""
+
+            # Rank movement indicator
+            if rank_change > 0:
+                rank_str = f"▲{rank_change}"
+                rank_style = "bold green"
+            elif rank_change < 0:
+                rank_str = f"▼{abs(rank_change)}"
+                rank_style = "bold red"
+            else:
+                rank_str = "—"
+                rank_style = "dim"
+
+            roto_table.add_row(
+                Text(f"#{rb.rank}", style="dim"),
+                Text(rb.name[:20], style=name_style),
+                Text(f"{rb.total:.1f}", justify="right"),
+                Text(f"{ra.total:.1f}", justify="right"),
+                Text(rank_str, style=rank_style, justify="right"),
+            )
 
         await scroll.mount(Static(""))  # spacer
 
-        # --- H2H Hypothetical Impact ---
+        # --- H2H Hypothetical ---
         await scroll.mount(Static(
-            Text(" H2H HYPOTHETICAL ", style="bold"),
+            Text(" H2H CATEGORY MATCHUP ", style="bold"),
             classes="trade-section-label",
         ))
 
         h2h_desc = Text()
         h2h_desc.append(
-            "  Simulates your season stats vs every other team — "
-            "how many would you beat?",
+            "  With these season stats, how many of the 17 other teams\n"
+            "  would you beat in a head-to-head category matchup?",
             style="dim italic",
         )
         await scroll.mount(Static(h2h_desc, classes="trade-result-label"))
 
         h2h_line = Text()
-        h2h_line.append(f"  Record: ", style="dim")
+        h2h_line.append(f"  Before: ", style="dim")
         h2h_line.append(f"{impact.h2h_before_a.record_str}", style="bold")
-        h2h_line.append(f"  →  ", style="dim")
-        h2h_line.append(f"{impact.h2h_after_a.record_str}", style="bold")
-        win_delta = impact.h2h_after_a.total_wins - impact.h2h_before_a.total_wins
-        if win_delta > 0:
-            h2h_line.append(f"  +{win_delta}W", style="bold green")
-        elif win_delta < 0:
-            h2h_line.append(f"  {win_delta}W", style="bold red")
+        h2h_line.append(f" (beat {impact.h2h_before_a.total_wins} of {impact.h2h_before_a.total_wins + impact.h2h_before_a.total_losses + impact.h2h_before_a.total_ties} teams)", style="dim")
         await scroll.mount(Static(h2h_line, classes="trade-result-label"))
 
-        h2h_pct = Text()
-        h2h_pct.append(f"  Win %: ", style="dim")
-        h2h_pct.append(f"{impact.h2h_before_a.win_pct:.1%}", style="bold")
-        h2h_pct.append(f"  →  ", style="dim")
-        h2h_pct.append(f"{impact.h2h_after_a.win_pct:.1%}", style="bold")
-        pct_delta = impact.h2h_after_a.win_pct - impact.h2h_before_a.win_pct
-        if pct_delta > 0.001:
-            h2h_pct.append(f"  +{pct_delta:.1%}", style="bold green")
-        elif pct_delta < -0.001:
-            h2h_pct.append(f"  {pct_delta:.1%}", style="bold red")
-        await scroll.mount(Static(h2h_pct, classes="trade-result-label"))
+        h2h_after = Text()
+        h2h_after.append(f"  After:  ", style="dim")
+        h2h_after.append(f"{impact.h2h_after_a.record_str}", style="bold")
+        h2h_after.append(f" (beat {impact.h2h_after_a.total_wins} of {impact.h2h_after_a.total_wins + impact.h2h_after_a.total_losses + impact.h2h_after_a.total_ties} teams)", style="dim")
+        win_delta = impact.h2h_after_a.total_wins - impact.h2h_before_a.total_wins
+        if win_delta > 0:
+            h2h_after.append(f"  +{win_delta}W", style="bold green")
+        elif win_delta < 0:
+            h2h_after.append(f"  {win_delta}W", style="bold red")
+        await scroll.mount(Static(h2h_after, classes="trade-result-label"))
 
         await scroll.mount(Static(""))  # spacer
 

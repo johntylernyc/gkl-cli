@@ -35,6 +35,14 @@ class CatImpact:
 
 
 @dataclass
+class RotoEntry:
+    """One team's roto ranking."""
+    team_key: str
+    name: str
+    rank: int
+    total: float
+
+@dataclass
 class TradeImpact:
     # Team A perspective
     team_a_before: TeamStats
@@ -54,6 +62,9 @@ class TradeImpact:
     roto_points_after_b: float
     h2h_before_b: TeamH2HSummary
     h2h_after_b: TeamH2HSummary
+    # Full league roto standings before/after
+    roto_standings_before: list[RotoEntry] = field(default_factory=list)
+    roto_standings_after: list[RotoEntry] = field(default_factory=list)
     # Per-category impact for team A
     cat_impacts: list[CatImpact] = field(default_factory=list)
 
@@ -359,6 +370,16 @@ def compute_trade_impact(
     rank_before_b, pts_before_b = _roto_rank(roto_before, side_b.team_key)
     rank_after_b, pts_after_b = _roto_rank(roto_after, side_b.team_key)
 
+    # Build full league roto standings for display
+    standings_before = [
+        RotoEntry(team_key=r["team_key"], name=r["name"], rank=i, total=r["total"])
+        for i, r in enumerate(roto_before, 1)
+    ]
+    standings_after = [
+        RotoEntry(team_key=r["team_key"], name=r["name"], rank=i, total=r["total"])
+        for i, r in enumerate(roto_after, 1)
+    ]
+
     # H2H power rankings
     h2h_before = simulate_h2h(teams_before, scored)
     h2h_after = simulate_h2h(teams_after, scored)
@@ -414,4 +435,6 @@ def compute_trade_impact(
         h2h_before_b=h2h_before_b,
         h2h_after_b=h2h_after_b,
         cat_impacts=cat_impacts,
+        roto_standings_before=standings_before,
+        roto_standings_after=standings_after,
     )
