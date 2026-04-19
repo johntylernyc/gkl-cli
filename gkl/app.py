@@ -6644,7 +6644,7 @@ class TradeModeSelectorModal(Screen):
 
 class CategorySelectModal(Screen):
     """Modal for selecting stat categories to improve (multi-select)."""
-    BINDINGS = [("escape", "cancel", "Cancel"), ("enter", "confirm", "Confirm")]
+    BINDINGS = [("escape", "cancel", "Cancel"), ("d", "confirm", "Done")]
     CSS = """
     CategorySelectModal {
         align: center middle;
@@ -6690,7 +6690,7 @@ class CategorySelectModal(Screen):
     def compose(self) -> ComposeResult:
         with Vertical(id="cat-select-container"):
             yield Static("Select Categories to Improve", id="cat-select-title")
-            yield Static("[Space] toggle  [Enter] confirm", id="cat-select-hint")
+            yield Static("[Enter] toggle  [d] done  [Esc] cancel", id="cat-select-hint")
             yield ListView(id="cat-select-list")
 
     def on_mount(self) -> None:
