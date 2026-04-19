@@ -7113,11 +7113,15 @@ class TradeAnalyzerScreen(Screen):
         self._selected_a = {self._block_player.player_key}
         self._selected_b = {target.player.player_key}
 
-        # Fetch team B roster and run analysis
+        # Fetch team B roster, update left pane, and run analysis
         async def _load_and_analyze():
             self._roster_b = self.api.get_roster_stats_season(
                 target.team_key, self.league.current_week
             )
+            # Switch to analyze mode view for the left pane
+            self._mode = "analyze"
+            self._update_subheader()
+            await self._render_left_pane()
             await self._run_analysis()
 
         self.run_worker(_load_and_analyze, group="trade-analysis", exclusive=True)
