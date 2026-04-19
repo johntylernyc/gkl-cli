@@ -76,6 +76,7 @@ class League:
     season: str
     current_week: int
     num_teams: int
+    end_week: int = 26
 
 
 @dataclass
@@ -174,6 +175,7 @@ class YahooFantasyAPI:
                         season=lg["season"],
                         current_week=int(lg.get("current_week", 1)),
                         num_teams=int(lg["num_teams"]),
+                        end_week=int(lg.get("end_week", 26)),
                     ))
         except (KeyError, IndexError, TypeError):
             pass

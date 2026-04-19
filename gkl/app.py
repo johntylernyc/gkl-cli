@@ -1114,10 +1114,11 @@ class WeekSelectModal(Screen):
     }
     """
 
-    def __init__(self, max_week: int, current_week: int) -> None:
+    def __init__(self, max_week: int, selected_week: int, league_week: int | None = None) -> None:
         super().__init__()
         self.max_week = max_week
-        self.current_week = current_week
+        self.selected_week = selected_week
+        self.league_week = league_week  # actual current week of the season
 
     def compose(self) -> ComposeResult:
         with Vertical(id="week-select-container"):
@@ -1128,12 +1129,16 @@ class WeekSelectModal(Screen):
         lv = self.query_one("#week-select-list", ListView)
         for w in range(1, self.max_week + 1):
             label = f"Week {w}"
-            if w == self.current_week:
+            if self.league_week and w == self.league_week:
                 label += "  (current)"
+            elif self.league_week and w > self.league_week:
+                label += "  (projected)"
+            if w == self.selected_week:
+                label += "  ●"
             item = ListItem(Label(label))
             item._week = w
             lv.mount(item)
-        lv.index = self.current_week - 1
+        lv.index = self.selected_week - 1
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         week = getattr(event.item, "_week", None)
@@ -6806,11 +6811,52 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         except Exception:
             pass
 
+    def _is_future_week(self) -> bool:
+        if self._viewing_week is None:
+            return False
+        return self._viewing_week > self.league.current_week
+
+    def _project_weekly_stats(self, matchups: list[Matchup]) -> None:
+        """Replace empty future-week stats with projections from season averages."""
+        from gkl.stats import RATE_STATS
+        season_teams = self.api.get_team_season_stats(self.league.league_key)
+        season_by_key = {t.team_key: t for t in season_teams}
+        weeks_played = max(self.league.current_week - 1, 1)
+
+        scored_cats = [c for c in self.categories if not c.is_only_display]
+
+        for m in matchups:
+            for team in (m.team_a, m.team_b):
+                season = season_by_key.get(team.team_key)
+                if not season:
+                    continue
+                projected_points = 0.0
+                for cat in scored_cats:
+                    season_val = season.stats.get(cat.stat_id, "")
+                    if not season_val or season_val in ("-", "/"):
+                        continue
+                    try:
+                        val_f = float(season_val)
+                    except (ValueError, TypeError):
+                        continue
+                    if cat.stat_id in RATE_STATS:
+                        # Ratio stat: use season value as-is
+                        team.stats[cat.stat_id] = season_val
+                    else:
+                        # Counting stat: project per-week average
+                        projected = val_f / weeks_played
+                        if projected == int(projected):
+                            team.stats[cat.stat_id] = str(int(projected))
+                        else:
+                            team.stats[cat.stat_id] = f"{projected:.1f}"
+
     async def _refresh_data(self) -> None:
         if not self.league:
             return
         week = self._viewing_week if self._viewing_week is not None else None
         self.matchups = self.api.get_scoreboard(self.league.league_key, week=week)
+        if self._is_future_week():
+            await asyncio.to_thread(self._project_weekly_stats, self.matchups)
         self._update_header()
         self._populate_matchups()
         if self._selected_idx is not None and self._selected_idx < len(self.matchups):
@@ -6825,28 +6871,51 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         display_week = self._viewing_week if self._viewing_week is not None else self.league.current_week
         sub = Text()
         sub.append(f"Week {display_week}", style="bold")
-        if self._viewing_week is not None and self._viewing_week != self.league.current_week:
-            sub.append(f"  (←→ week, [e] select)", style="dim")
-        else:
-            sub.append(f"  (←→ week, [e] select)", style="dim")
+        if self._is_future_week():
+            sub.append("  (projected)", style="bold italic #E8A735")
+        sub.append(f"  (←→ week, [e] select)", style="dim")
         sub.append(f"  |  {self.league.season} Season  |  {self.league.num_teams} Teams")
         if len(getattr(self.app, "_leagues", [])) > 1:
             sub.append("  |  [L] Switch League", style="dim")
         self.query_one("#board-subheader", Static).update(sub)
 
+    def _compute_projected_record(self, m: Matchup) -> tuple[int, int, int]:
+        """Compute projected W/L/T for a matchup based on projected stats."""
+        scored_cats = [c for c in self.categories if not c.is_only_display]
+        a_wins = b_wins = ties = 0
+        for cat in scored_cats:
+            a_val = m.team_a.stats.get(cat.stat_id, "-")
+            b_val = m.team_b.stats.get(cat.stat_id, "-")
+            winner = who_wins(a_val, b_val, cat.sort_order)
+            if winner == "a":
+                a_wins += 1
+            elif winner == "b":
+                b_wins += 1
+            else:
+                ties += 1
+        return a_wins, b_wins, ties
+
     def _populate_matchups(self) -> None:
         lv = self.query_one("#matchup-list", ListView)
         lv.clear()
         lv.display = True
+        is_future = self._is_future_week()
         for i, m in enumerate(self.matchups):
             num = str(i + 1) if i < 9 else "0" if i == 9 else ""
             score_line = Text()
             score_line.append(f"{num:>2} ", style="bold dim")
             score_line.append(f"{m.team_a.name[:18]:<18}", style=f"bold {TEAM_A_COLOR}")
-            score_line.append(f"{m.team_a.points:>5.0f}", style=f"{TEAM_A_COLOR}")
-            score_line.append("  ")
+            if is_future:
+                aw, bw, t = self._compute_projected_record(m)
+                score_line.append(f"{aw:>2}", style=f"{TEAM_A_COLOR}")
+                score_line.append(f"-{t}-", style="dim")
+                score_line.append(f"{bw:<2}", style=f"{TEAM_B_COLOR}")
+            else:
+                score_line.append(f"{m.team_a.points:>5.0f}", style=f"{TEAM_A_COLOR}")
+                score_line.append("  ")
             score_line.append(f"{m.team_b.name[:18]:<18}", style=f"bold {TEAM_B_COLOR}")
-            score_line.append(f"{m.team_b.points:>5.0f}", style=f"{TEAM_B_COLOR}")
+            if not is_future:
+                score_line.append(f"{m.team_b.points:>5.0f}", style=f"{TEAM_B_COLOR}")
 
             mgr_line = Text()
             mgr_line.append(f"   {m.team_a.manager[:18]:<23}", style="dim")
@@ -6873,7 +6942,8 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         self._selected_idx = idx
         async def _update(i: int = idx) -> None:
             await self._show_matchup_detail(i)
-            await self._load_player_stats(i)
+            if not self._is_future_week():
+                await self._load_player_stats(i)
         self.run_worker(_update, group="matchup-detail", exclusive=True)
 
     def on_key(self, event) -> None:
@@ -6903,11 +6973,16 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         header.append(f" {b.name} ", style=f"bold {TEAM_B_COLOR}")
         await container.mount(Static(header, classes="stat-header"))
 
-        score = Text()
-        score.append(f" {a.points:.0f} ", style=f"bold {TEAM_A_COLOR}")
-        score.append(" - ")
-        score.append(f" {b.points:.0f} ", style=f"bold {TEAM_B_COLOR}")
-        await container.mount(Static(score, classes="stat-score"))
+        if self._is_future_week():
+            score = Text()
+            score.append(" Projected based on season stats", style="italic dim #E8A735")
+            await container.mount(Static(score, classes="stat-score"))
+        else:
+            score = Text()
+            score.append(f" {a.points:.0f} ", style=f"bold {TEAM_A_COLOR}")
+            score.append(" - ")
+            score.append(f" {b.points:.0f} ", style=f"bold {TEAM_B_COLOR}")
+            await container.mount(Static(score, classes="stat-score"))
 
         scored_cats = [c for c in self.categories if not c.is_only_display]
         batting_cats = [c for c in scored_cats if c.position_type == "B"]
@@ -7235,7 +7310,7 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         if not self.league:
             return
         current = self._viewing_week if self._viewing_week is not None else self.league.current_week
-        if current < self.league.current_week:
+        if current < self.league.end_week:
             self._load_week(current + 1)
 
     def action_select_week(self) -> None:
@@ -7243,7 +7318,7 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
             return
         current = self._viewing_week if self._viewing_week is not None else self.league.current_week
         self.app.push_screen(
-            WeekSelectModal(self.league.current_week, current),
+            WeekSelectModal(self.league.end_week, current, league_week=self.league.current_week),
             callback=self._on_week_selected,
         )
 
