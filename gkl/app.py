@@ -1114,10 +1114,11 @@ class WeekSelectModal(Screen):
     }
     """
 
-    def __init__(self, max_week: int, current_week: int) -> None:
+    def __init__(self, max_week: int, selected_week: int, league_week: int | None = None) -> None:
         super().__init__()
         self.max_week = max_week
-        self.current_week = current_week
+        self.selected_week = selected_week
+        self.league_week = league_week  # actual current week of the season
 
     def compose(self) -> ComposeResult:
         with Vertical(id="week-select-container"):
@@ -1128,12 +1129,16 @@ class WeekSelectModal(Screen):
         lv = self.query_one("#week-select-list", ListView)
         for w in range(1, self.max_week + 1):
             label = f"Week {w}"
-            if w == self.current_week:
+            if self.league_week and w == self.league_week:
                 label += "  (current)"
+            elif self.league_week and w > self.league_week:
+                label += "  (projected)"
+            if w == self.selected_week:
+                label += "  ●"
             item = ListItem(Label(label))
             item._week = w
             lv.mount(item)
-        lv.index = self.current_week - 1
+        lv.index = self.selected_week - 1
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         week = getattr(event.item, "_week", None)
@@ -6743,6 +6748,8 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         self._player_view = "weekly"  # "weekly", "daily", "season"
         self._daily_date: str = ""  # current date for daily view
         self._matchup_dates: list[str] = []  # available dates for current matchup
+        self._roto_rank: dict[str, int] = {}
+        self._h2h_record: dict[str, dict] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -6806,11 +6813,84 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         except Exception:
             pass
 
+    def _is_future_week(self) -> bool:
+        if self._viewing_week is None:
+            return False
+        return self._viewing_week > self.league.current_week
+
+    def _project_weekly_stats(self, matchups: list[Matchup]) -> None:
+        """Replace empty future-week stats with projections from season averages.
+
+        Also computes roto ranks and H2H records for display.
+        """
+        from gkl.stats import RATE_STATS
+        season_teams = self.api.get_team_season_stats(self.league.league_key)
+        season_by_key = {t.team_key: t for t in season_teams}
+        weeks_played = max(self.league.current_week - 1, 1)
+
+        scored_cats = [c for c in self.categories if not c.is_only_display]
+
+        for m in matchups:
+            for team in (m.team_a, m.team_b):
+                season = season_by_key.get(team.team_key)
+                if not season:
+                    continue
+                for cat in scored_cats:
+                    season_val = season.stats.get(cat.stat_id, "")
+                    if not season_val or season_val in ("-", "/"):
+                        continue
+                    try:
+                        val_f = float(season_val)
+                    except (ValueError, TypeError):
+                        continue
+                    if cat.stat_id in RATE_STATS:
+                        team.stats[cat.stat_id] = season_val
+                    else:
+                        projected = val_f / weeks_played
+                        if projected == int(projected):
+                            team.stats[cat.stat_id] = str(int(projected))
+                        else:
+                            team.stats[cat.stat_id] = f"{projected:.1f}"
+
+        # Compute roto ranks from season stats
+        roto_results = compute_roto(season_teams, scored_cats)
+        self._roto_rank = {e["team_key"]: r for r, e in enumerate(roto_results, 1)}
+
+        # Compute H2H records from past matchups
+        self._h2h_record: dict[str, dict] = {}
+        cache = self.app.shared_cache
+        for w in range(1, self.league.current_week + 1):
+            week_matchups = cache.week_matchups.get(w)
+            if not week_matchups:
+                try:
+                    week_matchups = self.api.get_scoreboard(self.league.league_key, week=w)
+                    cache.week_matchups[w] = week_matchups
+                except Exception:
+                    continue
+            for wm in week_matchups:
+                if wm.status == "preevent":
+                    continue
+                for tk in (wm.team_a.team_key, wm.team_b.team_key):
+                    if tk not in self._h2h_record:
+                        self._h2h_record[tk] = {"wins": 0, "losses": 0, "ties": 0}
+                pa, pb = wm.team_a.points, wm.team_b.points
+                if pa > pb:
+                    self._h2h_record[wm.team_a.team_key]["wins"] += 1
+                    self._h2h_record[wm.team_b.team_key]["losses"] += 1
+                elif pb > pa:
+                    self._h2h_record[wm.team_a.team_key]["losses"] += 1
+                    self._h2h_record[wm.team_b.team_key]["wins"] += 1
+                else:
+                    self._h2h_record[wm.team_a.team_key]["ties"] += 1
+                    self._h2h_record[wm.team_b.team_key]["ties"] += 1
+
     async def _refresh_data(self) -> None:
         if not self.league:
             return
         week = self._viewing_week if self._viewing_week is not None else None
         self.matchups = self.api.get_scoreboard(self.league.league_key, week=week)
+        if self._is_future_week():
+            await asyncio.to_thread(self._project_weekly_stats, self.matchups)
         self._update_header()
         self._populate_matchups()
         if self._selected_idx is not None and self._selected_idx < len(self.matchups):
@@ -6825,28 +6905,82 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         display_week = self._viewing_week if self._viewing_week is not None else self.league.current_week
         sub = Text()
         sub.append(f"Week {display_week}", style="bold")
-        if self._viewing_week is not None and self._viewing_week != self.league.current_week:
-            sub.append(f"  (←→ week, [e] select)", style="dim")
-        else:
-            sub.append(f"  (←→ week, [e] select)", style="dim")
+        if self._is_future_week():
+            sub.append("  (projected)", style="bold italic #E8A735")
+        sub.append(f"  (←→ week, [e] select)", style="dim")
         sub.append(f"  |  {self.league.season} Season  |  {self.league.num_teams} Teams")
         if len(getattr(self.app, "_leagues", [])) > 1:
             sub.append("  |  [L] Switch League", style="dim")
         self.query_one("#board-subheader", Static).update(sub)
 
+    def _compute_projected_record(self, m: Matchup) -> tuple[int, int, int]:
+        """Compute projected W/L/T for a matchup based on projected stats."""
+        scored_cats = [c for c in self.categories if not c.is_only_display]
+        a_wins = b_wins = ties = 0
+        for cat in scored_cats:
+            a_val = m.team_a.stats.get(cat.stat_id, "-")
+            b_val = m.team_b.stats.get(cat.stat_id, "-")
+            winner = who_wins(a_val, b_val, cat.sort_order)
+            if winner == "a":
+                a_wins += 1
+            elif winner == "b":
+                b_wins += 1
+            else:
+                ties += 1
+        return a_wins, b_wins, ties
+
     def _populate_matchups(self) -> None:
         lv = self.query_one("#matchup-list", ListView)
         lv.clear()
         lv.display = True
+        is_future = self._is_future_week()
+
+        if is_future:
+            # Column headers — fixed widths matching data rows
+            hdr = Text()
+            hdr.append(f"   {'':18}  {'':18}", style="dim")
+            hdr.append("  proj   ", style="italic dim #E8A735")
+            hdr.append(" roto  ", style="dim")
+            hdr.append("   h2h    ", style="dim")
+            hdr_item = ListItem(Label(hdr, classes="matchup-row"))
+            hdr_item._matchup_index = None
+            lv.mount(hdr_item)
+
         for i, m in enumerate(self.matchups):
             num = str(i + 1) if i < 9 else "0" if i == 9 else ""
             score_line = Text()
             score_line.append(f"{num:>2} ", style="bold dim")
             score_line.append(f"{m.team_a.name[:18]:<18}", style=f"bold {TEAM_A_COLOR}")
-            score_line.append(f"{m.team_a.points:>5.0f}", style=f"{TEAM_A_COLOR}")
             score_line.append("  ")
             score_line.append(f"{m.team_b.name[:18]:<18}", style=f"bold {TEAM_B_COLOR}")
-            score_line.append(f"{m.team_b.points:>5.0f}", style=f"{TEAM_B_COLOR}")
+            if is_future:
+                aw, bw, t = self._compute_projected_record(m)
+                # Projected record — 9 char column
+                score_line.append(f"{aw:>3}", style=f"bold {TEAM_A_COLOR}")
+                score_line.append("-", style="dim")
+                score_line.append(f"{bw}", style=f"bold {TEAM_B_COLOR}")
+                score_line.append("-", style="dim")
+                score_line.append(f"{t:<3}", style="dim")
+
+                # Roto rank — 6 char column
+                roto_a = self._roto_rank.get(m.team_a.team_key, "-")
+                roto_b = self._roto_rank.get(m.team_b.team_key, "-")
+                score_line.append(f"{roto_a:>3}", style=f"{TEAM_A_COLOR}")
+                score_line.append("/", style="dim")
+                score_line.append(f"{roto_b:<3}", style=f"{TEAM_B_COLOR}")
+
+                # H2H record — 10 char column
+                h2h_a = self._h2h_record.get(m.team_a.team_key, {})
+                h2h_b = self._h2h_record.get(m.team_b.team_key, {})
+                rec_a = f"{h2h_a.get('wins', 0)}-{h2h_a.get('losses', 0)}"
+                rec_b = f"{h2h_b.get('wins', 0)}-{h2h_b.get('losses', 0)}"
+                score_line.append(f"{rec_a:>5}", style=f"{TEAM_A_COLOR}")
+                score_line.append("/", style="dim")
+                score_line.append(f"{rec_b:<5}", style=f"{TEAM_B_COLOR}")
+            else:
+                score_line.append(f"{m.team_a.points:>5.0f}", style=f"{TEAM_A_COLOR}")
+                score_line.append("  ")
+                score_line.append(f"{m.team_b.points:>5.0f}", style=f"{TEAM_B_COLOR}")
 
             mgr_line = Text()
             mgr_line.append(f"   {m.team_a.manager[:18]:<23}", style="dim")
@@ -6855,7 +6989,7 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
             item = ListItem(
                 Label(score_line, classes="matchup-row"),
                 Label(mgr_line, classes="matchup-row"),
-                Label("─" * 52, classes="matchup-divider"),
+                Label("─" * 70, classes="matchup-divider"),
             )
             item._matchup_index = i
             lv.mount(item)
@@ -6873,7 +7007,10 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         self._selected_idx = idx
         async def _update(i: int = idx) -> None:
             await self._show_matchup_detail(i)
-            await self._load_player_stats(i)
+            if self._is_future_week():
+                await self._load_future_player_stats(i)
+            else:
+                await self._load_player_stats(i)
         self.run_worker(_update, group="matchup-detail", exclusive=True)
 
     def on_key(self, event) -> None:
@@ -6903,11 +7040,16 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         header.append(f" {b.name} ", style=f"bold {TEAM_B_COLOR}")
         await container.mount(Static(header, classes="stat-header"))
 
-        score = Text()
-        score.append(f" {a.points:.0f} ", style=f"bold {TEAM_A_COLOR}")
-        score.append(" - ")
-        score.append(f" {b.points:.0f} ", style=f"bold {TEAM_B_COLOR}")
-        await container.mount(Static(score, classes="stat-score"))
+        if self._is_future_week():
+            score = Text()
+            score.append(" Projected based on season stats", style="italic dim #E8A735")
+            await container.mount(Static(score, classes="stat-score"))
+        else:
+            score = Text()
+            score.append(f" {a.points:.0f} ", style=f"bold {TEAM_A_COLOR}")
+            score.append(" - ")
+            score.append(f" {b.points:.0f} ", style=f"bold {TEAM_B_COLOR}")
+            await container.mount(Static(score, classes="stat-score"))
 
         scored_cats = [c for c in self.categories if not c.is_only_display]
         batting_cats = [c for c in scored_cats if c.position_type == "B"]
@@ -7037,6 +7179,60 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
 
         self.query_one("#bottom-pane").display = True
         self._update_player_view_header(m)
+
+        batting_cats, bat_unscored = build_stat_columns(self.categories, "B")
+        pitching_cats, pitch_unscored = build_stat_columns(self.categories, "P")
+
+        batting_positions = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF",
+                             "OF", "Util", "DH", "IF", "BN"}
+
+        for container_id, team, players, color in [
+            ("#player-scroll-a", m.team_a, players_a, TEAM_A_COLOR),
+            ("#player-scroll-b", m.team_b, players_b, TEAM_B_COLOR),
+        ]:
+            container = self.query_one(container_id, VerticalScroll)
+            await container.remove_children()
+
+            await container.mount(
+                Static(Text(f" {team.name} ", style=f"bold {color}"),
+                       classes="team-roster-label")
+            )
+
+            batters = [p for p in players if
+                       any(pos in batting_positions for pos in p.position.split(","))]
+            pitchers = [p for p in players if p not in batters]
+
+            if batters:
+                await container.mount(
+                    Static(" Batters", classes="roster-section-label"))
+                bat_table = DataTable()
+                await container.mount(bat_table)
+                self._fill_player_table(bat_table, batters, batting_cats, bat_unscored)
+
+            if pitchers:
+                await container.mount(
+                    Static(" Pitchers", classes="roster-section-label"))
+                pitch_table = DataTable()
+                await container.mount(pitch_table)
+                self._fill_player_table(pitch_table, pitchers, pitching_cats, pitch_unscored)
+
+    async def _load_future_player_stats(self, idx: int) -> None:
+        """Load season-long player stats for both teams in a future week matchup."""
+        if not self.league:
+            return
+        m = self.matchups[idx]
+        week = self.league.current_week
+
+        players_a = self.api.get_roster_stats_season(m.team_a.team_key, week)
+        players_b = self.api.get_roster_stats_season(m.team_b.team_key, week)
+
+        self.query_one("#bottom-pane").display = True
+
+        # Update player view header to indicate season stats
+        header = Text()
+        header.append(" Season Stats ", style="bold")
+        header.append(" (projected week — showing season totals)", style="dim")
+        self.query_one("#player-view-header", Static).update(header)
 
         batting_cats, bat_unscored = build_stat_columns(self.categories, "B")
         pitching_cats, pitch_unscored = build_stat_columns(self.categories, "P")
@@ -7235,7 +7431,7 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         if not self.league:
             return
         current = self._viewing_week if self._viewing_week is not None else self.league.current_week
-        if current < self.league.current_week:
+        if current < self.league.end_week:
             self._load_week(current + 1)
 
     def action_select_week(self) -> None:
@@ -7243,7 +7439,7 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
             return
         current = self._viewing_week if self._viewing_week is not None else self.league.current_week
         self.app.push_screen(
-            WeekSelectModal(self.league.current_week, current),
+            WeekSelectModal(self.league.end_week, current, league_week=self.league.current_week),
             callback=self._on_week_selected,
         )
 
