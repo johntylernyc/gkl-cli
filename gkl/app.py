@@ -6589,7 +6589,7 @@ class TradeModeSelectorModal(Screen):
         align: center middle;
     }
     #trade-mode-container {
-        width: 45;
+        width: 60;
         height: auto;
         max-height: 80%;
         background: $surface;
@@ -6605,10 +6605,10 @@ class TradeModeSelectorModal(Screen):
     }
     #trade-mode-list {
         height: auto;
-        max-height: 70%;
+        max-height: 80%;
     }
     #trade-mode-list > ListItem {
-        height: 2;
+        height: 3;
         padding: 0 1;
     }
     #trade-mode-list > ListItem.--highlight {
