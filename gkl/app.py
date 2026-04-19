@@ -6874,10 +6874,12 @@ class TradeAnalyzerScreen(Screen):
                 self.categories,
             )
 
-            # Prefetch weekly data for H2H replay
+            # Fetch weekly matchups and per-player rosters for H2H replay
+            self.query_one("#trade-loading-status", Static).update(
+                "Loading weekly data for H2H replay..."
+            )
             weeks = list(range(1, self.league.current_week + 1))
-            await cache.prefetch_weeks(self.api, self.league.league_key, weeks)
-            # Also fetch weekly matchups
+            # Fetch weekly matchups
             for w in weeks:
                 if w not in cache.week_matchups:
                     try:
@@ -6886,14 +6888,32 @@ class TradeAnalyzerScreen(Screen):
                     except Exception:
                         pass
 
+            # Fetch per-player weekly rosters for both teams (parallel per week)
+            weekly_roster_a: dict[int, list] = {}
+            weekly_roster_b: dict[int, list] = {}
+            for w in weeks:
+                try:
+                    ra, rb = await asyncio.gather(
+                        asyncio.to_thread(
+                            self.api.get_roster_stats, self._team_a_key, w),
+                        asyncio.to_thread(
+                            self.api.get_roster_stats, self._team_b_key, w),
+                    )
+                    weekly_roster_a[w] = ra
+                    weekly_roster_b[w] = rb
+                except Exception:
+                    pass
+
             from gkl.trade import replay_h2h_with_trade
+            side_a_keys = {p.player_key for p in players_out_a}
+            side_b_keys = {p.player_key for p in players_out_b}
             h2h_replay = await asyncio.to_thread(
                 replay_h2h_with_trade,
                 self._team_a_key,
-                players_out_a, players_out_b,
-                cache.week_team_stats,
+                self._team_b_key,
+                side_a_keys, side_b_keys,
                 cache.week_matchups,
-                self._roster_a, self._roster_b,
+                weekly_roster_a, weekly_roster_b,
                 self.categories,
                 self.league.current_week,
             )

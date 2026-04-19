@@ -474,29 +474,29 @@ def compute_trade_impact(
 
 def replay_h2h_with_trade(
     team_a_key: str,
-    side_a_players: list[PlayerStats],
-    side_b_players: list[PlayerStats],
-    week_team_stats: dict[int, list[TeamStats]],
+    team_b_key: str,
+    side_a_player_keys: set[str],
+    side_b_player_keys: set[str],
     week_matchups: dict[int, list['Matchup']],
-    roster_a: list[PlayerStats],
-    roster_b: list[PlayerStats],
+    weekly_roster_a: dict[int, list[PlayerStats]],
+    weekly_roster_b: dict[int, list[PlayerStats]],
     categories: list[StatCategory],
     current_week: int,
 ) -> H2HReplay:
     """Replay each completed week's H2H matchup with the trade applied.
 
-    For each week, finds team A's actual matchup, applies the trade to
-    team A's weekly stats, and re-simulates the category matchup to see
-    if the result would have changed.
+    Uses per-player weekly stats to correctly compute the delta for each
+    week. For each week, finds the traded players' weekly contributions,
+    applies the swap to team A's weekly team stats, and re-simulates.
 
     Args:
         team_a_key: The team whose perspective we're analyzing.
-        side_a_players: Players leaving team A (going to team B).
-        side_b_players: Players leaving team B (going to team A).
-        week_team_stats: Per-week team stats from cache.
+        team_b_key: The trade partner's team key.
+        side_a_player_keys: Player keys leaving team A.
+        side_b_player_keys: Player keys leaving team B (coming to team A).
         week_matchups: Per-week matchup data from cache.
-        roster_a: Team A's current full roster.
-        roster_b: Team B's current full roster.
+        weekly_roster_a: Per-week player rosters for team A.
+        weekly_roster_b: Per-week player rosters for team B.
         categories: League scoring categories.
         current_week: The current week of the season.
     """
@@ -509,9 +509,10 @@ def replay_h2h_with_trade(
 
     for week in range(1, current_week + 1):
         matchups = week_matchups.get(week, [])
-        week_teams = week_team_stats.get(week, [])
+        roster_a_week = weekly_roster_a.get(week, [])
+        roster_b_week = weekly_roster_b.get(week, [])
 
-        if not matchups or not week_teams:
+        if not matchups:
             continue
 
         # Find team A's matchup this week
@@ -560,13 +561,12 @@ def replay_h2h_with_trade(
             actual_result = "T"
             actual_t += 1
 
-        # Apply trade to team A's weekly stats
-        # Find team A's weekly TeamStats
-        week_team_a = next(
-            (t for t in week_teams if t.team_key == team_a_key), None
-        )
-        if week_team_a is None:
-            # Can't replay this week — add as-is
+        # Get traded players' WEEKLY stats
+        players_out_week = [p for p in roster_a_week if p.player_key in side_a_player_keys]
+        players_in_week = [p for p in roster_b_week if p.player_key in side_b_player_keys]
+
+        if not roster_a_week:
+            # No per-player data — can't replay, keep as-is
             results.append(WeekReplayResult(
                 week=week, opponent_name=opp_team.name,
                 actual_wins=a_wins, actual_losses=a_losses, actual_ties=a_ties,
@@ -576,10 +576,11 @@ def replay_h2h_with_trade(
             ))
             continue
 
+        # Apply trade using this week's player stats
         trade_team_a = apply_trade_to_team(
-            week_team_a, roster_a,
-            players_out=side_a_players,
-            players_in=side_b_players,
+            my_team, roster_a_week,
+            players_out=players_out_week,
+            players_in=players_in_week,
             categories=categories,
         )
 
