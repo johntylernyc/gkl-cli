@@ -141,19 +141,31 @@ This is going to be a fairly complex feature, so think through it well. While de
 | 22 | Fix `all_teams` undefined variable | ✅ Done |
 | 23 | Show both rosters when selecting a target | ✅ Done |
 
-### Phase 4: AI Summary (in progress)
+### Phase 4: AI Summary (completed 2026-04-19)
 
-**Goal:** When an Anthropic API key is available, provide a Claude-powered narrative analysis of the trade:
-- Pros and cons summary
-- 2-3 sentences on how to sell the deal to the other manager
-- 2-3 sentences on how to decline or counter if you were proposed the trade
+**Status:** Implemented on `feature/trade-analyzer` branch.
 
-**Approach:**
-- Check `load_anthropic_key()` for API key availability
-- Format the `TradeImpact` data (category deltas, roto movement, H2H replay results) into a structured prompt
-- Use the Anthropic SDK directly (lightweight call, not full Skipper tool suite)
-- Display the AI summary in a section at the bottom of the analysis results
-- Use the model from `DEFAULT_MODEL` in `skipper.py`
+**Decisions:**
+
+16. **Lightweight direct API call, not full Skipper tool suite.** The AI summary only needs to analyze pre-computed data — it doesn't need to query the Yahoo API. A single `anthropic.AsyncAnthropic.messages.create()` call with a structured prompt is sufficient. This avoids the complexity and token cost of Skipper's tool-use loop.
+
+17. **Hardcoded to Sonnet 4.6 for cost efficiency.** The trade summary prompt is under 500 words with a 512-token max response. Sonnet 4.6 (`claude-sonnet-4-6`) is fast and cheap enough for this use case. No model selector needed here.
+
+18. **Prompt includes actual numbers, not just directions.** The prompt feeds Claude the specific stat deltas, roto rank movement, and H2H replay results so the analysis references concrete data (e.g., "you lose 12 HR but gain 22 K and drop your ERA by 0.28").
+
+19. **Widget content update in-place, not remove/mount.** Initially tried removing the "Generating analysis..." widget and mounting a new one with the response. This failed silently in Textual's async rendering. Fixed to update the same Static widget's content via `.update()`.
+
+20. **CSS height: auto for result labels.** The `.trade-result-label` class had `height: 1` which clipped multiline content like the AI response. Changed to `height: auto` — this also fixed other multiline result labels that were being truncated.
+
+### Tasks
+
+| # | Task | Status |
+|---|------|--------|
+| 24 | Add `build_trade_summary_prompt()` to `trade.py` | ✅ Done |
+| 25 | Add `get_trade_ai_summary()` to `trade.py` | ✅ Done |
+| 26 | Wire AI summary into `_run_analysis` flow | ✅ Done |
+| 27 | Fix empty AI content (remove/mount → update in-place) | ✅ Done |
+| 28 | Fix clipped multiline content (height: 1 → auto) | ✅ Done |
 
 ### Phase 5: Trade Discovery (not started)
 
