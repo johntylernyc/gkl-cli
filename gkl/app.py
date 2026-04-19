@@ -7505,11 +7505,11 @@ class TradeAnalyzerScreen(Screen):
             classes="trade-section-label",
         ))
 
-        loading = Static(
+        ai_content = Static(
             Text("  Generating analysis...", style="dim italic"),
             classes="trade-result-label",
         )
-        await scroll.mount(loading)
+        await scroll.mount(ai_content)
         scroll.scroll_end(animate=False)
 
         try:
@@ -7521,18 +7521,9 @@ class TradeAnalyzerScreen(Screen):
                 players_out_a, players_out_b, h2h_replay,
             )
             summary = await get_trade_ai_summary(prompt, api_key, DEFAULT_MODEL)
-
-            await loading.remove()
-            await scroll.mount(Static(
-                Text(f"  {summary}"),
-                classes="trade-result-label",
-            ))
+            ai_content.update(Text(f"  {summary}"))
         except Exception as e:
-            await loading.remove()
-            await scroll.mount(Static(
-                Text(f"  Could not generate AI analysis: {e}", style="dim italic"),
-                classes="trade-result-label",
-            ))
+            ai_content.update(Text(f"  Could not generate AI analysis: {e}", style="dim italic"))
         scroll.scroll_end(animate=False)
 
     def action_go_back(self) -> None:
