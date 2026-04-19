@@ -7229,11 +7229,10 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         self.query_one("#bottom-pane").display = True
 
         # Update player view header to indicate season stats
-        view_label = self.query_one("#player-view-label", Static)
-        lbl = Text()
-        lbl.append(" Season Stats ", style="bold")
-        lbl.append(" (projected week — showing season totals)", style="dim")
-        view_label.update(lbl)
+        header = Text()
+        header.append(" Season Stats ", style="bold")
+        header.append(" (projected week — showing season totals)", style="dim")
+        self.query_one("#player-view-header", Static).update(header)
 
         batting_cats, bat_unscored = build_stat_columns(self.categories, "B")
         pitching_cats, pitch_unscored = build_stat_columns(self.categories, "P")
