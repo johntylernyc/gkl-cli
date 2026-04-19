@@ -6920,12 +6920,9 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
                 score_line.append("  ")
                 score_line.append(f"{aw:>2}", style=f"bold {TEAM_A_COLOR}")
                 score_line.append("-", style="dim")
-                if t:
-                    score_line.append(f"{t}", style="dim")
-                else:
-                    score_line.append("0", style="dim")
-                score_line.append("-", style="dim")
                 score_line.append(f"{bw}", style=f"bold {TEAM_B_COLOR}")
+                score_line.append("-", style="dim")
+                score_line.append(f"{t}", style="dim")
             else:
                 score_line.append(f"{m.team_a.points:>5.0f}", style=f"{TEAM_A_COLOR}")
                 score_line.append("  ")
