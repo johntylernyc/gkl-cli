@@ -6765,11 +6765,11 @@ class TradeAnalyzerScreen(Screen):
         height: 1fr;
     }
     #trade-left {
-        width: 65%;
+        width: 60%;
         border-right: solid $primary;
     }
     #trade-right {
-        width: 35%;
+        width: 40%;
     }
     #trade-left-scroll {
         height: 1fr;
