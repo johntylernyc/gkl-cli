@@ -6765,11 +6765,11 @@ class TradeAnalyzerScreen(Screen):
         height: 1fr;
     }
     #trade-left {
-        width: 45%;
+        width: 65%;
         border-right: solid $primary;
     }
     #trade-right {
-        width: 55%;
+        width: 35%;
     }
     #trade-left-scroll {
         height: 1fr;
@@ -7821,7 +7821,13 @@ class TradeAnalyzerScreen(Screen):
             summary = await get_trade_ai_summary(prompt, api_key, DEFAULT_MODEL)
             ai_content.update(Text(f"  {summary}"))
         except Exception as e:
-            ai_content.update(Text(f"  Could not generate AI analysis: {e}", style="dim italic"))
+            err_msg = str(e)
+            # Include more detail for API errors
+            if hasattr(e, 'message'):
+                err_msg = e.message
+            elif hasattr(e, 'body'):
+                err_msg = f"{e} — {e.body}"
+            ai_content.update(Text(f"  Could not generate AI analysis: {err_msg}", style="dim italic"))
         scroll.scroll_end(animate=False)
 
     def action_trade_view_season(self) -> None:
