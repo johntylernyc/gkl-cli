@@ -35,6 +35,34 @@ class CatImpact:
 
 
 @dataclass
+class WeekReplayResult:
+    """Result of replaying one week's matchup with the trade applied."""
+    week: int
+    opponent_name: str
+    actual_wins: int    # categories won in the actual matchup
+    actual_losses: int
+    actual_ties: int
+    actual_result: str  # "W", "L", "T"
+    trade_wins: int     # categories won with the trade applied
+    trade_losses: int
+    trade_ties: int
+    trade_result: str   # "W", "L", "T"
+    changed: bool       # True if the matchup result flipped
+
+
+@dataclass
+class H2HReplay:
+    """Full season H2H replay with a trade applied."""
+    weeks: list[WeekReplayResult]
+    actual_season_w: int
+    actual_season_l: int
+    actual_season_t: int
+    trade_season_w: int
+    trade_season_l: int
+    trade_season_t: int
+
+
+@dataclass
 class RotoEntry:
     """One team's roto ranking."""
     team_key: str
@@ -437,4 +465,160 @@ def compute_trade_impact(
         cat_impacts=cat_impacts,
         roto_standings_before=standings_before,
         roto_standings_after=standings_after,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Weekly H2H Replay
+# ---------------------------------------------------------------------------
+
+def replay_h2h_with_trade(
+    team_a_key: str,
+    side_a_players: list[PlayerStats],
+    side_b_players: list[PlayerStats],
+    week_team_stats: dict[int, list[TeamStats]],
+    week_matchups: dict[int, list['Matchup']],
+    roster_a: list[PlayerStats],
+    roster_b: list[PlayerStats],
+    categories: list[StatCategory],
+    current_week: int,
+) -> H2HReplay:
+    """Replay each completed week's H2H matchup with the trade applied.
+
+    For each week, finds team A's actual matchup, applies the trade to
+    team A's weekly stats, and re-simulates the category matchup to see
+    if the result would have changed.
+
+    Args:
+        team_a_key: The team whose perspective we're analyzing.
+        side_a_players: Players leaving team A (going to team B).
+        side_b_players: Players leaving team B (going to team A).
+        week_team_stats: Per-week team stats from cache.
+        week_matchups: Per-week matchup data from cache.
+        roster_a: Team A's current full roster.
+        roster_b: Team B's current full roster.
+        categories: League scoring categories.
+        current_week: The current week of the season.
+    """
+    from gkl.yahoo_api import Matchup
+
+    scored = [c for c in categories if not c.is_only_display]
+    results: list[WeekReplayResult] = []
+    actual_w = actual_l = actual_t = 0
+    trade_w = trade_l = trade_t = 0
+
+    for week in range(1, current_week + 1):
+        matchups = week_matchups.get(week, [])
+        week_teams = week_team_stats.get(week, [])
+
+        if not matchups or not week_teams:
+            continue
+
+        # Find team A's matchup this week
+        my_matchup: Matchup | None = None
+        am_team_a_side = True
+        for m in matchups:
+            if m.status == "preevent":
+                continue
+            if m.team_a.team_key == team_a_key:
+                my_matchup = m
+                am_team_a_side = True
+                break
+            elif m.team_b.team_key == team_a_key:
+                my_matchup = m
+                am_team_a_side = False
+                break
+
+        if my_matchup is None:
+            continue
+
+        my_team = my_matchup.team_a if am_team_a_side else my_matchup.team_b
+        opp_team = my_matchup.team_b if am_team_a_side else my_matchup.team_a
+
+        # Actual result
+        a_wins = a_losses = a_ties = 0
+        for cat in scored:
+            w = who_wins(
+                my_team.stats.get(cat.stat_id, "0"),
+                opp_team.stats.get(cat.stat_id, "0"),
+                cat.sort_order,
+            )
+            if w == "a":
+                a_wins += 1
+            elif w == "b":
+                a_losses += 1
+            else:
+                a_ties += 1
+
+        if a_wins > a_losses:
+            actual_result = "W"
+            actual_w += 1
+        elif a_losses > a_wins:
+            actual_result = "L"
+            actual_l += 1
+        else:
+            actual_result = "T"
+            actual_t += 1
+
+        # Apply trade to team A's weekly stats
+        # Find team A's weekly TeamStats
+        week_team_a = next(
+            (t for t in week_teams if t.team_key == team_a_key), None
+        )
+        if week_team_a is None:
+            # Can't replay this week — add as-is
+            results.append(WeekReplayResult(
+                week=week, opponent_name=opp_team.name,
+                actual_wins=a_wins, actual_losses=a_losses, actual_ties=a_ties,
+                actual_result=actual_result,
+                trade_wins=a_wins, trade_losses=a_losses, trade_ties=a_ties,
+                trade_result=actual_result, changed=False,
+            ))
+            continue
+
+        trade_team_a = apply_trade_to_team(
+            week_team_a, roster_a,
+            players_out=side_a_players,
+            players_in=side_b_players,
+            categories=categories,
+        )
+
+        # Re-simulate with traded stats vs same opponent
+        t_wins = t_losses = t_ties = 0
+        for cat in scored:
+            w = who_wins(
+                trade_team_a.stats.get(cat.stat_id, "0"),
+                opp_team.stats.get(cat.stat_id, "0"),
+                cat.sort_order,
+            )
+            if w == "a":
+                t_wins += 1
+            elif w == "b":
+                t_losses += 1
+            else:
+                t_ties += 1
+
+        if t_wins > t_losses:
+            trade_result = "W"
+            trade_w += 1
+        elif t_losses > t_wins:
+            trade_result = "L"
+            trade_l += 1
+        else:
+            trade_result = "T"
+            trade_t += 1
+
+        results.append(WeekReplayResult(
+            week=week, opponent_name=opp_team.name,
+            actual_wins=a_wins, actual_losses=a_losses, actual_ties=a_ties,
+            actual_result=actual_result,
+            trade_wins=t_wins, trade_losses=t_losses, trade_ties=t_ties,
+            trade_result=trade_result,
+            changed=(actual_result != trade_result),
+        ))
+
+    return H2HReplay(
+        weeks=results,
+        actual_season_w=actual_w, actual_season_l=actual_l, actual_season_t=actual_t,
+        trade_season_w=trade_w, trade_season_l=trade_l, trade_season_t=trade_t,
     )

@@ -6874,15 +6874,39 @@ class TradeAnalyzerScreen(Screen):
                 self.categories,
             )
 
-            await self._render_results(impact)
+            # Prefetch weekly data for H2H replay
+            weeks = list(range(1, self.league.current_week + 1))
+            await cache.prefetch_weeks(self.api, self.league.league_key, weeks)
+            # Also fetch weekly matchups
+            for w in weeks:
+                if w not in cache.week_matchups:
+                    try:
+                        wm = self.api.get_scoreboard(self.league.league_key, week=w)
+                        cache.week_matchups[w] = wm
+                    except Exception:
+                        pass
+
+            from gkl.trade import replay_h2h_with_trade
+            h2h_replay = await asyncio.to_thread(
+                replay_h2h_with_trade,
+                self._team_a_key,
+                players_out_a, players_out_b,
+                cache.week_team_stats,
+                cache.week_matchups,
+                self._roster_a, self._roster_b,
+                self.categories,
+                self.league.current_week,
+            )
+
+            await self._render_results(impact, h2h_replay)
         except Exception as e:
             self.notify(f"Analysis failed: {e}", severity="error")
         finally:
             self.query_one("#trade-loading").display = False
             self.query_one("#trade-right-scroll").display = True
 
-    async def _render_results(self, impact) -> None:
-        from gkl.trade import TradeImpact
+    async def _render_results(self, impact, h2h_replay=None) -> None:
+        from gkl.trade import TradeImpact, H2HReplay
         impact: TradeImpact
 
         scroll = self.query_one("#trade-right-scroll", VerticalScroll)
@@ -6979,16 +7003,17 @@ class TradeAnalyzerScreen(Screen):
 
         await scroll.mount(Static(""))  # spacer
 
-        # --- H2H Hypothetical ---
+        # --- H2H Season-Aggregate Hypothetical ---
         await scroll.mount(Static(
-            Text(" H2H CATEGORY MATCHUP ", style="bold"),
+            Text(" H2H SEASON-AGGREGATE HYPOTHETICAL ", style="bold"),
             classes="trade-section-label",
         ))
 
+        n_opponents = impact.h2h_before_a.total_wins + impact.h2h_before_a.total_losses + impact.h2h_before_a.total_ties
         h2h_desc = Text()
         h2h_desc.append(
-            "  With these season stats, how many of the 17 other teams\n"
-            "  would you beat in a head-to-head category matchup?",
+            f"  If your full season stats were a single matchup vs each of the\n"
+            f"  {n_opponents} other teams, how many category matchups would you win?",
             style="dim italic",
         )
         await scroll.mount(Static(h2h_desc, classes="trade-result-label"))
@@ -6996,19 +7021,27 @@ class TradeAnalyzerScreen(Screen):
         h2h_line = Text()
         h2h_line.append(f"  Before: ", style="dim")
         h2h_line.append(f"{impact.h2h_before_a.record_str}", style="bold")
-        h2h_line.append(f" (beat {impact.h2h_before_a.total_wins} of {impact.h2h_before_a.total_wins + impact.h2h_before_a.total_losses + impact.h2h_before_a.total_ties} teams)", style="dim")
+        h2h_line.append(f" (beat {impact.h2h_before_a.total_wins} of {n_opponents})", style="dim")
         await scroll.mount(Static(h2h_line, classes="trade-result-label"))
 
         h2h_after = Text()
         h2h_after.append(f"  After:  ", style="dim")
         h2h_after.append(f"{impact.h2h_after_a.record_str}", style="bold")
-        h2h_after.append(f" (beat {impact.h2h_after_a.total_wins} of {impact.h2h_after_a.total_wins + impact.h2h_after_a.total_losses + impact.h2h_after_a.total_ties} teams)", style="dim")
+        h2h_after.append(f" (beat {impact.h2h_after_a.total_wins} of {n_opponents})", style="dim")
         win_delta = impact.h2h_after_a.total_wins - impact.h2h_before_a.total_wins
         if win_delta > 0:
             h2h_after.append(f"  +{win_delta}W", style="bold green")
         elif win_delta < 0:
             h2h_after.append(f"  {win_delta}W", style="bold red")
         await scroll.mount(Static(h2h_after, classes="trade-result-label"))
+
+        h2h_note = Text()
+        h2h_note.append(
+            "  Note: this uses cumulative season stats, not per-week replay.\n"
+            "  See H2H Weekly Replay below for week-by-week impact.",
+            style="dim italic",
+        )
+        await scroll.mount(Static(h2h_note, classes="trade-result-label"))
 
         await scroll.mount(Static(""))  # spacer
 
@@ -7035,6 +7068,75 @@ class TradeAnalyzerScreen(Screen):
         elif b_win_delta < 0:
             partner_h2h.append(f"  {b_win_delta}W", style="red")
         await scroll.mount(Static(partner_h2h, classes="trade-result-label"))
+
+        # --- H2H Weekly Replay ---
+        if h2h_replay and h2h_replay.weeks:
+            await scroll.mount(Static(""))  # spacer
+
+            await scroll.mount(Static(
+                Text(" H2H WEEKLY REPLAY ", style="bold"),
+                classes="trade-section-label",
+            ))
+
+            replay_desc = Text()
+            replay_desc.append(
+                "  Replays each completed week's actual matchup with the trade\n"
+                "  applied to your team's weekly stats.",
+                style="dim italic",
+            )
+            await scroll.mount(Static(replay_desc, classes="trade-result-label"))
+
+            replay_table = DataTable(classes="trade-impact-table")
+            await scroll.mount(replay_table)
+            replay_table.cursor_type = "none"
+            replay_table.zebra_stripes = True
+            replay_table.add_columns("Wk", "Opponent", "Actual", "W/ Trade", "")
+
+            for wr in h2h_replay.weeks:
+                actual_str = f"{wr.actual_wins}-{wr.actual_losses}-{wr.actual_ties}"
+                trade_str = f"{wr.trade_wins}-{wr.trade_losses}-{wr.trade_ties}"
+
+                if wr.changed:
+                    if wr.trade_result == "W" and wr.actual_result != "W":
+                        change_str = "▲ FLIP"
+                        change_style = "bold green"
+                    elif wr.trade_result == "L" and wr.actual_result != "L":
+                        change_str = "▼ FLIP"
+                        change_style = "bold red"
+                    else:
+                        change_str = "~ FLIP"
+                        change_style = "bold #E8A735"
+                else:
+                    change_str = ""
+                    change_style = "dim"
+
+                replay_table.add_row(
+                    Text(f"{wr.week}", justify="right"),
+                    Text(wr.opponent_name[:18]),
+                    Text(f"{actual_str} {wr.actual_result}", justify="right"),
+                    Text(f"{trade_str} {wr.trade_result}", justify="right"),
+                    Text(change_str, style=change_style),
+                )
+
+            # Season summary
+            await scroll.mount(Static(""))
+            summary = Text()
+            summary.append(f"  Season record: ", style="dim")
+            summary.append(
+                f"{h2h_replay.actual_season_w}-{h2h_replay.actual_season_l}-{h2h_replay.actual_season_t}",
+                style="bold",
+            )
+            summary.append(f"  →  ", style="dim")
+            summary.append(
+                f"{h2h_replay.trade_season_w}-{h2h_replay.trade_season_l}-{h2h_replay.trade_season_t}",
+                style="bold",
+            )
+            sw_delta = h2h_replay.trade_season_w - h2h_replay.actual_season_w
+            if sw_delta > 0:
+                summary.append(f"  +{sw_delta}W", style="bold green")
+            elif sw_delta < 0:
+                summary.append(f"  {sw_delta}W", style="bold red")
+            await scroll.mount(Static(summary, classes="trade-result-label"))
 
     def action_go_back(self) -> None:
         self.app.pop_screen()
