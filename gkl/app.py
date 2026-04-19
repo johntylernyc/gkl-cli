@@ -87,6 +87,7 @@ from gkl.yahoo_api import (
 from gkl.datastore import RosterDataStore
 from gkl.yahoo_auth import YahooAuth, load_credentials, save_credentials, is_web_mode
 from gkl.stats import (
+    RATE_STATS,
     who_wins, simulate_h2h, compute_power_rankings, aggregate_h2h_season,
     H2HResult, TeamH2HSummary, SGPCalculator,
     build_stat_columns, get_stat_value, compute_roto,
@@ -6577,6 +6578,429 @@ class LeagueSelectScreen(Screen):
         self.app.exit()
 
 
+# --- Trade Analyzer Screen ---
+
+
+class TradeAnalyzerScreen(Screen):
+    """Analyze the impact of a trade between two teams."""
+    BINDINGS = [
+        ("escape", "go_back", "Back"),
+        ("q", "go_back", "Back"),
+        ("b", "select_team_b", "Team B"),
+        ("a", "analyze", "Analyze"),
+    ]
+    CSS = """
+    #trade-header {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #trade-subheader {
+        height: 1;
+        content-align: center middle;
+        background: $surface;
+        color: $text-muted;
+    }
+    #trade-split {
+        height: 1fr;
+    }
+    #trade-left {
+        width: 45%;
+        border-right: solid $primary;
+    }
+    #trade-right {
+        width: 55%;
+    }
+    #trade-left-scroll {
+        height: 1fr;
+    }
+    #trade-right-scroll {
+        height: 1fr;
+        padding: 0 1;
+    }
+    .trade-team-label {
+        height: 1;
+        text-style: bold;
+        padding: 0 1;
+    }
+    .trade-section-label {
+        height: 1;
+        text-style: bold;
+        background: #2A2A2A;
+        padding: 0 1;
+        color: $text-muted;
+    }
+    .trade-roster-table {
+        height: auto;
+        max-height: 45%;
+        background: $panel;
+    }
+    .trade-result-label {
+        height: 1;
+        padding: 0 1;
+    }
+    .trade-impact-table {
+        height: auto;
+        background: $panel;
+    }
+    DataTable > .datatable--cursor {
+        background: #3A5A3A;
+        color: #E8E4DF;
+    }
+    #trade-loading {
+        height: auto;
+        content-align: center middle;
+        padding: 1 0;
+    }
+    #trade-loading-status {
+        height: 1;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    """
+
+    def __init__(self, api: YahooFantasyAPI, league: League,
+                 categories: list[StatCategory]) -> None:
+        super().__init__()
+        self.api = api
+        self.league = league
+        self.categories = categories
+        self._team_a_key: str | None = None
+        self._team_a_name: str = ""
+        self._team_b_key: str | None = None
+        self._team_b_name: str = ""
+        self._roster_a: list[PlayerStats] = []
+        self._roster_b: list[PlayerStats] = []
+        self._selected_a: set[str] = set()  # player_keys checked for trade
+        self._selected_b: set[str] = set()
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("", id="trade-header")
+        yield Static("", id="trade-subheader")
+        with Horizontal(id="trade-split"):
+            with Vertical(id="trade-left"):
+                yield VerticalScroll(id="trade-left-scroll")
+            with Vertical(id="trade-right"):
+                with Vertical(id="trade-loading", display=False):
+                    yield LoadingIndicator()
+                    yield Static("Analyzing trade...", id="trade-loading-status")
+                yield VerticalScroll(id="trade-right-scroll")
+        yield WrappingFooter()
+
+    def on_mount(self) -> None:
+        self.query_one("#trade-header", Static).update(
+            f" {self.league.name} — Trade Analyzer "
+        )
+        self._update_subheader()
+        # Auto-select Team A
+        teams = self.api.get_team_season_stats(self.league.league_key)
+        options = [(t.team_key, t.name) for t in teams]
+        self.app.push_screen(
+            TeamSelectModal(options),
+            callback=self._on_team_a_selected,
+        )
+
+    def _update_subheader(self) -> None:
+        sub = Text()
+        if self._team_a_key and self._team_b_key:
+            sub.append(f" {self._team_a_name}", style=f"bold {TEAM_A_COLOR}")
+            sub.append("  ↔  ", style="dim")
+            sub.append(f"{self._team_b_name} ", style=f"bold {TEAM_B_COLOR}")
+            sub.append("  |  [a] Analyze  [b] Change Team B  [Enter] Toggle player", style="dim")
+        elif self._team_a_key:
+            sub.append(f" {self._team_a_name}", style=f"bold {TEAM_A_COLOR}")
+            sub.append("  |  Press [b] to select trade partner", style="dim")
+        else:
+            sub.append(" Select your team...", style="dim")
+        self.query_one("#trade-subheader", Static).update(sub)
+
+    def _on_team_a_selected(self, team_key: str | None) -> None:
+        if not team_key:
+            self.app.pop_screen()
+            return
+        teams = self.api.get_team_season_stats(self.league.league_key)
+        self._team_a_key = team_key
+        self._team_a_name = next(
+            (t.name for t in teams if t.team_key == team_key), team_key
+        )
+        self._update_subheader()
+        self.run_worker(self._load_roster_a)
+
+    async def _load_roster_a(self) -> None:
+        self._roster_a = self.api.get_roster_stats_season(
+            self._team_a_key, self.league.current_week
+        )
+        self._selected_a.clear()
+        await self._render_left_pane()
+
+    def action_select_team_b(self) -> None:
+        if not self._team_a_key:
+            return
+        teams = self.api.get_team_season_stats(self.league.league_key)
+        options = [(t.team_key, t.name) for t in teams
+                   if t.team_key != self._team_a_key]
+        self.app.push_screen(
+            TeamSelectModal(options),
+            callback=self._on_team_b_selected,
+        )
+
+    def _on_team_b_selected(self, team_key: str | None) -> None:
+        if not team_key:
+            return
+        teams = self.api.get_team_season_stats(self.league.league_key)
+        self._team_b_key = team_key
+        self._team_b_name = next(
+            (t.name for t in teams if t.team_key == team_key), team_key
+        )
+        self._update_subheader()
+        self.run_worker(self._load_roster_b)
+
+    async def _load_roster_b(self) -> None:
+        self._roster_b = self.api.get_roster_stats_season(
+            self._team_b_key, self.league.current_week
+        )
+        self._selected_b.clear()
+        await self._render_left_pane()
+
+    async def _render_left_pane(self) -> None:
+        scroll = self.query_one("#trade-left-scroll", VerticalScroll)
+        await scroll.remove_children()
+
+        if self._roster_a:
+            label_a = Text(f" {self._team_a_name} ", style=f"bold {TEAM_A_COLOR}")
+            await scroll.mount(Static(label_a, classes="trade-team-label"))
+            table_a = DataTable(classes="trade-roster-table", id="roster-table-a")
+            await scroll.mount(table_a)
+            self._fill_trade_roster(table_a, self._roster_a, self._selected_a)
+
+        if self._roster_b:
+            await scroll.mount(Static(""))  # spacer
+            label_b = Text(f" {self._team_b_name} ", style=f"bold {TEAM_B_COLOR}")
+            await scroll.mount(Static(label_b, classes="trade-team-label"))
+            table_b = DataTable(classes="trade-roster-table", id="roster-table-b")
+            await scroll.mount(table_b)
+            self._fill_trade_roster(table_b, self._roster_b, self._selected_b)
+
+    def _fill_trade_roster(
+        self, table: DataTable, roster: list[PlayerStats], selected: set[str],
+    ) -> None:
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table._players = roster
+        table.clear(columns=True)
+
+        scored = [c for c in self.categories if not c.is_only_display]
+        batting_cats = [c for c in scored if c.position_type == "B"]
+        pitching_cats = [c for c in scored if c.position_type == "P"]
+
+        table.add_columns("", "Player", "Pos", "Team")
+        batting_positions = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF",
+                             "OF", "Util", "DH", "IF", "BN"}
+
+        for p in roster:
+            is_batter = any(
+                pos in batting_positions for pos in p.position.split(",")
+            )
+            marker = "★" if p.player_key in selected else " "
+            marker_style = "bold #FFD700" if p.player_key in selected else "dim"
+            table.add_row(
+                Text(marker, style=marker_style),
+                Text(p.name[:20], style="bold"),
+                Text(p.selected_position or p.position[:8], style="dim"),
+                Text(p.team_abbr, style="dim"),
+            )
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Toggle player selection when Enter is pressed on a roster row."""
+        table = event.data_table
+        table_id = getattr(table, "id", "")
+        players = getattr(table, "_players", [])
+        row_idx = event.cursor_row
+        if row_idx < 0 or row_idx >= len(players):
+            return
+
+        p = players[row_idx]
+        if table_id == "roster-table-a":
+            if p.player_key in self._selected_a:
+                self._selected_a.discard(p.player_key)
+            else:
+                self._selected_a.add(p.player_key)
+        elif table_id == "roster-table-b":
+            if p.player_key in self._selected_b:
+                self._selected_b.discard(p.player_key)
+            else:
+                self._selected_b.add(p.player_key)
+
+        # Re-render left pane to update markers
+        self.run_worker(self._render_left_pane, group="render-left", exclusive=True)
+
+    def action_analyze(self) -> None:
+        if not self._selected_a or not self._selected_b:
+            self.notify("Select players from both teams first", severity="warning")
+            return
+        if not self._team_a_key or not self._team_b_key:
+            self.notify("Select both teams first", severity="warning")
+            return
+        self.run_worker(self._run_analysis, group="trade-analysis", exclusive=True)
+
+    async def _run_analysis(self) -> None:
+        from gkl.trade import TradeSide, compute_trade_impact
+
+        # Show loading
+        self.query_one("#trade-loading").display = True
+        self.query_one("#trade-right-scroll").display = False
+
+        try:
+            cache = self.app.shared_cache
+            await cache.ensure_loaded(self.api, self.league, self.categories)
+
+            players_out_a = [p for p in self._roster_a if p.player_key in self._selected_a]
+            players_out_b = [p for p in self._roster_b if p.player_key in self._selected_b]
+
+            side_a = TradeSide(self._team_a_key, self._team_a_name, players_out_a)
+            side_b = TradeSide(self._team_b_key, self._team_b_name, players_out_b)
+
+            import asyncio
+            impact = await asyncio.to_thread(
+                compute_trade_impact,
+                cache.all_teams,
+                self._roster_a,
+                self._roster_b,
+                side_a, side_b,
+                self.categories,
+            )
+
+            await self._render_results(impact)
+        except Exception as e:
+            self.notify(f"Analysis failed: {e}", severity="error")
+        finally:
+            self.query_one("#trade-loading").display = False
+            self.query_one("#trade-right-scroll").display = True
+
+    async def _render_results(self, impact) -> None:
+        from gkl.trade import TradeImpact
+        impact: TradeImpact
+
+        scroll = self.query_one("#trade-right-scroll", VerticalScroll)
+        await scroll.remove_children()
+
+        # --- Stat Impact Table ---
+        await scroll.mount(Static(
+            Text(" CATEGORY IMPACT ", style="bold"),
+            classes="trade-section-label",
+        ))
+
+        cat_table = DataTable(classes="trade-impact-table")
+        await scroll.mount(cat_table)
+        cat_table.cursor_type = "none"
+        cat_table.zebra_stripes = True
+        cat_table.add_columns("Category", "Before", "After", "Delta")
+
+        for ci in impact.cat_impacts:
+            if ci.delta == 0:
+                delta_style = "dim"
+                delta_str = "—"
+            elif ci.favorable:
+                delta_style = "bold green"
+                # Format delta based on stat type
+                if ci.stat_id in RATE_STATS:
+                    delta_str = f"{ci.delta:+.3f}"
+                else:
+                    delta_str = f"{ci.delta:+.0f}"
+            else:
+                delta_style = "bold red"
+                if ci.stat_id in RATE_STATS:
+                    delta_str = f"{ci.delta:+.3f}"
+                else:
+                    delta_str = f"{ci.delta:+.0f}"
+
+            cat_table.add_row(
+                Text(f" {ci.display_name}", style="bold"),
+                Text(ci.before, justify="right"),
+                Text(ci.after, justify="right"),
+                Text(delta_str, style=delta_style, justify="right"),
+            )
+
+        await scroll.mount(Static(""))  # spacer
+
+        # --- Roto Impact ---
+        await scroll.mount(Static(
+            Text(" ROTO STANDINGS IMPACT ", style="bold"),
+            classes="trade-section-label",
+        ))
+
+        roto_line = Text()
+        rank_delta = impact.roto_rank_before_a - impact.roto_rank_after_a  # positive = improved
+        pts_delta = impact.roto_points_after_a - impact.roto_points_before_a
+        roto_line.append(f"  Before: ", style="dim")
+        roto_line.append(f"#{impact.roto_rank_before_a}", style="bold")
+        roto_line.append(f" ({impact.roto_points_before_a:.1f} pts)", style="dim")
+        roto_line.append(f"   →   After: ", style="dim")
+        roto_line.append(f"#{impact.roto_rank_after_a}", style="bold")
+        roto_line.append(f" ({impact.roto_points_after_a:.1f} pts)", style="dim")
+        if rank_delta > 0:
+            roto_line.append(f"   ▲ {rank_delta} spots", style="bold green")
+        elif rank_delta < 0:
+            roto_line.append(f"   ▼ {abs(rank_delta)} spots", style="bold red")
+        else:
+            roto_line.append(f"   — no change", style="dim")
+        await scroll.mount(Static(roto_line, classes="trade-result-label"))
+
+        await scroll.mount(Static(""))  # spacer
+
+        # --- H2H Power Ranking Impact ---
+        await scroll.mount(Static(
+            Text(" H2H POWER RANKING IMPACT ", style="bold"),
+            classes="trade-section-label",
+        ))
+
+        h2h_line = Text()
+        h2h_line.append(f"  Before: ", style="dim")
+        h2h_line.append(f"{impact.h2h_before_a.record_str}", style="bold")
+        h2h_line.append(f" ({impact.h2h_before_a.win_pct:.3f})", style="dim")
+        h2h_line.append(f"   →   After: ", style="dim")
+        h2h_line.append(f"{impact.h2h_after_a.record_str}", style="bold")
+        h2h_line.append(f" ({impact.h2h_after_a.win_pct:.3f})", style="dim")
+        win_delta = impact.h2h_after_a.total_wins - impact.h2h_before_a.total_wins
+        if win_delta > 0:
+            h2h_line.append(f"   +{win_delta}W", style="bold green")
+        elif win_delta < 0:
+            h2h_line.append(f"   {win_delta}W", style="bold red")
+        await scroll.mount(Static(h2h_line, classes="trade-result-label"))
+
+        await scroll.mount(Static(""))  # spacer
+
+        # --- Trade Partner Impact ---
+        await scroll.mount(Static(
+            Text(f" IMPACT ON {self._team_b_name.upper()} ", style="bold"),
+            classes="trade-section-label",
+        ))
+
+        partner_roto = Text()
+        b_rank_delta = impact.roto_rank_before_b - impact.roto_rank_after_b
+        partner_roto.append(f"  Roto: #{impact.roto_rank_before_b} → #{impact.roto_rank_after_b}", style="dim")
+        if b_rank_delta > 0:
+            partner_roto.append(f"  ▲ {b_rank_delta}", style="green")
+        elif b_rank_delta < 0:
+            partner_roto.append(f"  ▼ {abs(b_rank_delta)}", style="red")
+        await scroll.mount(Static(partner_roto, classes="trade-result-label"))
+
+        partner_h2h = Text()
+        partner_h2h.append(f"  H2H: {impact.h2h_before_b.record_str} → {impact.h2h_after_b.record_str}", style="dim")
+        b_win_delta = impact.h2h_after_b.total_wins - impact.h2h_before_b.total_wins
+        if b_win_delta > 0:
+            partner_h2h.append(f"  +{b_win_delta}W", style="green")
+        elif b_win_delta < 0:
+            partner_h2h.append(f"  {b_win_delta}W", style="red")
+        await scroll.mount(Static(partner_h2h, classes="trade-result-label"))
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
+
+
 # --- Scoreboard Screen (3-pane layout) ---
 
 
@@ -6603,6 +7027,7 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
                 ("c", "compare", "Compare"),
                 ("i", "player_detail", "Player Detail"),
                 ("a", "ask_skipper", "Ask Skipper"),
+                ("T", "trade_analyzer", "Trade Analyzer"),
                 ("C", "settings", "Config")]
     CSS = """
     #board-header {
@@ -6823,7 +7248,6 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
 
         Also computes roto ranks and H2H records for display.
         """
-        from gkl.stats import RATE_STATS
         season_teams = self.api.get_team_season_stats(self.league.league_key)
         season_by_key = {t.team_key: t for t in season_teams}
         weeks_played = max(self.league.current_week - 1, 1)
@@ -7404,6 +7828,12 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         if self.league:
             self.app.push_screen(
                 AskSkipperScreen(self.api, self.league, self.categories)
+            )
+
+    def action_trade_analyzer(self) -> None:
+        if self.league:
+            self.app.push_screen(
+                TradeAnalyzerScreen(self.api, self.league, self.categories)
             )
 
     def action_mlb_scores(self) -> None:
