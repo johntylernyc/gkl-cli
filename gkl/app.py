@@ -7314,7 +7314,7 @@ class TradeAnalyzerScreen(Screen):
         target_table.cursor_type = "row"
         target_table.zebra_stripes = True
         target_table._players = self._trade_targets
-        target_table.add_columns("Player", "Pos", "Team", "SGP", "ΔSGP", "ΔRoto", "ΔWin%")
+        target_table.add_columns("Player", "Pos", "Team", "SGP", "ΔSGP", "ΔRoto", "ΔWin%", "Partner")
 
         for t in self._trade_targets:
             sgp_str = f"{t.sgp:+.1f}" if t.sgp is not None else "N/A"
@@ -7332,6 +7332,14 @@ class TradeAnalyzerScreen(Screen):
                 h2h_str = "—"
                 h2h_style = "dim"
 
+            partner_str = f"{t.partner_roto_delta:+.0f}"
+            if t.partner_roto_delta > 0.1:
+                partner_style = "green"
+            elif t.partner_roto_delta < -5:
+                partner_style = "red"
+            else:
+                partner_style = "dim"
+
             target_table.add_row(
                 Text(t.player.name[:20], style="bold"),
                 Text(t.player.position[:12], style="dim"),
@@ -7340,6 +7348,7 @@ class TradeAnalyzerScreen(Screen):
                 Text(net_str, style=net_style, justify="right"),
                 Text(roto_str, style=roto_style, justify="right"),
                 Text(h2h_str, style=h2h_style, justify="right"),
+                Text(partner_str, style=partner_style, justify="right"),
             )
 
     def _run_block_analysis(self, target) -> None:

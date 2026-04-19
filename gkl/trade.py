@@ -27,6 +27,7 @@ class TradeTarget:
     sgp: float | None          # target player's SGP
     net_sgp: float             # target SGP − outgoing SGP (positive = upgrade)
     roto_delta: float = 0.0    # change in roto points for team A
+    partner_roto_delta: float = 0.0  # change in roto points for trade partner
     h2h_win_pct_before: float = 0.0  # baseline win % vs all opponents
     h2h_win_pct_after: float = 0.0   # post-trade win % vs all opponents
     h2h_win_pct_delta: float = 0.0   # change in win %
@@ -914,30 +915,56 @@ def find_trade_targets(
     candidates.sort(key=lambda t: t.net_sgp, reverse=True)
     candidates = candidates[:max_results * 2]  # keep extra for re-ranking
 
+    # Build baseline partner roto lookup
+    partner_baseline_pts: dict[str, float] = {}
+    baseline_roto_results = compute_roto(all_teams, scored)
+    for r in baseline_roto_results:
+        partner_baseline_pts[r["team_key"]] = r["total"]
+
     # Compute roto and H2H deltas for each candidate
+    filtered_candidates: list[TradeTarget] = []
     for target in candidates:
-        # Apply trade to my team
-        trade_team = apply_trade_to_team(
+        # Apply trade to both teams
+        trade_team_a = apply_trade_to_team(
             my_team, my_roster,
             players_out=[outgoing_player],
             players_in=[target.player],
             categories=categories,
         )
+        partner_team = next((t for t in all_teams if t.team_key == target.team_key), None)
+        partner_roster = all_rosters.get(target.team_key, [])
+        if partner_team and partner_roster:
+            trade_team_b = apply_trade_to_team(
+                partner_team, partner_roster,
+                players_out=[target.player],
+                players_in=[outgoing_player],
+                categories=categories,
+            )
+        else:
+            trade_team_b = None
 
-        # Build modified team list
+        # Build modified team list with both sides of the trade
         teams_after = []
         for t in all_teams:
             if t.team_key == my_team_key:
-                teams_after.append(trade_team)
+                teams_after.append(trade_team_a)
+            elif t.team_key == target.team_key and trade_team_b:
+                teams_after.append(trade_team_b)
             else:
                 teams_after.append(t)
 
-        # Roto delta
+        # Roto delta for both sides
         roto_after = compute_roto(teams_after, scored)
         for r in roto_after:
             if r["team_key"] == my_team_key:
                 target.roto_delta = r["total"] - baseline_pts
-                break
+            elif r["team_key"] == target.team_key:
+                target.partner_roto_delta = r["total"] - partner_baseline_pts.get(target.team_key, 0)
+
+        # Filter unrealistic deals — partner loses too much
+        if target.partner_roto_delta < -15:
+            continue
+        filtered_candidates.append(target)
 
         # H2H win % delta — replay actual weekly matchups with trade applied
         target.h2h_win_pct_before = baseline_win_pct
@@ -955,8 +982,8 @@ def find_trade_targets(
             target.h2h_win_pct_delta = target.h2h_win_pct_after - baseline_win_pct
 
     # Sort by roto delta descending
-    candidates.sort(key=lambda t: t.roto_delta, reverse=True)
-    return candidates[:max_results]
+    filtered_candidates.sort(key=lambda t: t.roto_delta, reverse=True)
+    return filtered_candidates[:max_results]
 
 
 # ---------------------------------------------------------------------------
@@ -1066,7 +1093,7 @@ def _find_best_offer(
 
     candidates: list[tuple[PlayerStats, float, float]] = []
     for p in my_roster:
-        if p.selected_position in ("IL", "IL+", "NA", "BN"):
+        if p.selected_position in ("IL", "IL+", "NA"):
             continue
         p_sgp = sgp_calc.player_sgp(p) if sgp_calc else None
         if p_sgp is None:
