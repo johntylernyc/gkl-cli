@@ -7028,7 +7028,7 @@ class TradeAnalyzerScreen(Screen):
                 self._block_player,
                 self._team_a_key,
                 all_rosters,
-                all_teams,
+                cache.all_teams,
                 cache.team_names,
                 self.categories,
                 cache.sgp_calc,
