@@ -6690,7 +6690,7 @@ class CategorySelectModal(Screen):
     def compose(self) -> ComposeResult:
         with Vertical(id="cat-select-container"):
             yield Static("Select Categories to Improve", id="cat-select-title")
-            yield Static("[Enter] toggle  [d] done  [Esc] cancel", id="cat-select-hint")
+            yield Static("[Enter] toggle selection  |  [d] done — run discovery  |  [Esc] cancel", id="cat-select-hint")
             yield ListView(id="cat-select-list")
 
     def on_mount(self) -> None:
@@ -7162,20 +7162,39 @@ class TradeAnalyzerScreen(Screen):
         scenario_table.cursor_type = "row"
         scenario_table.zebra_stripes = True
         scenario_table._players = self._discover_scenarios
-        scenario_table.add_columns("You Get", "From", "You Send", "ΔSGP", "ΔRoto")
+        scenario_table.add_columns("You Get", "From", "You Send", "ΔSGP", "ΔRoto", "ΔWin%", "Partner")
 
         for s in self._discover_scenarios:
             net_str = f"{s.net_sgp:+.1f}"
             net_style = "bold green" if s.net_sgp > 0 else "bold red" if s.net_sgp < 0 else "dim"
+
             roto_str = f"{s.roto_delta:+.1f}"
             roto_style = "bold green" if s.roto_delta > 0.1 else "bold red" if s.roto_delta < -0.1 else "dim"
 
+            if abs(s.h2h_win_pct_delta) > 0.001:
+                h2h_str = f"{s.h2h_win_pct_delta:+.1%}"
+                h2h_style = "bold green" if s.h2h_win_pct_delta > 0 else "bold red"
+            else:
+                h2h_str = "—"
+                h2h_style = "dim"
+
+            # Partner roto delta — shows if the deal is realistic
+            partner_str = f"{s.partner_roto_delta:+.0f}"
+            if s.partner_roto_delta > 0.1:
+                partner_style = "green"  # partner benefits — good for acceptance
+            elif s.partner_roto_delta < -5:
+                partner_style = "red"  # partner loses a lot — unlikely to accept
+            else:
+                partner_style = "dim"
+
             scenario_table.add_row(
-                Text(f"{s.target.name[:18]} ({s.target.position[:6]})", style="bold"),
-                Text(s.target_team_name[:14], style="dim"),
-                Text(f"{s.offer.name[:18]} ({s.offer.position[:6]})", style=f"{TEAM_A_COLOR}"),
+                Text(f"{s.target.name[:16]} ({s.target.position[:5]})", style="bold"),
+                Text(s.target_team_name[:12], style="dim"),
+                Text(f"{s.offer.name[:16]} ({s.offer.position[:5]})", style=f"{TEAM_A_COLOR}"),
                 Text(net_str, style=net_style, justify="right"),
                 Text(roto_str, style=roto_style, justify="right"),
+                Text(h2h_str, style=h2h_style, justify="right"),
+                Text(partner_str, style=partner_style, justify="right"),
             )
 
     async def _scan_trade_targets(self) -> None:

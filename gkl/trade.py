@@ -43,7 +43,8 @@ class TradeScenario:
     offer_sgp: float | None
     net_sgp: float              # target SGP − offer SGP
     roto_delta: float = 0.0
-    category_scores: dict[str, float] = field(default_factory=dict)  # stat_id -> target's value
+    partner_roto_delta: float = 0.0  # roto impact on trade partner (positive = they benefit)
+    h2h_win_pct_delta: float = 0.0   # H2H win% change for user
 
 
 @dataclass
@@ -1046,44 +1047,47 @@ def _find_best_offer(
     target: PlayerStats,
     target_sgp: float | None,
     sgp_calc: SGPCalculator | None,
+    target_stat_ids: list[str] | None = None,
 ) -> PlayerStats | None:
     """Find the best player to offer from my roster for a given target.
 
-    Looks for a player with:
-    1. Position overlap with the target (so the other manager can slot them in)
-    2. Closest SGP value to the target (realistic trade, not a fleece)
+    Strategy: offer a player from a DIFFERENT position group than the
+    target categories, so the trade makes sense for both sides. E.g.,
+    if targeting a pitcher, offer a batter — the other manager fills
+    a batting need, you fill a pitching need.
+
+    Prefers players with SGP close to the target's value (realistic deal).
+    Avoids offering players at the same position as the target (which
+    would devastate the partner's roster at that position).
     """
-    target_positions = {pos.strip() for pos in target.position.split(",")}
+    batting_positions = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF",
+                         "OF", "Util", "DH"}
+    target_is_pitcher = _is_pitcher(target)
 
     candidates: list[tuple[PlayerStats, float, float]] = []
     for p in my_roster:
-        if p.selected_position in ("IL", "IL+", "NA"):
-            continue
-        player_positions = {pos.strip() for pos in p.position.split(",")}
-        if not (target_positions & player_positions):
+        if p.selected_position in ("IL", "IL+", "NA", "BN"):
             continue
         p_sgp = sgp_calc.player_sgp(p) if sgp_calc else None
         if p_sgp is None:
             continue
-        # Distance from target's value — prefer close matches
-        gap = abs(p_sgp - (target_sgp or 0))
-        candidates.append((p, p_sgp, gap))
 
-    if not candidates:
-        # Fall back: any player with SGP, no position filter
-        for p in my_roster:
-            if p.selected_position in ("IL", "IL+", "NA"):
-                continue
-            p_sgp = sgp_calc.player_sgp(p) if sgp_calc else None
-            if p_sgp is None:
-                continue
+        p_is_pitcher = _is_pitcher(p)
+
+        # Prefer cross-type trades: if target is pitcher, offer a batter and vice versa
+        # This creates trades where both sides fill different needs
+        if target_is_pitcher == p_is_pitcher:
+            # Same type — penalize to push these down the ranking
+            gap = abs(p_sgp - (target_sgp or 0)) + 50
+        else:
             gap = abs(p_sgp - (target_sgp or 0))
-            candidates.append((p, p_sgp, gap))
+
+        candidates.append((p, p_sgp, gap))
 
     if not candidates:
         return None
 
-    # Sort by SGP gap — closest value match first
+    # Sort by gap — closest value match (with cross-type bonus) first
     candidates.sort(key=lambda x: x[2])
     return candidates[0][0]
 
@@ -1168,30 +1172,75 @@ def discover_trades(
             baseline_pts = r["total"]
             break
 
+    # Also compute baseline partner roto and H2H for filtering
+    partner_baseline_pts: dict[str, float] = {}
+    for r in baseline_roto:
+        partner_baseline_pts[r["team_key"]] = r["total"]
+
+    baseline_h2h = simulate_h2h(all_teams, scored)
+    baseline_pr = compute_power_rankings(baseline_h2h, all_teams)
+    baseline_win_pct = 0.0
+    for s in baseline_pr:
+        if s.team_key == my_team_key:
+            baseline_win_pct = s.win_pct
+            break
+
     for player, team_key, team_name, cat_score, p_sgp in candidates:
-        offer = _find_best_offer(my_roster, player, p_sgp, sgp_calc)
+        offer = _find_best_offer(my_roster, player, p_sgp, sgp_calc, target_stat_ids)
         if offer is None:
             continue
 
         offer_sgp = sgp_calc.player_sgp(offer) if sgp_calc else None
         net = (p_sgp - (offer_sgp or 0)) if p_sgp else 0.0
 
-        # Compute roto delta
-        trade_team = apply_trade_to_team(
+        # Compute roto delta for both sides
+        trade_team_a = apply_trade_to_team(
             my_team, my_roster,
             players_out=[offer],
             players_in=[player],
             categories=categories,
         )
-        teams_after = [
-            trade_team if t.team_key == my_team_key else t
-            for t in all_teams
-        ]
+        partner_team = next((t for t in all_teams if t.team_key == team_key), None)
+        partner_roster = all_rosters.get(team_key, [])
+        if partner_team:
+            trade_team_b = apply_trade_to_team(
+                partner_team, partner_roster,
+                players_out=[player],
+                players_in=[offer],
+                categories=categories,
+            )
+        else:
+            trade_team_b = None
+
+        teams_after = []
+        for t in all_teams:
+            if t.team_key == my_team_key:
+                teams_after.append(trade_team_a)
+            elif t.team_key == team_key and trade_team_b:
+                teams_after.append(trade_team_b)
+            else:
+                teams_after.append(t)
+
         roto_after = compute_roto(teams_after, scored)
         roto_delta = 0.0
+        partner_roto_delta = 0.0
         for r in roto_after:
             if r["team_key"] == my_team_key:
                 roto_delta = r["total"] - baseline_pts
+            elif r["team_key"] == team_key:
+                partner_roto_delta = r["total"] - partner_baseline_pts.get(team_key, 0)
+
+        # Skip deals where the partner loses too much — unrealistic offers
+        if partner_roto_delta < -15:
+            continue
+
+        # H2H win% delta
+        h2h_after = simulate_h2h(teams_after, scored)
+        pr_after = compute_power_rankings(h2h_after, teams_after)
+        h2h_win_pct_delta = 0.0
+        for s in pr_after:
+            if s.team_key == my_team_key:
+                h2h_win_pct_delta = s.win_pct - baseline_win_pct
                 break
 
         scenarios.append(TradeScenario(
@@ -1203,6 +1252,8 @@ def discover_trades(
             offer_sgp=offer_sgp,
             net_sgp=net,
             roto_delta=roto_delta,
+            partner_roto_delta=partner_roto_delta,
+            h2h_win_pct_delta=h2h_win_pct_delta,
         ))
 
     # Sort by roto delta
