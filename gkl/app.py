@@ -6748,6 +6748,8 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         self._player_view = "weekly"  # "weekly", "daily", "season"
         self._daily_date: str = ""  # current date for daily view
         self._matchup_dates: list[str] = []  # available dates for current matchup
+        self._roto_rank: dict[str, int] = {}
+        self._h2h_record: dict[str, dict] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -6817,7 +6819,10 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         return self._viewing_week > self.league.current_week
 
     def _project_weekly_stats(self, matchups: list[Matchup]) -> None:
-        """Replace empty future-week stats with projections from season averages."""
+        """Replace empty future-week stats with projections from season averages.
+
+        Also computes roto ranks and H2H records for display.
+        """
         from gkl.stats import RATE_STATS
         season_teams = self.api.get_team_season_stats(self.league.league_key)
         season_by_key = {t.team_key: t for t in season_teams}
@@ -6830,7 +6835,6 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
                 season = season_by_key.get(team.team_key)
                 if not season:
                     continue
-                projected_points = 0.0
                 for cat in scored_cats:
                     season_val = season.stats.get(cat.stat_id, "")
                     if not season_val or season_val in ("-", "/"):
@@ -6840,15 +6844,45 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
                     except (ValueError, TypeError):
                         continue
                     if cat.stat_id in RATE_STATS:
-                        # Ratio stat: use season value as-is
                         team.stats[cat.stat_id] = season_val
                     else:
-                        # Counting stat: project per-week average
                         projected = val_f / weeks_played
                         if projected == int(projected):
                             team.stats[cat.stat_id] = str(int(projected))
                         else:
                             team.stats[cat.stat_id] = f"{projected:.1f}"
+
+        # Compute roto ranks from season stats
+        roto_results = compute_roto(season_teams, scored_cats)
+        self._roto_rank = {e["team_key"]: r for r, e in enumerate(roto_results, 1)}
+
+        # Compute H2H records from past matchups
+        self._h2h_record: dict[str, dict] = {}
+        cache = self.app.shared_cache
+        for w in range(1, self.league.current_week + 1):
+            week_matchups = cache.week_matchups.get(w)
+            if not week_matchups:
+                try:
+                    week_matchups = self.api.get_scoreboard(self.league.league_key, week=w)
+                    cache.week_matchups[w] = week_matchups
+                except Exception:
+                    continue
+            for wm in week_matchups:
+                if wm.status == "preevent":
+                    continue
+                for tk in (wm.team_a.team_key, wm.team_b.team_key):
+                    if tk not in self._h2h_record:
+                        self._h2h_record[tk] = {"wins": 0, "losses": 0, "ties": 0}
+                pa, pb = wm.team_a.points, wm.team_b.points
+                if pa > pb:
+                    self._h2h_record[wm.team_a.team_key]["wins"] += 1
+                    self._h2h_record[wm.team_b.team_key]["losses"] += 1
+                elif pb > pa:
+                    self._h2h_record[wm.team_a.team_key]["losses"] += 1
+                    self._h2h_record[wm.team_b.team_key]["wins"] += 1
+                else:
+                    self._h2h_record[wm.team_a.team_key]["ties"] += 1
+                    self._h2h_record[wm.team_b.team_key]["ties"] += 1
 
     async def _refresh_data(self) -> None:
         if not self.league:
@@ -6902,11 +6936,15 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
         is_future = self._is_future_week()
 
         if is_future:
-            # Column header for projected scores
+            # Column headers for projected scores + standings
             hdr = Text()
-            hdr.append(f"{'':>3} {'':18}  {'':18}  ", style="dim")
-            hdr.append("projected", style="italic dim #E8A735")
-            lv.mount(ListItem(Label(hdr, classes="matchup-row")))
+            hdr.append(f"{'':>3} {'':18}  {'':18}", style="dim")
+            hdr.append(f"  {'proj':>7}", style="italic dim #E8A735")
+            hdr.append(f"  {'roto':>4}", style="dim")
+            hdr.append(f"  {'h2h':>7}", style="dim")
+            hdr_item = ListItem(Label(hdr, classes="matchup-row"))
+            hdr_item._matchup_index = None
+            lv.mount(hdr_item)
 
         for i, m in enumerate(self.matchups):
             num = str(i + 1) if i < 9 else "0" if i == 9 else ""
@@ -6917,12 +6955,29 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
             score_line.append(f"{m.team_b.name[:18]:<18}", style=f"bold {TEAM_B_COLOR}")
             if is_future:
                 aw, bw, t = self._compute_projected_record(m)
+                # Projected record
                 score_line.append("  ")
                 score_line.append(f"{aw:>2}", style=f"bold {TEAM_A_COLOR}")
                 score_line.append("-", style="dim")
                 score_line.append(f"{bw}", style=f"bold {TEAM_B_COLOR}")
                 score_line.append("-", style="dim")
                 score_line.append(f"{t}", style="dim")
+                # Roto rank
+                roto_a = self._roto_rank.get(m.team_a.team_key, "")
+                roto_b = self._roto_rank.get(m.team_b.team_key, "")
+                score_line.append("  ")
+                score_line.append(f"{roto_a}", style=f"{TEAM_A_COLOR}")
+                score_line.append("/", style="dim")
+                score_line.append(f"{roto_b}", style=f"{TEAM_B_COLOR}")
+                # H2H record
+                h2h_a = self._h2h_record.get(m.team_a.team_key, {})
+                h2h_b = self._h2h_record.get(m.team_b.team_key, {})
+                rec_a = f"{h2h_a.get('wins', 0)}-{h2h_a.get('losses', 0)}"
+                rec_b = f"{h2h_b.get('wins', 0)}-{h2h_b.get('losses', 0)}"
+                score_line.append("  ")
+                score_line.append(f"{rec_a}", style=f"{TEAM_A_COLOR}")
+                score_line.append("/", style="dim")
+                score_line.append(f"{rec_b}", style=f"{TEAM_B_COLOR}")
             else:
                 score_line.append(f"{m.team_a.points:>5.0f}", style=f"{TEAM_A_COLOR}")
                 score_line.append("  ")
@@ -6935,7 +6990,7 @@ class ScoreboardScreen(PlayerCompareMixin, Screen):
             item = ListItem(
                 Label(score_line, classes="matchup-row"),
                 Label(mgr_line, classes="matchup-row"),
-                Label("─" * 56, classes="matchup-divider"),
+                Label("─" * 70, classes="matchup-divider"),
             )
             item._matchup_index = i
             lv.mount(item)
