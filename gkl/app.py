@@ -6684,7 +6684,7 @@ class TradeAnalyzerScreen(Screen):
             with Vertical(id="trade-left"):
                 yield VerticalScroll(id="trade-left-scroll")
             with Vertical(id="trade-right"):
-                with Vertical(id="trade-loading", display=False):
+                with Vertical(id="trade-loading"):
                     yield LoadingIndicator()
                     yield Static("Analyzing trade...", id="trade-loading-status")
                 yield VerticalScroll(id="trade-right-scroll")
@@ -6694,6 +6694,7 @@ class TradeAnalyzerScreen(Screen):
         self.query_one("#trade-header", Static).update(
             f" {self.league.name} — Trade Analyzer "
         )
+        self.query_one("#trade-loading").display = False
         self._update_subheader()
         # Auto-select Team A
         teams = self.api.get_team_season_stats(self.league.league_key)
