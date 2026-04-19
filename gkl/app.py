@@ -6904,7 +6904,7 @@ class TradeAnalyzerScreen(Screen):
                 except Exception:
                     pass
 
-            from gkl.trade import replay_h2h_with_trade
+            from gkl.trade import replay_h2h_with_trade, compute_h2h_hypothetical
             side_a_keys = {p.player_key for p in players_out_a}
             side_b_keys = {p.player_key for p in players_out_b}
             h2h_replay = await asyncio.to_thread(
@@ -6917,16 +6917,25 @@ class TradeAnalyzerScreen(Screen):
                 self.categories,
                 self.league.current_week,
             )
+            h2h_hypo = await asyncio.to_thread(
+                compute_h2h_hypothetical,
+                self._team_a_key,
+                side_a_keys, side_b_keys,
+                cache.week_matchups,
+                weekly_roster_a, weekly_roster_b,
+                self.categories,
+                self.league.current_week,
+            )
 
-            await self._render_results(impact, h2h_replay)
+            await self._render_results(impact, h2h_replay, h2h_hypo)
         except Exception as e:
             self.notify(f"Analysis failed: {e}", severity="error")
         finally:
             self.query_one("#trade-loading").display = False
             self.query_one("#trade-right-scroll").display = True
 
-    async def _render_results(self, impact, h2h_replay=None) -> None:
-        from gkl.trade import TradeImpact, H2HReplay
+    async def _render_results(self, impact, h2h_replay=None, h2h_hypo=None) -> None:
+        from gkl.trade import TradeImpact, H2HReplay, H2HHypothetical
         impact: TradeImpact
 
         scroll = self.query_one("#trade-right-scroll", VerticalScroll)
@@ -7021,74 +7030,6 @@ class TradeAnalyzerScreen(Screen):
                 Text(rank_str, style=rank_style, justify="right"),
             )
 
-        await scroll.mount(Static(""))  # spacer
-
-        # --- H2H Season-Aggregate Hypothetical ---
-        await scroll.mount(Static(
-            Text(" H2H SEASON-AGGREGATE HYPOTHETICAL ", style="bold"),
-            classes="trade-section-label",
-        ))
-
-        n_opponents = impact.h2h_before_a.total_wins + impact.h2h_before_a.total_losses + impact.h2h_before_a.total_ties
-        h2h_desc = Text()
-        h2h_desc.append(
-            f"  If your full season stats were a single matchup vs each of the\n"
-            f"  {n_opponents} other teams, how many category matchups would you win?",
-            style="dim italic",
-        )
-        await scroll.mount(Static(h2h_desc, classes="trade-result-label"))
-
-        h2h_line = Text()
-        h2h_line.append(f"  Before: ", style="dim")
-        h2h_line.append(f"{impact.h2h_before_a.record_str}", style="bold")
-        h2h_line.append(f" (beat {impact.h2h_before_a.total_wins} of {n_opponents})", style="dim")
-        await scroll.mount(Static(h2h_line, classes="trade-result-label"))
-
-        h2h_after = Text()
-        h2h_after.append(f"  After:  ", style="dim")
-        h2h_after.append(f"{impact.h2h_after_a.record_str}", style="bold")
-        h2h_after.append(f" (beat {impact.h2h_after_a.total_wins} of {n_opponents})", style="dim")
-        win_delta = impact.h2h_after_a.total_wins - impact.h2h_before_a.total_wins
-        if win_delta > 0:
-            h2h_after.append(f"  +{win_delta}W", style="bold green")
-        elif win_delta < 0:
-            h2h_after.append(f"  {win_delta}W", style="bold red")
-        await scroll.mount(Static(h2h_after, classes="trade-result-label"))
-
-        h2h_note = Text()
-        h2h_note.append(
-            "  Note: this uses cumulative season stats, not per-week replay.\n"
-            "  See H2H Weekly Replay below for week-by-week impact.",
-            style="dim italic",
-        )
-        await scroll.mount(Static(h2h_note, classes="trade-result-label"))
-
-        await scroll.mount(Static(""))  # spacer
-
-        # --- Trade Partner Impact ---
-        await scroll.mount(Static(
-            Text(f" IMPACT ON {self._team_b_name.upper()} ", style="bold"),
-            classes="trade-section-label",
-        ))
-
-        partner_roto = Text()
-        b_rank_delta = impact.roto_rank_before_b - impact.roto_rank_after_b
-        partner_roto.append(f"  Roto: #{impact.roto_rank_before_b} → #{impact.roto_rank_after_b}", style="dim")
-        if b_rank_delta > 0:
-            partner_roto.append(f"  ▲ {b_rank_delta}", style="green")
-        elif b_rank_delta < 0:
-            partner_roto.append(f"  ▼ {abs(b_rank_delta)}", style="red")
-        await scroll.mount(Static(partner_roto, classes="trade-result-label"))
-
-        partner_h2h = Text()
-        partner_h2h.append(f"  H2H: {impact.h2h_before_b.record_str} → {impact.h2h_after_b.record_str}", style="dim")
-        b_win_delta = impact.h2h_after_b.total_wins - impact.h2h_before_b.total_wins
-        if b_win_delta > 0:
-            partner_h2h.append(f"  +{b_win_delta}W", style="green")
-        elif b_win_delta < 0:
-            partner_h2h.append(f"  {b_win_delta}W", style="red")
-        await scroll.mount(Static(partner_h2h, classes="trade-result-label"))
-
         # --- H2H Weekly Replay ---
         if h2h_replay and h2h_replay.weeks:
             await scroll.mount(Static(""))  # spacer
@@ -7157,6 +7098,71 @@ class TradeAnalyzerScreen(Screen):
             elif sw_delta < 0:
                 summary.append(f"  {sw_delta}W", style="bold red")
             await scroll.mount(Static(summary, classes="trade-result-label"))
+
+        # --- H2H Hypothetical (per-week vs all opponents) ---
+        if h2h_hypo:
+            await scroll.mount(Static(""))  # spacer
+
+            await scroll.mount(Static(
+                Text(" H2H HYPOTHETICAL (ALL OPPONENTS, ALL WEEKS) ", style="bold"),
+                classes="trade-section-label",
+            ))
+
+            n_matchups = h2h_hypo.before_w + h2h_hypo.before_l + h2h_hypo.before_t
+            n_opponents = self.league.num_teams - 1
+            n_weeks = self.league.current_week
+            hypo_desc = Text()
+            hypo_desc.append(
+                f"  For each of the {n_weeks} completed weeks, simulates your\n"
+                f"  weekly stats vs all {n_opponents} other teams ({n_matchups} total matchups).",
+                style="dim italic",
+            )
+            await scroll.mount(Static(hypo_desc, classes="trade-result-label"))
+
+            hypo_before = Text()
+            hypo_before.append(f"  Before: ", style="dim")
+            hypo_before.append(f"{h2h_hypo.before_w}-{h2h_hypo.before_l}-{h2h_hypo.before_t}", style="bold")
+            b_pct = h2h_hypo.before_w / n_matchups if n_matchups else 0
+            hypo_before.append(f" ({b_pct:.1%})", style="dim")
+            await scroll.mount(Static(hypo_before, classes="trade-result-label"))
+
+            hypo_after = Text()
+            hypo_after.append(f"  After:  ", style="dim")
+            hypo_after.append(f"{h2h_hypo.after_w}-{h2h_hypo.after_l}-{h2h_hypo.after_t}", style="bold")
+            a_pct = h2h_hypo.after_w / n_matchups if n_matchups else 0
+            hypo_after.append(f" ({a_pct:.1%})", style="dim")
+            hw_delta = h2h_hypo.after_w - h2h_hypo.before_w
+            if hw_delta > 0:
+                hypo_after.append(f"  +{hw_delta}W", style="bold green")
+            elif hw_delta < 0:
+                hypo_after.append(f"  {hw_delta}W", style="bold red")
+            await scroll.mount(Static(hypo_after, classes="trade-result-label"))
+
+        await scroll.mount(Static(""))  # spacer
+
+        # --- Trade Partner Impact ---
+        await scroll.mount(Static(
+            Text(f" IMPACT ON {self._team_b_name.upper()} ", style="bold"),
+            classes="trade-section-label",
+        ))
+
+        partner_roto = Text()
+        b_rank_delta = impact.roto_rank_before_b - impact.roto_rank_after_b
+        partner_roto.append(f"  Roto: #{impact.roto_rank_before_b} → #{impact.roto_rank_after_b}", style="dim")
+        if b_rank_delta > 0:
+            partner_roto.append(f"  ▲ {b_rank_delta}", style="green")
+        elif b_rank_delta < 0:
+            partner_roto.append(f"  ▼ {abs(b_rank_delta)}", style="red")
+        await scroll.mount(Static(partner_roto, classes="trade-result-label"))
+
+        partner_h2h = Text()
+        partner_h2h.append(f"  H2H: {impact.h2h_before_b.record_str} → {impact.h2h_after_b.record_str}", style="dim")
+        b_win_delta = impact.h2h_after_b.total_wins - impact.h2h_before_b.total_wins
+        if b_win_delta > 0:
+            partner_h2h.append(f"  +{b_win_delta}W", style="green")
+        elif b_win_delta < 0:
+            partner_h2h.append(f"  {b_win_delta}W", style="red")
+        await scroll.mount(Static(partner_h2h, classes="trade-result-label"))
 
     def action_go_back(self) -> None:
         self.app.pop_screen()

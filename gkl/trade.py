@@ -63,6 +63,19 @@ class H2HReplay:
 
 
 @dataclass
+class H2HHypothetical:
+    """Per-week hypothetical: team A's trade-adjusted stats vs every opponent."""
+    # Before trade: W-L-T across all weeks vs all opponents
+    before_w: int
+    before_l: int
+    before_t: int
+    # After trade
+    after_w: int
+    after_l: int
+    after_t: int
+
+
+@dataclass
 class RotoEntry:
     """One team's roto ranking."""
     team_key: str
@@ -622,4 +635,117 @@ def replay_h2h_with_trade(
         weeks=results,
         actual_season_w=actual_w, actual_season_l=actual_l, actual_season_t=actual_t,
         trade_season_w=trade_w, trade_season_l=trade_l, trade_season_t=trade_t,
+    )
+
+
+def compute_h2h_hypothetical(
+    team_a_key: str,
+    side_a_player_keys: set[str],
+    side_b_player_keys: set[str],
+    week_matchups: dict[int, list['Matchup']],
+    weekly_roster_a: dict[int, list[PlayerStats]],
+    weekly_roster_b: dict[int, list[PlayerStats]],
+    categories: list[StatCategory],
+    current_week: int,
+) -> H2HHypothetical:
+    """Compute a hypothetical H2H record by replaying every completed week
+    against every opponent using actual weekly stats.
+
+    For each week, applies the trade to team A's weekly stats, then
+    simulates category matchups against ALL other teams' actual weekly
+    stats (not just the scheduled opponent). Sums across all weeks for
+    a comprehensive hypothetical W-L-T record.
+    """
+    from gkl.yahoo_api import Matchup
+
+    scored = [c for c in categories if not c.is_only_display]
+    before_w = before_l = before_t = 0
+    after_w = after_l = after_t = 0
+
+    for week in range(1, current_week + 1):
+        matchups = week_matchups.get(week, [])
+        roster_a_week = weekly_roster_a.get(week, [])
+        roster_b_week = weekly_roster_b.get(week, [])
+
+        if not matchups:
+            continue
+
+        # Extract all teams' weekly stats from matchups
+        all_weekly_teams: dict[str, TeamStats] = {}
+        for m in matchups:
+            if m.status == "preevent":
+                continue
+            all_weekly_teams[m.team_a.team_key] = m.team_a
+            all_weekly_teams[m.team_b.team_key] = m.team_b
+
+        my_team = all_weekly_teams.get(team_a_key)
+        if my_team is None:
+            continue
+
+        # Compute trade-adjusted team stats for this week
+        players_out_week = [p for p in roster_a_week if p.player_key in side_a_player_keys]
+        players_in_week = [p for p in roster_b_week if p.player_key in side_b_player_keys]
+
+        if roster_a_week:
+            trade_team_a = apply_trade_to_team(
+                my_team, roster_a_week,
+                players_out=players_out_week,
+                players_in=players_in_week,
+                categories=categories,
+            )
+        else:
+            trade_team_a = my_team
+
+        # Simulate vs every other team this week
+        for opp_key, opp_team in all_weekly_teams.items():
+            if opp_key == team_a_key:
+                continue
+
+            # Before trade: my actual stats vs opponent
+            b_wins = b_losses = b_ties = 0
+            for cat in scored:
+                w = who_wins(
+                    my_team.stats.get(cat.stat_id, "0"),
+                    opp_team.stats.get(cat.stat_id, "0"),
+                    cat.sort_order,
+                )
+                if w == "a":
+                    b_wins += 1
+                elif w == "b":
+                    b_losses += 1
+                else:
+                    b_ties += 1
+
+            if b_wins > b_losses:
+                before_w += 1
+            elif b_losses > b_wins:
+                before_l += 1
+            else:
+                before_t += 1
+
+            # After trade: adjusted stats vs opponent
+            a_wins = a_losses = a_ties = 0
+            for cat in scored:
+                w = who_wins(
+                    trade_team_a.stats.get(cat.stat_id, "0"),
+                    opp_team.stats.get(cat.stat_id, "0"),
+                    cat.sort_order,
+                )
+                if w == "a":
+                    a_wins += 1
+                elif w == "b":
+                    a_losses += 1
+                else:
+                    a_ties += 1
+
+            if a_wins > a_losses:
+                after_w += 1
+            elif a_losses > a_wins:
+                after_l += 1
+            else:
+                after_t += 1
+
+    return H2HHypothetical(
+        before_w=before_w, before_l=before_l, before_t=before_t,
+        after_w=after_w, after_l=after_l, after_t=after_t,
     )
