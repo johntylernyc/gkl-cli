@@ -85,20 +85,56 @@ This is going to be a fairly complex feature, so think through it well. While de
 | 8 | Clarify H2H section labeling | ✅ Done |
 | 9 | Update this document with decisions | ✅ Done |
 
-### Phase 2: H2H Weekly Replay (in progress)
+### Phase 2: H2H Replay & Hypothetical (completed 2026-04-19)
 
-**Goal:** For each completed week, fetch weekly team stats, apply the trade retroactively, re-simulate that week's actual H2H matchup, and show how the season W/L/T record would have changed.
+**Status:** Implemented on `feature/trade-analyzer` branch.
+
+**Decisions:**
+
+6. **H2H Weekly Replay uses per-player weekly stats, not season stats.** The initial implementation incorrectly applied season-long player stats as the delta for each week's team stats. This produced wrong results for rate stats (e.g., subtracting a player's season ERA components from a single week's team ERA). Fix: fetch per-player weekly roster stats via `get_roster_stats(team_key, week)` for both teams for each completed week, find the traded players' actual weekly contributions, and use those as the delta. Trade-off: 2 additional API calls per week (2 teams × N weeks), but accuracy is critical.
+
+7. **H2H Hypothetical replays every week against every opponent.** Instead of one hypothetical using season-aggregate stats, the new approach replays each completed week against ALL opponents using actual weekly team stats with the trade applied. For a 4-week season with 18 teams, that's 68 hypothetical matchups (4 × 17). This captures weekly variance rather than averaging it away, and produces a more representative hypothetical record.
+
+8. **Roto standings table ordered by post-trade rank.** The table was initially ordered by before-trade rank, making it unclear what the new standings would be. Now ordered by after-trade total so the table reads as "here are the standings if this trade happened." Includes batting and pitching roto subtotal columns with deltas to show where the impact comes from.
+
+9. **Roto is zero-sum — other teams' points change even though their stats don't.** Roto points are relative rankings per category (1-18). When a traded team improves in a category, they pass other teams, causing those teams to lose a rank point in that category. This is correct and expected — the full league table makes this visible.
+
+### Tasks
+
+| # | Task | Status |
+|---|------|--------|
+| 10 | Implement `replay_h2h_with_trade()` | ✅ Done |
+| 11 | Implement `compute_h2h_hypothetical()` | ✅ Done |
+| 12 | Fix replay to use per-player weekly stats | ✅ Done |
+| 13 | Sort roto table by post-trade rank | ✅ Done |
+| 14 | Add batting/pitching roto subtotal columns | ✅ Done |
+| 15 | Move weekly replay above trade partner impact | ✅ Done |
+| 16 | Relabel H2H sections for clarity | ✅ Done |
+
+### Phase 3: Trade Discovery & Trading Block (in progress)
+
+**Goal:** Help users find trade targets and evaluate potential deals without needing to manually browse every roster.
+
+**Three modes:**
+
+1. **Trade Discovery** — User selects categories/positions to improve. System scans all rosters for players who would improve those areas and identifies which of the user's players could be reasonable trade currency.
+
+2. **Trading Block** — User selects a specific player they want to trade. System finds the best possible incoming players across all rosters, considering position needs, category improvements, and replacement-level availability.
+
+3. **Analyze Proposed Trade** — Already implemented in Phase 1. User picks players from two rosters and sees full impact analysis.
 
 **Approach:**
-- Use `shared_cache.week_team_stats` and `shared_cache.week_matchups` to get per-week data
-- For each week, apply `apply_trade_to_team()` to modify the two traded teams' weekly stats
-- Re-run `who_wins()` on each category for that week's actual matchup opponents
-- Show a week-by-week table: week #, opponent, actual result, projected result, change
-- Summarize with total season W-L-T before vs after
+- Fetch all team rosters (parallelized with `asyncio.gather`)
+- For discovery: score each opposing player by how much they'd improve the user's team in the target categories (using SGP or raw stat delta)
+- For each candidate target, identify reasonable trade currency from the user's roster (positions with depth, sell-high candidates)
+- Rank scenarios by net SGP improvement
+- Present as a ranked list; selecting a scenario populates the full Phase 1 analysis
 
-### Phase 3: Trade Discovery & Trading Block (not started)
-
-**Goal:** User selects categories/positions to improve; system finds suitable trade targets and partners across the league.
+**Key considerations from the spec:**
+- Roster depth: positions where the user has 2+ eligible players
+- Free agent backfill: suitable replacement-level players at positions the user would vacate
+- Sell-high candidates: players with strong current stats but weak underlying metrics or track record
+- Category control: targeting areas where improvement would flip matchup outcomes in most weeks
 
 ### Phase 4: AI Summary (not started)
 
