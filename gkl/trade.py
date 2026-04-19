@@ -14,7 +14,18 @@ from gkl.stats import (
     who_wins,
     TeamH2HSummary,
 )
+from gkl.stats import SGPCalculator
 from gkl.yahoo_api import PlayerStats, StatCategory, TeamStats
+
+
+@dataclass
+class TradeTarget:
+    """A candidate player to acquire in a trade."""
+    player: PlayerStats
+    team_key: str
+    team_name: str
+    sgp: float | None          # target player's SGP
+    net_sgp: float             # target SGP − outgoing SGP (positive = upgrade)
 
 
 @dataclass
@@ -780,3 +791,72 @@ def compute_h2h_hypothetical(
         before_w=before_w, before_l=before_l, before_t=before_t,
         after_w=after_w, after_l=after_l, after_t=after_t,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Trading Block — find trade targets
+# ---------------------------------------------------------------------------
+
+def find_trade_targets(
+    outgoing_player: PlayerStats,
+    my_team_key: str,
+    all_rosters: dict[str, list[PlayerStats]],
+    team_names: dict[str, str],
+    sgp_calc: SGPCalculator | None,
+    max_results: int = 25,
+) -> list[TradeTarget]:
+    """Find the best trade targets for a player you want to trade away.
+
+    Scans all opposing rosters for players who share at least one position
+    with the outgoing player, scores them by net SGP improvement, and
+    returns a ranked list.
+
+    Args:
+        outgoing_player: The player being traded away.
+        my_team_key: The user's team key (excluded from search).
+        all_rosters: {team_key: roster} for all teams in the league.
+        team_names: {team_key: team_name} mapping.
+        sgp_calc: SGP calculator (may be None; targets still ranked by SGP if available).
+        max_results: Maximum number of targets to return.
+    """
+    outgoing_positions = {pos.strip() for pos in outgoing_player.position.split(",")}
+    outgoing_sgp = sgp_calc.player_sgp(outgoing_player) if sgp_calc else None
+
+    targets: list[TradeTarget] = []
+
+    for team_key, roster in all_rosters.items():
+        if team_key == my_team_key:
+            continue
+
+        team_name = team_names.get(team_key, team_key)
+
+        for player in roster:
+            # Skip players on IL/NA
+            if player.selected_position in ("IL", "IL+", "NA"):
+                continue
+
+            # Check position overlap
+            player_positions = {pos.strip() for pos in player.position.split(",")}
+            if not (outgoing_positions & player_positions):
+                continue
+
+            player_sgp = sgp_calc.player_sgp(player) if sgp_calc else None
+
+            if outgoing_sgp is not None and player_sgp is not None:
+                net = player_sgp - outgoing_sgp
+            elif player_sgp is not None:
+                net = player_sgp
+            else:
+                net = 0.0
+
+            targets.append(TradeTarget(
+                player=player,
+                team_key=team_key,
+                team_name=team_name,
+                sgp=player_sgp,
+                net_sgp=net,
+            ))
+
+    # Sort by net SGP descending (best upgrades first)
+    targets.sort(key=lambda t: t.net_sgp, reverse=True)
+    return targets[:max_results]

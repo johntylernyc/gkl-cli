@@ -6581,6 +6581,66 @@ class LeagueSelectScreen(Screen):
 # --- Trade Analyzer Screen ---
 
 
+class TradeModeSelectorModal(Screen):
+    """Modal for selecting trade analyzer mode."""
+    BINDINGS = [("escape", "cancel", "Cancel")]
+    CSS = """
+    TradeModeSelectorModal {
+        align: center middle;
+    }
+    #trade-mode-container {
+        width: 45;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #trade-mode-title {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #trade-mode-list {
+        height: auto;
+        max-height: 70%;
+    }
+    #trade-mode-list > ListItem {
+        height: 2;
+        padding: 0 1;
+    }
+    #trade-mode-list > ListItem.--highlight {
+        background: #3A5A3A;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="trade-mode-container"):
+            yield Static("Trade Analyzer Mode", id="trade-mode-title")
+            yield ListView(id="trade-mode-list")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#trade-mode-list", ListView)
+        modes = [
+            ("analyze", "Analyze Trade\n  Select players from two rosters"),
+            ("block", "Trading Block\n  Find targets for a player you want to trade"),
+        ]
+        for mode_id, label in modes:
+            item = ListItem(Label(label))
+            item._mode = mode_id
+            lv.mount(item)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        mode = getattr(event.item, "_mode", None)
+        if mode:
+            self.dismiss(mode)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class TradeAnalyzerScreen(Screen):
     """Analyze the impact of a trade between two teams."""
     BINDINGS = [
@@ -6588,6 +6648,7 @@ class TradeAnalyzerScreen(Screen):
         ("q", "go_back", "Back"),
         ("b", "select_team_b", "Team B"),
         ("a", "analyze", "Analyze"),
+        ("m", "switch_mode", "Mode"),
     ]
     CSS = """
     #trade-header {
@@ -6667,6 +6728,7 @@ class TradeAnalyzerScreen(Screen):
         self.api = api
         self.league = league
         self.categories = categories
+        self._mode = "analyze"  # "analyze" or "block"
         self._team_a_key: str | None = None
         self._team_a_name: str = ""
         self._team_b_key: str | None = None
@@ -6675,6 +6737,9 @@ class TradeAnalyzerScreen(Screen):
         self._roster_b: list[PlayerStats] = []
         self._selected_a: set[str] = set()  # player_keys checked for trade
         self._selected_b: set[str] = set()
+        # Trading Block state
+        self._block_player: PlayerStats | None = None
+        self._trade_targets: list = []  # list[TradeTarget]
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -6706,16 +6771,31 @@ class TradeAnalyzerScreen(Screen):
 
     def _update_subheader(self) -> None:
         sub = Text()
-        if self._team_a_key and self._team_b_key:
-            sub.append(f" {self._team_a_name}", style=f"bold {TEAM_A_COLOR}")
-            sub.append("  ↔  ", style="dim")
-            sub.append(f"{self._team_b_name} ", style=f"bold {TEAM_B_COLOR}")
-            sub.append("  |  [a] Analyze  [b] Change Team B  [Enter] Toggle player", style="dim")
-        elif self._team_a_key:
-            sub.append(f" {self._team_a_name}", style=f"bold {TEAM_A_COLOR}")
-            sub.append("  |  Press [b] to select trade partner", style="dim")
+        mode_label = "Analyze Trade" if self._mode == "analyze" else "Trading Block"
+        sub.append(f" [{mode_label}] ", style="bold italic")
+
+        if self._mode == "block":
+            if self._block_player:
+                sub.append(f" Trading: ", style="dim")
+                sub.append(f"{self._block_player.name}", style=f"bold {TEAM_A_COLOR}")
+                sub.append(f" ({self._block_player.position})", style="dim")
+                sub.append("  |  [Enter] Select target  [m] Mode", style="dim")
+            elif self._team_a_key:
+                sub.append(f" {self._team_a_name}", style=f"bold {TEAM_A_COLOR}")
+                sub.append("  |  [Enter] Select player to trade  [m] Mode", style="dim")
+            else:
+                sub.append(" Select your team...", style="dim")
         else:
-            sub.append(" Select your team...", style="dim")
+            if self._team_a_key and self._team_b_key:
+                sub.append(f" {self._team_a_name}", style=f"bold {TEAM_A_COLOR}")
+                sub.append("  ↔  ", style="dim")
+                sub.append(f"{self._team_b_name} ", style=f"bold {TEAM_B_COLOR}")
+                sub.append("  |  [a] Analyze  [b] Team B  [m] Mode", style="dim")
+            elif self._team_a_key:
+                sub.append(f" {self._team_a_name}", style=f"bold {TEAM_A_COLOR}")
+                sub.append("  |  [b] Select trade partner  [m] Mode", style="dim")
+            else:
+                sub.append(" Select your team...", style="dim")
         self.query_one("#trade-subheader", Static).update(sub)
 
     def _on_team_a_selected(self, team_key: str | None) -> None:
@@ -6815,7 +6895,7 @@ class TradeAnalyzerScreen(Screen):
             )
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Toggle player selection when Enter is pressed on a roster row."""
+        """Handle Enter on a roster or target table row."""
         table = event.data_table
         table_id = getattr(table, "id", "")
         players = getattr(table, "_players", [])
@@ -6823,6 +6903,20 @@ class TradeAnalyzerScreen(Screen):
         if row_idx < 0 or row_idx >= len(players):
             return
 
+        if self._mode == "block":
+            if table_id == "roster-table-a":
+                # Select the player to trade
+                p = players[row_idx]
+                self._block_player = p
+                self._update_subheader()
+                self.run_worker(self._scan_trade_targets, group="trade-scan", exclusive=True)
+            elif table_id == "target-table":
+                # Select a target → run full analysis
+                target = self._trade_targets[row_idx]
+                self._run_block_analysis(target)
+            return
+
+        # Analyze mode: toggle selection
         p = players[row_idx]
         if table_id == "roster-table-a":
             if p.player_key in self._selected_a:
@@ -6837,6 +6931,145 @@ class TradeAnalyzerScreen(Screen):
 
         # Re-render left pane to update markers
         self.run_worker(self._render_left_pane, group="render-left", exclusive=True)
+
+    def action_switch_mode(self) -> None:
+        self.app.push_screen(
+            TradeModeSelectorModal(),
+            callback=self._on_mode_selected,
+        )
+
+    def _on_mode_selected(self, mode: str | None) -> None:
+        if mode is None or mode == self._mode:
+            return
+        self._mode = mode
+        self._block_player = None
+        self._trade_targets = []
+        self._selected_a.clear()
+        self._selected_b.clear()
+        self._team_b_key = None
+        self._team_b_name = ""
+        self._roster_b = []
+        self._update_subheader()
+        # Clear right pane
+        async def _clear():
+            scroll = self.query_one("#trade-right-scroll", VerticalScroll)
+            await scroll.remove_children()
+            await self._render_left_pane()
+        self.run_worker(_clear, group="render-left", exclusive=True)
+
+    async def _scan_trade_targets(self) -> None:
+        """Scan all rosters for trade targets matching the block player."""
+        from gkl.trade import find_trade_targets
+
+        self.query_one("#trade-loading").display = True
+        self.query_one("#trade-loading-status", Static).update("Scanning rosters for trade targets...")
+        self.query_one("#trade-right-scroll").display = False
+
+        try:
+            cache = self.app.shared_cache
+            await cache.ensure_loaded(self.api, self.league, self.categories)
+
+            # Fetch all rosters in parallel
+            import asyncio
+            teams = cache.all_teams
+            roster_tasks = [
+                asyncio.to_thread(
+                    self.api.get_roster_stats_season, t.team_key, self.league.current_week
+                )
+                for t in teams if t.team_key != self._team_a_key
+            ]
+            roster_results = await asyncio.gather(*roster_tasks)
+            all_rosters = {}
+            non_my_teams = [t for t in teams if t.team_key != self._team_a_key]
+            for t, roster in zip(non_my_teams, roster_results):
+                all_rosters[t.team_key] = roster
+            # Include my roster
+            all_rosters[self._team_a_key] = self._roster_a
+
+            self._trade_targets = find_trade_targets(
+                self._block_player,
+                self._team_a_key,
+                all_rosters,
+                cache.team_names,
+                cache.sgp_calc,
+            )
+
+            await self._render_target_list()
+        except Exception as e:
+            self.notify(f"Scan failed: {e}", severity="error")
+        finally:
+            self.query_one("#trade-loading").display = False
+            self.query_one("#trade-right-scroll").display = True
+
+    async def _render_target_list(self) -> None:
+        """Render the ranked trade target list in the right pane."""
+        scroll = self.query_one("#trade-right-scroll", VerticalScroll)
+        await scroll.remove_children()
+
+        if not self._trade_targets:
+            await scroll.mount(Static(
+                Text("  No position-eligible trade targets found.", style="dim"),
+            ))
+            return
+
+        out_sgp = None
+        if self._block_player:
+            cache = self.app.shared_cache
+            if cache.sgp_calc:
+                out_sgp = cache.sgp_calc.player_sgp(self._block_player)
+
+        header = Text()
+        header.append(f" Trading: ", style="dim")
+        header.append(f"{self._block_player.name}", style=f"bold {TEAM_A_COLOR}")
+        if out_sgp is not None:
+            header.append(f" (SGP: {out_sgp:+.1f})", style="dim")
+        header.append(f"\n Select a target to see full trade analysis.", style="dim italic")
+        await scroll.mount(Static(header, classes="trade-result-label"))
+
+        target_table = DataTable(classes="trade-impact-table", id="target-table")
+        await scroll.mount(target_table)
+        target_table.cursor_type = "row"
+        target_table.zebra_stripes = True
+        target_table._players = self._trade_targets
+        target_table.add_columns("Player", "Pos", "Team", "SGP", "Net SGP")
+
+        for t in self._trade_targets:
+            sgp_str = f"{t.sgp:+.1f}" if t.sgp is not None else "N/A"
+            net_str = f"{t.net_sgp:+.1f}"
+            if t.net_sgp > 0:
+                net_style = "bold green"
+            elif t.net_sgp < 0:
+                net_style = "bold red"
+            else:
+                net_style = "dim"
+
+            target_table.add_row(
+                Text(t.player.name[:20], style="bold"),
+                Text(t.player.position[:12], style="dim"),
+                Text(t.team_name[:15], style="dim"),
+                Text(sgp_str, justify="right"),
+                Text(net_str, style=net_style, justify="right"),
+            )
+
+    def _run_block_analysis(self, target) -> None:
+        """Run full trade analysis for a Trading Block target selection."""
+        from gkl.trade import TradeTarget
+        target: TradeTarget
+
+        # Set up as if it were an Analyze Trade
+        self._team_b_key = target.team_key
+        self._team_b_name = target.team_name
+        self._selected_a = {self._block_player.player_key}
+        self._selected_b = {target.player.player_key}
+
+        # Fetch team B roster and run analysis
+        async def _load_and_analyze():
+            self._roster_b = self.api.get_roster_stats_season(
+                target.team_key, self.league.current_week
+            )
+            await self._run_analysis()
+
+        self.run_worker(_load_and_analyze, group="trade-analysis", exclusive=True)
 
     def action_analyze(self) -> None:
         if not self._selected_a or not self._selected_b:

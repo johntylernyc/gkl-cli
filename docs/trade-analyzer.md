@@ -111,30 +111,32 @@ This is going to be a fairly complex feature, so think through it well. While de
 | 15 | Move weekly replay above trade partner impact | ✅ Done |
 | 16 | Relabel H2H sections for clarity | ✅ Done |
 
-### Phase 3: Trade Discovery & Trading Block (in progress)
+### Phase 3: Trading Block (in progress)
 
-**Goal:** Help users find trade targets and evaluate potential deals without needing to manually browse every roster.
+**Goal:** User selects a specific player they want to trade. System finds the best possible incoming players across all rosters and ranks them by net improvement.
 
-**Three modes:**
+**Scope:** Trading Block only. Trade Discovery (category/position-based search) deferred to a future phase.
 
-1. **Trade Discovery** — User selects categories/positions to improve. System scans all rosters for players who would improve those areas and identifies which of the user's players could be reasonable trade currency.
+**User flow:**
+1. From the Trade Analyzer screen, press `m` to switch mode → select "Trading Block"
+2. Select your team (if not already selected)
+3. Your roster appears in the left pane — highlight a player and press Enter to mark them as the trade piece
+4. System fetches all opposing rosters, finds position-eligible players on each team
+5. Scores each candidate by net SGP improvement (incoming SGP − outgoing SGP)
+6. Right pane shows a ranked list of trade targets with: player name, team, position, SGP, net SGP delta
+7. Selecting a target from the list runs the full Phase 1 analysis (category impact, roto, H2H replay)
 
-2. **Trading Block** — User selects a specific player they want to trade. System finds the best possible incoming players across all rosters, considering position needs, category improvements, and replacement-level availability.
+**Scoring approach:**
+- Use `SGPCalculator.player_sgp()` for both the outgoing and incoming player
+- Net SGP = incoming SGP − outgoing SGP (positive = upgrade)
+- Filter to position-eligible players only (must share at least one position with the outgoing player)
+- Show SGP values for context alongside the ranking
 
-3. **Analyze Proposed Trade** — Already implemented in Phase 1. User picks players from two rosters and sees full impact analysis.
-
-**Approach:**
-- Fetch all team rosters (parallelized with `asyncio.gather`)
-- For discovery: score each opposing player by how much they'd improve the user's team in the target categories (using SGP or raw stat delta)
-- For each candidate target, identify reasonable trade currency from the user's roster (positions with depth, sell-high candidates)
-- Rank scenarios by net SGP improvement
-- Present as a ranked list; selecting a scenario populates the full Phase 1 analysis
-
-**Key considerations from the spec:**
-- Roster depth: positions where the user has 2+ eligible players
-- Free agent backfill: suitable replacement-level players at positions the user would vacate
-- Sell-high candidates: players with strong current stats but weak underlying metrics or track record
-- Category control: targeting areas where improvement would flip matchup outcomes in most weeks
+**Implementation:**
+- Add `find_trade_targets()` to `gkl/trade.py` — scans all rosters, returns ranked list
+- Add mode switching to `TradeAnalyzerScreen` via `TradeModeSelectorModal`
+- Trading Block mode reuses the left pane for roster display + single player selection
+- Right pane switches between target list (before selection) and full analysis (after selection)
 
 ### Phase 4: AI Summary (not started)
 
