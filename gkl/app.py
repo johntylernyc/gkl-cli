@@ -6699,7 +6699,7 @@ class TradeAnalyzerScreen(Screen):
         background: $panel;
     }
     .trade-result-label {
-        height: 1;
+        height: auto;
         padding: 0 1;
     }
     .trade-impact-table {
