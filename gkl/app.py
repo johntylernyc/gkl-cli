@@ -3471,6 +3471,16 @@ class ComparisonScreen(Screen):
 
         # H2H replay + hypothetical
         weeks = list(range(1, self.league.current_week + 1))
+
+        # Ensure weekly matchups are cached
+        for w in weeks:
+            if w not in cache.week_matchups:
+                try:
+                    cache.week_matchups[w] = await asyncio.to_thread(
+                        self.api.get_scoreboard, self.league.league_key, w)
+                except Exception:
+                    pass
+
         weekly_roster_target: dict[int, list[PlayerStats]] = {}
         for w in weeks:
             try:
@@ -3481,6 +3491,7 @@ class ComparisonScreen(Screen):
 
         h2h_replay = None
         h2h_hypo = None
+        h2h_error = None
         try:
             h2h_replay = await asyncio.to_thread(
                 replay_h2h_with_trade,
@@ -3500,8 +3511,8 @@ class ComparisonScreen(Screen):
                 {w: [self._wl_player] for w in weekly_roster_target.keys()},
                 self.categories, self.league.current_week,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            h2h_error = str(e)
 
         # --- Render ---
         scroll = self.query_one("#cmp-scroll", VerticalScroll)
@@ -3606,18 +3617,18 @@ class ComparisonScreen(Screen):
             )
 
         # H2H weekly replay
+        await scroll.mount(Static(""))
+        await scroll.mount(Static(
+            Text(" H2H WEEKLY REPLAY ", style="bold"),
+            classes="cmp-section",
+        ))
+        replay_desc = Text()
+        replay_desc.append(
+            "  Replays each completed week's actual matchup with the swap applied.",
+            style="dim italic",
+        )
+        await scroll.mount(Static(replay_desc))
         if h2h_replay and h2h_replay.weeks:
-            await scroll.mount(Static(""))
-            await scroll.mount(Static(
-                Text(" H2H WEEKLY REPLAY ", style="bold"),
-                classes="cmp-section",
-            ))
-            replay_desc = Text()
-            replay_desc.append(
-                "  Replays each completed week's actual matchup with the swap applied.",
-                style="dim italic",
-            )
-            await scroll.mount(Static(replay_desc))
             replay_table = DataTable(classes="cmp-table")
             await scroll.mount(replay_table)
             replay_table.cursor_type = "none"
@@ -3660,14 +3671,24 @@ class ComparisonScreen(Screen):
             elif sw_delta < 0:
                 rec_summary.append(f"  {sw_delta}W", style="bold red")
             await scroll.mount(Static(rec_summary))
+        else:
+            msg = Text()
+            if h2h_error:
+                msg.append(f"  Could not compute replay: {h2h_error}", style="dim italic")
+            else:
+                msg.append(
+                    "  No completed weeks with played games yet — check back after Week 1 has finished.",
+                    style="dim italic",
+                )
+            await scroll.mount(Static(msg))
 
         # H2H hypothetical
-        if h2h_hypo:
-            await scroll.mount(Static(""))
-            await scroll.mount(Static(
-                Text(" H2H HYPOTHETICAL (ALL OPPONENTS, ALL WEEKS) ", style="bold"),
-                classes="cmp-section",
-            ))
+        await scroll.mount(Static(""))
+        await scroll.mount(Static(
+            Text(" H2H HYPOTHETICAL (ALL OPPONENTS, ALL WEEKS) ", style="bold"),
+            classes="cmp-section",
+        ))
+        if h2h_hypo and (h2h_hypo.before_w + h2h_hypo.before_l + h2h_hypo.before_t) > 0:
             n_matchups = h2h_hypo.before_w + h2h_hypo.before_l + h2h_hypo.before_t
             hypo_desc = Text()
             hypo_desc.append(
@@ -3690,6 +3711,13 @@ class ComparisonScreen(Screen):
             elif hw_delta < 0:
                 hypo_line.append(f"  {hw_delta}W", style="bold red")
             await scroll.mount(Static(hypo_line))
+        else:
+            msg = Text()
+            msg.append(
+                "  No completed weeks with played games yet — check back after Week 1 has finished.",
+                style="dim italic",
+            )
+            await scroll.mount(Static(msg))
 
         # AI summary
         api_key = load_anthropic_key()
