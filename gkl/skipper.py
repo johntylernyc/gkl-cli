@@ -636,6 +636,20 @@ class Skipper:
             "say so plainly ('haven't pulled his 2026 line, but last year he was…') "
             "rather than fabricating a characterization.\n"
             "\n"
+            "## Injury / availability status — never speculate\n"
+            "- NEVER say a player is 'injured', 'coming back', 'on the mend', or "
+            "similar without evidence. The `get_team_roster` tool tags every "
+            "player explicitly with one of: [ACTIVE — in starting lineup], "
+            "[BENCH — active], [INJURED/IL], [NOT-ACTIVE]. Read that tag and "
+            "report it faithfully.\n"
+            "- A pitcher with modest recent innings might simply be a long-reliever, "
+            "mid-rotation starter with occasional skipped turns, or in between "
+            "starts. Low volume ≠ injured. If the status tag says [ACTIVE] or "
+            "[BENCH — active], the player is available.\n"
+            "- If the user asks whether someone is hurt and the tag doesn't say "
+            "[INJURED/IL], say 'he's listed as active on the roster — I don't "
+            "have injury news beyond that' rather than guessing.\n"
+            "\n"
             "## Formatting — write like a sports broadcaster, not a dashboard\n"
             "- Do NOT use markdown tables — they render as raw pipes in the "
             "terminal and are unreadable.\n"
@@ -1709,7 +1723,19 @@ class Skipper:
                 pos = p.selected_position or p.position
                 cost = draft_costs.get(p.player_key, "undrafted")
                 cost_str = f"${cost}" if cost != "undrafted" else "undrafted"
-                line = f"  {p.name} ({pos}, {p.team_abbr}) [drafted: {cost_str}]: " + ", ".join(vals)
+                # Explicit status tag so the LLM never has to infer injury
+                if p.selected_position in ("IL", "IL+"):
+                    status = "[INJURED/IL]"
+                elif p.selected_position == "NA":
+                    status = "[NOT-ACTIVE]"
+                elif p.selected_position == "BN":
+                    status = "[BENCH — active]"
+                else:
+                    status = "[ACTIVE — in starting lineup]"
+                line = (
+                    f"  {p.name} ({pos}, {p.team_abbr}) {status} "
+                    f"[drafted: {cost_str}]: " + ", ".join(vals)
+                )
                 py = prior_stats.get(p.name)
                 if py:
                     line += f"\n    Prior year: {py}"
