@@ -479,6 +479,30 @@ AVAILABLE_MODELS = [
 DEFAULT_MODEL = "claude-sonnet-4-6"
 
 
+def _availability_tag(player: PlayerStats, *, is_free_agent: bool = False) -> str:
+    """Return a consistent availability tag for a player.
+
+    The tag tells the LLM explicitly whether a player is healthy, benched, or
+    unavailable so it never has to infer injury status from stat volume.
+
+    For pitchers showing [BENCH] the tag flags that starting pitchers commonly
+    rotate through the bench on rest days — a bench SP is typically not a drop
+    candidate or an injury concern.
+    """
+    if is_free_agent:
+        return "[FREE AGENT]"
+    pos = player.selected_position
+    if pos in ("IL", "IL+"):
+        return "[INJURED/IL]"
+    if pos == "NA":
+        return "[NOT-ACTIVE]"
+    if pos == "BN":
+        if player.position in ("SP", "P"):
+            return "[BENCH — healthy; SPs rotate through bench on rest days]"
+        return "[BENCH — active]"
+    return "[ACTIVE — in starting lineup]"
+
+
 class Skipper:
     """Chat assistant that uses Claude + Yahoo Fantasy API tools."""
 
@@ -638,14 +662,23 @@ class Skipper:
             "\n"
             "## Injury / availability status — never speculate\n"
             "- NEVER say a player is 'injured', 'coming back', 'on the mend', or "
-            "similar without evidence. The `get_team_roster` tool tags every "
-            "player explicitly with one of: [ACTIVE — in starting lineup], "
-            "[BENCH — active], [INJURED/IL], [NOT-ACTIVE]. Read that tag and "
-            "report it faithfully.\n"
+            "similar without evidence. Every tool that lists players tags each "
+            "one explicitly with one of: [ACTIVE — in starting lineup], "
+            "[BENCH — active], [BENCH — healthy; SPs rotate through bench on "
+            "rest days], [INJURED/IL], [NOT-ACTIVE], or [FREE AGENT]. This "
+            "applies to `get_team_roster`, `get_free_agents`, `find_trade_targets`, "
+            "`analyze_trade`, `discover_trade_scenarios`, and `compare_add_drop`. "
+            "Read the tag and report it faithfully.\n"
             "- A pitcher with modest recent innings might simply be a long-reliever, "
             "mid-rotation starter with occasional skipped turns, or in between "
             "starts. Low volume ≠ injured. If the status tag says [ACTIVE] or "
             "[BENCH — active], the player is available.\n"
+            "- Starting pitchers commonly appear on the bench. This is expected: "
+            "managers rotate SPs through the bench on their rest days between "
+            "starts (a healthy SP pitches roughly every 5th day and sits the "
+            "other 4). A bench SP is NOT an injury signal and NOT a drop "
+            "candidate just because of low weekly volume. Treat [BENCH] SPs as "
+            "healthy rotation pieces unless you have explicit injury evidence.\n"
             "- If the user asks whether someone is hurt and the tag doesn't say "
             "[INJURED/IL], say 'he's listed as active on the roster — I don't "
             "have injury news beyond that' rather than guessing.\n"
@@ -1723,15 +1756,7 @@ class Skipper:
                 pos = p.selected_position or p.position
                 cost = draft_costs.get(p.player_key, "undrafted")
                 cost_str = f"${cost}" if cost != "undrafted" else "undrafted"
-                # Explicit status tag so the LLM never has to infer injury
-                if p.selected_position in ("IL", "IL+"):
-                    status = "[INJURED/IL]"
-                elif p.selected_position == "NA":
-                    status = "[NOT-ACTIVE]"
-                elif p.selected_position == "BN":
-                    status = "[BENCH — active]"
-                else:
-                    status = "[ACTIVE — in starting lineup]"
+                status = _availability_tag(p)
                 line = (
                     f"  {p.name} ({pos}, {p.team_abbr}) {status} "
                     f"[drafted: {cost_str}]: " + ", ".join(vals)
@@ -2002,8 +2027,9 @@ class Skipper:
             sgp = f"{t.sgp:+.1f}" if t.sgp is not None else "N/A"
             win_pct = (f"{t.h2h_win_pct_delta:+.1%}"
                        if abs(t.h2h_win_pct_delta) > 0.001 else "—")
+            tag = _availability_tag(t.player)
             lines.append(
-                f"  {t.player.name} ({t.player.position}, {t.team_name}) — "
+                f"  {t.player.name} ({t.player.position}, {t.team_name}) {tag} — "
                 f"SGP {sgp}, ΔSGP {t.net_sgp:+.1f}, ΔRoto {t.roto_delta:+.1f}, "
                 f"ΔWin% {win_pct}, Partner {t.partner_roto_delta:+.1f}"
             )
@@ -2074,8 +2100,11 @@ class Skipper:
         except Exception:
             pass
 
-        a_names = ", ".join(p.name for p in a_players)
-        b_names = ", ".join(p.name for p in b_players)
+        def _fmt_trade_side(players: list[PlayerStats]) -> str:
+            return ", ".join(f"{p.name} {_availability_tag(p)}" for p in players)
+
+        a_names = _fmt_trade_side(a_players)
+        b_names = _fmt_trade_side(b_players)
         lines = [
             f"Trade Analysis — {team_a_name_resolved} sends: {a_names}",
             f"                 {team_b_name_resolved} sends: {b_names}",
@@ -2188,10 +2217,12 @@ class Skipper:
         for s in scenarios:
             target_sgp = f"{s.target_sgp:+.1f}" if s.target_sgp is not None else "N/A"
             offer_sgp = f"{s.offer_sgp:+.1f}" if s.offer_sgp is not None else "N/A"
+            target_tag = _availability_tag(s.target)
+            offer_tag = _availability_tag(s.offer)
             lines.append(
-                f"  You get {s.target.name} ({s.target.position}) from "
-                f"{s.target_team_name}  ↔  You send {s.offer.name} "
-                f"({s.offer.position})"
+                f"  You get {s.target.name} ({s.target.position}) {target_tag} "
+                f"from {s.target_team_name}  ↔  You send {s.offer.name} "
+                f"({s.offer.position}) {offer_tag}"
             )
             lines.append(
                 f"    Target SGP {target_sgp}, Offer SGP {offer_sgp}, "
@@ -2281,9 +2312,11 @@ class Skipper:
             )
             return base + ("\n" + rostered_note if rostered_note else "")
 
+        add_is_fa = owner_team_key is None
+        add_tag = _availability_tag(add_player, is_free_agent=add_is_fa)
         lines = [
             f"Add/Drop Analysis — considering adding {add_player.name} "
-            f"({add_player.position}, {add_player.team_abbr}) to {team_name}:",
+            f"({add_player.position}, {add_player.team_abbr}) {add_tag} to {team_name}:",
         ]
         if rostered_note:
             lines.append(rostered_note)
@@ -2297,8 +2330,9 @@ class Skipper:
             drop_sgp = f"{s.drop_sgp:+.1f}" if s.drop_sgp is not None else "N/A"
             win_pct = (f"{s.h2h_win_pct_delta:+.1%}"
                        if abs(s.h2h_win_pct_delta) > 0.001 else "—")
+            drop_tag = _availability_tag(drop)
             lines.append(
-                f"  Drop {drop.name} ({drop.position}, {drop.team_abbr}) — "
+                f"  Drop {drop.name} ({drop.position}, {drop.team_abbr}) {drop_tag} — "
                 f"SGP {drop_sgp}, ΔSGP {s.net_sgp:+.1f}, "
                 f"ΔRoto {s.roto_delta:+.1f}, ΔWin% {win_pct}"
             )
@@ -2469,7 +2503,8 @@ class Skipper:
             is_pitcher = p.position in ("SP", "RP", "P")
             cats = pit_cats if is_pitcher else bat_cats
             vals = [f"{c.display_name}={p.stats.get(c.stat_id, '-')}" for c in cats]
-            line = f"  {p.name} ({p.position}, {p.team_abbr}): " + ", ".join(vals)
+            tag = _availability_tag(p, is_free_agent=True)
+            line = f"  {p.name} ({p.position}, {p.team_abbr}) {tag}: " + ", ".join(vals)
             py = prior_stats.get(p.name)
             if py:
                 line += f"\n    Prior year: {py}"
