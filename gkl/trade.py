@@ -191,6 +191,65 @@ def _is_pitcher(p: PlayerStats) -> bool:
     return bool(positions & {"SP", "RP", "P"})
 
 
+def project_player_per_week(
+    player: PlayerStats, weeks_played: int,
+) -> PlayerStats:
+    """Create a new PlayerStats with counting stats divided by weeks played.
+
+    Rate stats and component stats (H/AB, IP) are preserved since they
+    represent averages, not totals. Used to convert season-total stats
+    into a per-week approximation for weekly H2H replay of add/drop
+    scenarios where per-player weekly data isn't available.
+    """
+    if weeks_played <= 0:
+        return player
+
+    new_stats = dict(player.stats)
+    for stat_id, val in player.stats.items():
+        # Skip rate stats — they're averages, not totals
+        if stat_id in RATE_STATS:
+            continue
+        # Skip H/AB composite (stat 60) and IP (stat 50) — used for rate decomposition
+        if stat_id in ("60", "50"):
+            # Divide both components of H/AB proportionally
+            if stat_id == "60" and "/" in val:
+                try:
+                    h_str, ab_str = val.split("/")
+                    h = int(h_str) / weeks_played
+                    ab = int(ab_str) / weeks_played
+                    new_stats[stat_id] = f"{int(h)}/{int(ab)}"
+                except (ValueError, TypeError):
+                    pass
+            elif stat_id == "50":
+                # IP: divide by weeks, preserve fractional innings notation
+                try:
+                    ip_f = _parse_ip(val)
+                    new_stats[stat_id] = f"{ip_f / weeks_played:.1f}"
+                except Exception:
+                    pass
+            continue
+        # Counting stat — divide by weeks played
+        try:
+            f_val = float(val)
+            projected = f_val / weeks_played
+            if projected == int(projected):
+                new_stats[stat_id] = str(int(projected))
+            else:
+                new_stats[stat_id] = f"{projected:.1f}"
+        except (ValueError, TypeError):
+            pass
+
+    return PlayerStats(
+        player_key=player.player_key,
+        name=player.name,
+        position=player.position,
+        team_abbr=player.team_abbr,
+        stats=new_stats,
+        draft_cost=player.draft_cost,
+        selected_position=player.selected_position,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Core: apply a trade to a team's stats
 # ---------------------------------------------------------------------------
@@ -582,6 +641,9 @@ def replay_h2h_with_trade(
     actual_w = actual_l = actual_t = 0
     trade_w = trade_l = trade_t = 0
 
+    from datetime import date as _date
+    is_monday = _date.today().weekday() == 0
+
     for week in range(1, current_week + 1):
         matchups = week_matchups.get(week, [])
         roster_a_week = weekly_roster_a.get(week, [])
@@ -590,11 +652,20 @@ def replay_h2h_with_trade(
         if not matchups:
             continue
 
+        # On Mondays, exclude the current in-progress week — new matchups
+        # have just started with minimal stats accumulated. Completed prior
+        # weeks are still included.
+        if week == current_week and is_monday:
+            continue
+
         # Find team A's matchup this week
         my_matchup: Matchup | None = None
         am_team_a_side = True
         for m in matchups:
             if m.status == "preevent":
+                continue
+            # Skip weeks where no games have been played yet (both teams at 0 points).
+            if m.status != "postevent" and m.team_a.points == 0 and m.team_b.points == 0:
                 continue
             if m.team_a.team_key == team_a_key:
                 my_matchup = m
@@ -732,6 +803,14 @@ def compute_h2h_hypothetical(
         if not matchups:
             continue
 
+        # On Mondays, exclude the current in-progress week entirely —
+        # the new week has started but stats have barely accumulated,
+        # which would dramatically over-project win counts. Completed
+        # prior weeks still count.
+        from datetime import date as _date
+        if week == current_week and _date.today().weekday() == 0:
+            continue
+
         # Extract all teams' weekly stats from matchups
         all_weekly_teams: dict[str, TeamStats] = {}
         for m in matchups:
@@ -742,6 +821,19 @@ def compute_h2h_hypothetical(
 
         my_team = all_weekly_teams.get(team_a_key)
         if my_team is None:
+            continue
+
+        # Skip weeks where my team's actual matchup hasn't been played yet
+        # (same criterion as the weekly replay — ensures both views stay in sync).
+        my_matchup_started = False
+        for m in matchups:
+            if m.team_a.team_key == team_a_key or m.team_b.team_key == team_a_key:
+                if m.status == "postevent":
+                    my_matchup_started = True
+                elif m.team_a.points > 0 or m.team_b.points > 0:
+                    my_matchup_started = True
+                break
+        if not my_matchup_started:
             continue
 
         # Compute trade-adjusted team stats for this week
@@ -1050,10 +1142,131 @@ async def get_trade_ai_summary(
     client = anthropic.AsyncAnthropic(api_key=api_key)
     response = await client.messages.create(
         model=model,
-        max_tokens=512,
+        max_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
     )
     return response.content[0].text
+
+
+def _format_statcast_for_prompt(sc, is_batter: bool) -> str:
+    """Format statcast data into a short string for the AI prompt."""
+    if sc is None:
+        return "no Statcast data"
+    parts = []
+    if is_batter:
+        if sc.avg_exit_velo is not None:
+            parts.append(f"EV {sc.avg_exit_velo:.1f}")
+        if sc.max_exit_velo is not None:
+            parts.append(f"MaxEV {sc.max_exit_velo:.1f}")
+        if sc.barrel_pct is not None:
+            parts.append(f"Barrel% {sc.barrel_pct:.1f}")
+        if sc.hard_hit_pct is not None:
+            parts.append(f"HardHit% {sc.hard_hit_pct:.1f}")
+        if sc.xba is not None:
+            parts.append(f"xBA {sc.xba:.3f}")
+        if sc.xslg is not None:
+            parts.append(f"xSLG {sc.xslg:.3f}")
+        if sc.xwoba is not None:
+            parts.append(f"xwOBA {sc.xwoba:.3f}")
+        if sc.k_pct is not None:
+            parts.append(f"K% {sc.k_pct:.1f}")
+        if sc.bb_pct is not None:
+            parts.append(f"BB% {sc.bb_pct:.1f}")
+    else:
+        if sc.avg_exit_velo is not None:
+            parts.append(f"EV Alw {sc.avg_exit_velo:.1f}")
+        if sc.barrel_pct is not None:
+            parts.append(f"Barrel% {sc.barrel_pct:.1f}")
+        if sc.hard_hit_pct is not None:
+            parts.append(f"HardHit% {sc.hard_hit_pct:.1f}")
+        if sc.xba is not None:
+            parts.append(f"xBA {sc.xba:.3f}")
+        if sc.xslg is not None:
+            parts.append(f"xSLG {sc.xslg:.3f}")
+        if sc.xwoba is not None:
+            parts.append(f"xwOBA {sc.xwoba:.3f}")
+        if sc.xera is not None:
+            parts.append(f"xERA {sc.xera:.2f}")
+        if sc.k_pct is not None:
+            parts.append(f"K% {sc.k_pct:.1f}")
+        if sc.bb_pct is not None:
+            parts.append(f"BB% {sc.bb_pct:.1f}")
+    return ", ".join(parts) if parts else "no Statcast data"
+
+
+def build_compare_summary_prompt(
+    team_name: str,
+    add_player: PlayerStats,
+    drop_player: PlayerStats,
+    cat_impacts: list,  # list of {cat, before, after, delta, favorable}
+    roto_rank_before: int,
+    roto_rank_after: int,
+    roto_points_before: float,
+    roto_points_after: float,
+    h2h_replay: H2HReplay | None = None,
+    add_statcast=None,     # StatcastBatter or StatcastPitcher
+    drop_statcast=None,
+    is_batter: bool = True,
+) -> str:
+    """Build a prompt for Claude to analyze an add/drop for a single team.
+
+    Unlike the trade prompt, this frames the analysis as "what if this
+    player were on your roster instead of X?" — no trade partner, no
+    counter-offer, no pitch. Purely the impact on your own team.
+    """
+    lines = [
+        "You are a fantasy baseball analyst. Analyze this hypothetical add/drop for a single team.",
+        "Do not frame this as a trade — treat it as 'what if this player were on your roster instead'.",
+        "",
+        f"Team: **{team_name}**",
+        f"Add: {add_player.name} ({add_player.position}, {add_player.team_abbr})",
+        f"Drop: {drop_player.name} ({drop_player.position}, {drop_player.team_abbr})",
+        "",
+        "Statcast (season, quality-of-contact metrics):",
+        f"  {add_player.name}: {_format_statcast_for_prompt(add_statcast, is_batter)}",
+        f"  {drop_player.name}: {_format_statcast_for_prompt(drop_statcast, is_batter)}",
+        "",
+        "Category impact:",
+    ]
+    for ci in cat_impacts:
+        if ci["delta"] != 0:
+            direction = "+" if ci["favorable"] else "-"
+            lines.append(f"  {ci['cat'].display_name}: {ci['before']} → {ci['after']} ({direction})")
+
+    lines.append("")
+    lines.append(f"Roto standings: #{roto_rank_before} → #{roto_rank_after} "
+                 f"({roto_points_before:.1f} → {roto_points_after:.1f} pts)")
+
+    if h2h_replay and h2h_replay.weeks:
+        lines.append(f"H2H record (completed weeks, with swap applied): "
+                     f"{h2h_replay.actual_season_w}-{h2h_replay.actual_season_l}-{h2h_replay.actual_season_t}"
+                     f" → {h2h_replay.trade_season_w}-{h2h_replay.trade_season_l}-{h2h_replay.trade_season_t}")
+        flips = [w for w in h2h_replay.weeks if w.changed]
+        if flips:
+            lines.append(f"Matchup flips: {len(flips)} weeks would have changed outcome")
+
+    lines.append("")
+    lines.append("Provide your analysis in this order (under 300 words total):")
+    lines.append(
+        "1. Opening narrative paragraph (3-5 sentences, no heading): Broader context on both "
+        "players — their historical production profile, age/career stage, and what the "
+        "Statcast data suggests about their current form. Specifically comment on whether "
+        "each player's season-to-date stats look sustainable based on their quality-of-contact "
+        "metrics (xBA/xSLG/xwOBA vs actual, Barrel%, HardHit%, K%/BB%) — are they likely "
+        "to continue producing at current levels, regress, or improve?"
+    )
+    lines.append("2. **Verdict**: One sentence — would this add/drop help the team?")
+    lines.append("3. **Pros** (2-3 bullets, referencing specific stat changes and standings impact)")
+    lines.append("4. **Cons** (2-3 bullets)")
+    lines.append("5. **Takeaway**: 1-2 sentences on whether to pursue this move")
+    lines.append("")
+    lines.append(
+        "Do NOT include a title like 'Trade Analysis' at the start. Do NOT label the opening "
+        "paragraph with a '**Narrative**' heading — start it plainly. Do NOT discuss selling "
+        "the deal to anyone or counter-offers — this is a one-sided analysis of your own roster."
+    )
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1286,3 +1499,178 @@ def discover_trades(
     # Sort by roto delta
     scenarios.sort(key=lambda s: s.roto_delta, reverse=True)
     return scenarios[:max_results]
+
+
+# ---------------------------------------------------------------------------
+# Compare Screen scenarios — "what if I added this player and dropped X?"
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CompareScenario:
+    """A single add/drop scenario on a target roster.
+
+    Unlike TradeTarget (which represents a trade with another team),
+    CompareScenario represents adding one player to a team and dropping
+    one of its existing players. Used by the Compare tool.
+    """
+    drop_player: PlayerStats   # the roster player being dropped
+    drop_sgp: float | None     # dropped player's SGP
+    add_sgp: float | None      # added player's SGP (same for every scenario)
+    net_sgp: float             # add - drop (positive = upgrade)
+    roto_delta: float = 0.0    # change in team roto points
+    h2h_win_pct_before: float = 0.0
+    h2h_win_pct_after: float = 0.0
+    h2h_win_pct_delta: float = 0.0
+
+
+def compute_compare_scenarios(
+    added_player: PlayerStats,
+    target_team_key: str,
+    target_roster: list[PlayerStats],
+    all_teams: list[TeamStats],
+    categories: list[StatCategory],
+    sgp_calc: SGPCalculator | None,
+    week_matchups: dict[int, list] | None = None,
+    weekly_roster_target: dict[int, list[PlayerStats]] | None = None,
+    current_week: int = 1,
+) -> list[CompareScenario]:
+    """Compute drop-candidate scenarios for adding a player to a team.
+
+    For each position-eligible player on the target team's roster, simulates
+    replacing them with `added_player` and reports ΔSGP, ΔRoto, and ΔWin%.
+
+    Args:
+        added_player: The player being added to the target team.
+        target_team_key: The team receiving the player.
+        target_roster: Current season roster for the target team.
+        all_teams: League-wide season team stats.
+        categories: Scoring categories.
+        sgp_calc: SGP calculator (optional).
+        week_matchups: Per-week matchup data (for actual H2H replay).
+        weekly_roster_target: Per-week rosters for the target team.
+        current_week: Current week of the season.
+    """
+    scored = [c for c in categories if not c.is_only_display]
+    target_team = next((t for t in all_teams if t.team_key == target_team_key), None)
+    if target_team is None:
+        return []
+
+    added_positions = {pos.strip() for pos in added_player.position.split(",")}
+    add_sgp = sgp_calc.player_sgp(added_player) if sgp_calc else None
+
+    # Baseline roto
+    baseline_roto = compute_roto(all_teams, scored)
+    baseline_pts = 0.0
+    for r in baseline_roto:
+        if r["team_key"] == target_team_key:
+            baseline_pts = r["total"]
+            break
+
+    # Baseline H2H win % (per-week replay if data available)
+    has_weekly = bool(week_matchups and weekly_roster_target)
+    baseline_win_pct = 0.0
+    if has_weekly:
+        baseline_replay = replay_h2h_with_trade(
+            target_team_key, target_team_key,
+            set(), set(),
+            week_matchups, weekly_roster_target, {},
+            categories, current_week,
+        )
+        total = (baseline_replay.actual_season_w +
+                 baseline_replay.actual_season_l +
+                 baseline_replay.actual_season_t)
+        baseline_win_pct = baseline_replay.actual_season_w / total if total else 0.0
+    else:
+        baseline_h2h = simulate_h2h(all_teams, scored)
+        baseline_pr = compute_power_rankings(baseline_h2h, all_teams)
+        for s in baseline_pr:
+            if s.team_key == target_team_key:
+                baseline_win_pct = s.win_pct
+                break
+
+    # Per-week projection of the added player (for the weekly H2H replay
+    # in the summary table — avoids adding season totals to each week).
+    weeks_played = max(current_week - 1, 1)
+    weekly_added_player = project_player_per_week(added_player, weeks_played)
+
+    scenarios: list[CompareScenario] = []
+    for drop_candidate in target_roster:
+        if drop_candidate.selected_position in ("IL", "IL+", "NA"):
+            continue
+        # Position eligibility: shared position with the added player
+        drop_positions = {pos.strip() for pos in drop_candidate.position.split(",")}
+        if not (added_positions & drop_positions):
+            continue
+        # Don't compare the player against themselves
+        if drop_candidate.player_key == added_player.player_key:
+            continue
+
+        drop_sgp = sgp_calc.player_sgp(drop_candidate) if sgp_calc else None
+        if add_sgp is not None and drop_sgp is not None:
+            net = add_sgp - drop_sgp
+        elif add_sgp is not None:
+            net = add_sgp
+        elif drop_sgp is not None:
+            net = -drop_sgp
+        else:
+            net = 0.0
+
+        # Apply the add/drop to the target team
+        trade_team = apply_trade_to_team(
+            target_team, target_roster,
+            players_out=[drop_candidate],
+            players_in=[added_player],
+            categories=categories,
+        )
+        teams_after = [
+            trade_team if t.team_key == target_team_key else t
+            for t in all_teams
+        ]
+
+        # Roto delta
+        roto_after = compute_roto(teams_after, scored)
+        roto_delta = 0.0
+        for r in roto_after:
+            if r["team_key"] == target_team_key:
+                roto_delta = r["total"] - baseline_pts
+                break
+
+        # H2H win % delta
+        scenario = CompareScenario(
+            drop_player=drop_candidate,
+            drop_sgp=drop_sgp,
+            add_sgp=add_sgp,
+            net_sgp=net,
+            roto_delta=roto_delta,
+            h2h_win_pct_before=baseline_win_pct,
+        )
+        if has_weekly:
+            # Weekly replay: swap this specific drop player for the added player.
+            # Use per-week projected stats for the added player so we don't add
+            # a full season's worth of counting stats to each weekly total.
+            replay = replay_h2h_with_trade(
+                target_team_key, target_team_key,
+                {drop_candidate.player_key}, {weekly_added_player.player_key},
+                week_matchups,
+                weekly_roster_target,
+                {w: [weekly_added_player] for w in weekly_roster_target.keys()},
+                categories, current_week,
+            )
+            total = (replay.trade_season_w +
+                     replay.trade_season_l +
+                     replay.trade_season_t)
+            scenario.h2h_win_pct_after = replay.trade_season_w / total if total else 0.0
+        else:
+            h2h_after = simulate_h2h(teams_after, scored)
+            pr_after = compute_power_rankings(h2h_after, teams_after)
+            for s in pr_after:
+                if s.team_key == target_team_key:
+                    scenario.h2h_win_pct_after = s.win_pct
+                    break
+        scenario.h2h_win_pct_delta = scenario.h2h_win_pct_after - baseline_win_pct
+
+        scenarios.append(scenario)
+
+    # Sort by roto delta — best upgrades first
+    scenarios.sort(key=lambda s: s.roto_delta, reverse=True)
+    return scenarios
