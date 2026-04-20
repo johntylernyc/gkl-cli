@@ -3037,6 +3037,8 @@ class ComparisonScreen(Screen):
         ("1", "view_season", "Season"),
         ("2", "view_l14", "L14"),
         ("3", "view_l30", "L30"),
+        ("w", "toggle_watchlist", "Watchlist"),
+        ("T", "open_trade_analyzer", "Trade Analyzer"),
     ]
     CSS = """
     #cmp-header {
@@ -3105,6 +3107,7 @@ class ComparisonScreen(Screen):
         self._scenarios: list = []  # list[CompareScenario]
         self._roster: list[PlayerStats] = []
         self._selected_scenario = None  # CompareScenario
+        self._store = RosterDataStore()
 
     @property
     def _is_batter(self) -> bool:
@@ -3131,9 +3134,9 @@ class ComparisonScreen(Screen):
         sub.append(f"{self._team_name}", style="bold")
         sub.append(f"  |  {view_labels.get(self._view, self._view)}", style="dim")
         if self._mode == "summary":
-            sub.append(f"  [Enter] detail  [1/2/3] view\n", style="dim")
+            sub.append(f"  [Enter] detail  [1/2/3] view  [w] watch  [T] trade\n", style="dim")
         else:
-            sub.append(f"  [Esc] back to list\n", style="dim")
+            sub.append(f"  [Esc] back to list  [w] watch  [T] trade\n", style="dim")
         self.query_one("#cmp-subheader", Static).update(sub)
 
     def on_mount(self) -> None:
@@ -3167,6 +3170,72 @@ class ComparisonScreen(Screen):
         self._view = "l30"
         self._update_subheader()
         self.run_worker(self._load_comparison, group="cmp-load", exclusive=True)
+
+    def action_toggle_watchlist(self) -> None:
+        """Toggle the compared player on/off the watchlist."""
+        p = self._wl_player
+        if self._store.is_on_watchlist(self.league.league_key, p.player_key):
+            self._store.remove_from_watchlist(self.league.league_key, p.player_key)
+            self.notify(f"Removed {p.name} from watchlist")
+        else:
+            self._store.add_to_watchlist(
+                self.league.league_key, p.player_key,
+                p.name, p.position, p.team_abbr,
+            )
+            self.notify(f"Added {p.name} to watchlist")
+
+    def action_open_trade_analyzer(self) -> None:
+        """Open the Trade Analyzer with the compared player pre-selected.
+
+        If the player is on another fantasy team, configures the analyze-trade
+        flow with that team pre-selected. Otherwise notifies the user.
+        """
+        self.run_worker(self._launch_trade_analyzer, group="cmp-ta", exclusive=True)
+
+    async def _launch_trade_analyzer(self) -> None:
+        # Find which fantasy team owns the compared player by scanning rosters
+        cache = self.app.shared_cache
+        await cache.ensure_loaded(self.api, self.league, self.categories)
+        import asyncio
+
+        other_teams = [t for t in cache.all_teams if t.team_key != self._team_key]
+        owner_team_key: str | None = None
+        owner_team_name: str = ""
+
+        # Scan opposing rosters in parallel
+        roster_tasks = [
+            asyncio.to_thread(
+                self.api.get_roster_stats_season, t.team_key, self.league.current_week)
+            for t in other_teams
+        ]
+        rosters = await asyncio.gather(*roster_tasks, return_exceptions=True)
+        for team, roster in zip(other_teams, rosters):
+            if isinstance(roster, Exception):
+                continue
+            for p in roster:
+                if p.player_key == self._wl_player.player_key:
+                    owner_team_key = team.team_key
+                    owner_team_name = team.name
+                    break
+            if owner_team_key:
+                break
+
+        if not owner_team_key:
+            self.notify(
+                f"{self._wl_player.name} is a free agent — Trade Analyzer requires a rostered player.",
+                severity="warning",
+            )
+            return
+
+        # Launch Trade Analyzer with both teams and players pre-configured
+        screen = TradeAnalyzerScreen(self.api, self.league, self.categories)
+        # Pre-seed state so on_mount skips the team select modals
+        screen._team_a_key = self._team_key
+        screen._team_a_name = self._team_name
+        screen._team_b_key = owner_team_key
+        screen._team_b_name = owner_team_name
+        screen._skip_auto_select = True  # flag for on_mount
+        self.app.push_screen(screen)
 
     def _get_roster_fetcher(self):
         if self._view == "l14":
@@ -3339,7 +3408,7 @@ class ComparisonScreen(Screen):
         """Render the full detail analysis for the selected scenario."""
         from gkl.trade import (
             apply_trade_to_team, replay_h2h_with_trade, compute_h2h_hypothetical,
-            build_trade_summary_prompt, get_trade_ai_summary,
+            get_trade_ai_summary,
         )
         from gkl.skipper import DEFAULT_MODEL, load_anthropic_key
 
@@ -3629,39 +3698,26 @@ class ComparisonScreen(Screen):
             scroll.scroll_end(animate=False)
 
             try:
-                # Build a mini TradeImpact-like object for the prompt
-                class _MiniImpact:
-                    pass
-                mi = _MiniImpact()
-                mi.cat_impacts = [
-                    type("CI", (), {
-                        "stat_id": ci["cat"].stat_id,
-                        "display_name": ci["cat"].display_name,
-                        "before": ci["before"],
-                        "after": ci["after"],
-                        "delta": ci["delta"],
-                        "favorable": ci["favorable"],
-                    })()
-                    for ci in cat_impacts
-                ]
-                mi.roto_rank_before_a = before_ranks.get(self._team_key, (0, 0))[0]
+                from gkl.trade import build_compare_summary_prompt
+                before_rank, before_pts = before_ranks.get(self._team_key, (0, 0))
                 after_rank = next(
                     (i for i, r in enumerate(roto_after, 1)
                      if r["team_key"] == self._team_key), 0,
                 )
-                mi.roto_rank_after_a = after_rank
-                mi.roto_points_before_a = before_ranks.get(self._team_key, (0, 0))[1]
-                mi.roto_points_after_a = next(
+                after_pts = next(
                     (r["total"] for r in roto_after
-                     if r["team_key"] == self._team_key), 0,
+                     if r["team_key"] == self._team_key), 0.0,
                 )
-                mi.roto_rank_before_b = 0
-                mi.roto_rank_after_b = 0
-
-                prompt = build_trade_summary_prompt(
-                    mi, self._team_name, "Free Agency",
-                    [scenario.drop_player], [self._wl_player],
-                    h2h_replay,
+                prompt = build_compare_summary_prompt(
+                    team_name=self._team_name,
+                    add_player=self._wl_player,
+                    drop_player=scenario.drop_player,
+                    cat_impacts=cat_impacts,
+                    roto_rank_before=before_rank,
+                    roto_rank_after=after_rank,
+                    roto_points_before=before_pts,
+                    roto_points_after=after_pts,
+                    h2h_replay=h2h_replay,
                 )
                 ai_summary = await get_trade_ai_summary(prompt, api_key, DEFAULT_MODEL)
                 ai_content.update(Text(f"  {ai_summary}"))
@@ -7095,6 +7151,9 @@ class TradeAnalyzerScreen(Screen):
         self._discover_scenarios: list = []  # list[TradeScenario]
         # Stat view for roster tables
         self._trade_view = "season"  # "season" or "last30"
+        # When set, skip the initial team select modals (used when pre-configured
+        # externally, e.g., from the Compare screen's "open trade analyzer" hotkey)
+        self._skip_auto_select = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -7116,6 +7175,12 @@ class TradeAnalyzerScreen(Screen):
         )
         self.query_one("#trade-loading").display = False
         self._update_subheader()
+
+        if self._skip_auto_select and self._team_a_key and self._team_b_key:
+            # Pre-configured from another screen — load both rosters directly
+            self.run_worker(self._load_both_rosters, group="trade-preload", exclusive=True)
+            return
+
         # Auto-select Team A
         teams = self.api.get_team_season_stats(self.league.league_key)
         options = [(t.team_key, t.name) for t in teams]
@@ -7123,6 +7188,22 @@ class TradeAnalyzerScreen(Screen):
             TeamSelectModal(options),
             callback=self._on_team_a_selected,
         )
+
+    async def _load_both_rosters(self) -> None:
+        """Load both team rosters when the screen is pre-configured."""
+        import asyncio
+        ra, rb = await asyncio.gather(
+            asyncio.to_thread(
+                self.api.get_roster_stats_season, self._team_a_key, self.league.current_week),
+            asyncio.to_thread(
+                self.api.get_roster_stats_season, self._team_b_key, self.league.current_week),
+        )
+        self._roster_a = ra
+        self._roster_b = rb
+        self._selected_a.clear()
+        self._selected_b.clear()
+        await self._render_left_pane()
+        self._update_subheader()
 
     def _update_subheader(self) -> None:
         sub = Text()

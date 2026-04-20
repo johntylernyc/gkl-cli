@@ -596,6 +596,11 @@ def replay_h2h_with_trade(
         for m in matchups:
             if m.status == "preevent":
                 continue
+            # Skip weeks where no games have been played yet (both teams at 0 points).
+            # This catches the Monday morning case where status is "midevent" but
+            # no actual stats have been recorded.
+            if m.status != "postevent" and m.team_a.points == 0 and m.team_b.points == 0:
+                continue
             if m.team_a.team_key == team_a_key:
                 my_matchup = m
                 am_team_a_side = True
@@ -734,6 +739,13 @@ def compute_h2h_hypothetical(
 
         # Extract all teams' weekly stats from matchups
         all_weekly_teams: dict[str, TeamStats] = {}
+        # Skip weeks where no games have been played (both teams at 0 points)
+        any_games_played = any(
+            m.status == "postevent" or m.team_a.points > 0 or m.team_b.points > 0
+            for m in matchups
+        )
+        if not any_games_played:
+            continue
         for m in matchups:
             if m.status == "preevent":
                 continue
@@ -1054,6 +1066,65 @@ async def get_trade_ai_summary(
         messages=[{"role": "user", "content": prompt}],
     )
     return response.content[0].text
+
+
+def build_compare_summary_prompt(
+    team_name: str,
+    add_player: PlayerStats,
+    drop_player: PlayerStats,
+    cat_impacts: list,  # list of {cat, before, after, delta, favorable}
+    roto_rank_before: int,
+    roto_rank_after: int,
+    roto_points_before: float,
+    roto_points_after: float,
+    h2h_replay: H2HReplay | None = None,
+) -> str:
+    """Build a prompt for Claude to analyze an add/drop for a single team.
+
+    Unlike the trade prompt, this frames the analysis as "what if this
+    player were on your roster instead of X?" — no trade partner, no
+    counter-offer, no pitch. Purely the impact on your own team.
+    """
+    lines = [
+        "You are a fantasy baseball analyst. Analyze this hypothetical add/drop for a single team.",
+        "Do not frame this as a trade — treat it as 'what if this player were on your roster instead'.",
+        "",
+        f"Team: **{team_name}**",
+        f"Add: {add_player.name} ({add_player.position}, {add_player.team_abbr})",
+        f"Drop: {drop_player.name} ({drop_player.position}, {drop_player.team_abbr})",
+        "",
+        "Category impact:",
+    ]
+    for ci in cat_impacts:
+        if ci["delta"] != 0:
+            direction = "+" if ci["favorable"] else "-"
+            lines.append(f"  {ci['cat'].display_name}: {ci['before']} → {ci['after']} ({direction})")
+
+    lines.append("")
+    lines.append(f"Roto standings: #{roto_rank_before} → #{roto_rank_after} "
+                 f"({roto_points_before:.1f} → {roto_points_after:.1f} pts)")
+
+    if h2h_replay and h2h_replay.weeks:
+        lines.append(f"H2H record (completed weeks, with swap applied): "
+                     f"{h2h_replay.actual_season_w}-{h2h_replay.actual_season_l}-{h2h_replay.actual_season_t}"
+                     f" → {h2h_replay.trade_season_w}-{h2h_replay.trade_season_l}-{h2h_replay.trade_season_t}")
+        flips = [w for w in h2h_replay.weeks if w.changed]
+        if flips:
+            lines.append(f"Matchup flips: {len(flips)} weeks would have changed outcome")
+
+    lines.append("")
+    lines.append("Provide a concise analysis under 180 words:")
+    lines.append("1. **Verdict**: One sentence — would this add/drop help the team?")
+    lines.append("2. **Pros** (2-3 bullets, referencing specific stat changes and standings impact)")
+    lines.append("3. **Cons** (2-3 bullets)")
+    lines.append("4. **Takeaway**: 1-2 sentences on whether to pursue this move")
+    lines.append("")
+    lines.append(
+        "Do NOT include a title like 'Trade Analysis'. Do NOT discuss selling the deal "
+        "to anyone or counter-offers — this is a one-sided analysis of your own roster."
+    )
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
