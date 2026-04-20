@@ -641,12 +641,21 @@ def replay_h2h_with_trade(
     actual_w = actual_l = actual_t = 0
     trade_w = trade_l = trade_t = 0
 
+    from datetime import date as _date
+    is_monday = _date.today().weekday() == 0
+
     for week in range(1, current_week + 1):
         matchups = week_matchups.get(week, [])
         roster_a_week = weekly_roster_a.get(week, [])
         roster_b_week = weekly_roster_b.get(week, [])
 
         if not matchups:
+            continue
+
+        # On Mondays, exclude the current in-progress week — new matchups
+        # have just started with minimal stats accumulated. Completed prior
+        # weeks are still included.
+        if week == current_week and is_monday:
             continue
 
         # Find team A's matchup this week
@@ -656,8 +665,6 @@ def replay_h2h_with_trade(
             if m.status == "preevent":
                 continue
             # Skip weeks where no games have been played yet (both teams at 0 points).
-            # This catches the Monday morning case where status is "midevent" but
-            # no actual stats have been recorded.
             if m.status != "postevent" and m.team_a.points == 0 and m.team_b.points == 0:
                 continue
             if m.team_a.team_key == team_a_key:
@@ -796,15 +803,16 @@ def compute_h2h_hypothetical(
         if not matchups:
             continue
 
+        # On Mondays, exclude the current in-progress week entirely —
+        # the new week has started but stats have barely accumulated,
+        # which would dramatically over-project win counts. Completed
+        # prior weeks still count.
+        from datetime import date as _date
+        if week == current_week and _date.today().weekday() == 0:
+            continue
+
         # Extract all teams' weekly stats from matchups
         all_weekly_teams: dict[str, TeamStats] = {}
-        # Skip weeks where no games have been played (both teams at 0 points)
-        any_games_played = any(
-            m.status == "postevent" or m.team_a.points > 0 or m.team_b.points > 0
-            for m in matchups
-        )
-        if not any_games_played:
-            continue
         for m in matchups:
             if m.status == "preevent":
                 continue
@@ -813,6 +821,19 @@ def compute_h2h_hypothetical(
 
         my_team = all_weekly_teams.get(team_a_key)
         if my_team is None:
+            continue
+
+        # Skip weeks where my team's actual matchup hasn't been played yet
+        # (same criterion as the weekly replay — ensures both views stay in sync).
+        my_matchup_started = False
+        for m in matchups:
+            if m.team_a.team_key == team_a_key or m.team_b.team_key == team_a_key:
+                if m.status == "postevent":
+                    my_matchup_started = True
+                elif m.team_a.points > 0 or m.team_b.points > 0:
+                    my_matchup_started = True
+                break
+        if not my_matchup_started:
             continue
 
         # Compute trade-adjusted team stats for this week
@@ -1227,7 +1248,7 @@ def build_compare_summary_prompt(
     lines.append("")
     lines.append("Provide your analysis in this order (under 300 words total):")
     lines.append(
-        "1. **Narrative** (opening paragraph, 3-5 sentences): Broader context on both "
+        "1. Opening narrative paragraph (3-5 sentences, no heading): Broader context on both "
         "players — their historical production profile, age/career stage, and what the "
         "Statcast data suggests about their current form. Specifically comment on whether "
         "each player's season-to-date stats look sustainable based on their quality-of-contact "
@@ -1240,7 +1261,8 @@ def build_compare_summary_prompt(
     lines.append("5. **Takeaway**: 1-2 sentences on whether to pursue this move")
     lines.append("")
     lines.append(
-        "Do NOT include a title like 'Trade Analysis' at the start. Do NOT discuss selling "
+        "Do NOT include a title like 'Trade Analysis' at the start. Do NOT label the opening "
+        "paragraph with a '**Narrative**' heading — start it plainly. Do NOT discuss selling "
         "the deal to anyone or counter-offers — this is a one-sided analysis of your own roster."
     )
 
