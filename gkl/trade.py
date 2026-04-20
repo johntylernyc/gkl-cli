@@ -191,6 +191,65 @@ def _is_pitcher(p: PlayerStats) -> bool:
     return bool(positions & {"SP", "RP", "P"})
 
 
+def project_player_per_week(
+    player: PlayerStats, weeks_played: int,
+) -> PlayerStats:
+    """Create a new PlayerStats with counting stats divided by weeks played.
+
+    Rate stats and component stats (H/AB, IP) are preserved since they
+    represent averages, not totals. Used to convert season-total stats
+    into a per-week approximation for weekly H2H replay of add/drop
+    scenarios where per-player weekly data isn't available.
+    """
+    if weeks_played <= 0:
+        return player
+
+    new_stats = dict(player.stats)
+    for stat_id, val in player.stats.items():
+        # Skip rate stats — they're averages, not totals
+        if stat_id in RATE_STATS:
+            continue
+        # Skip H/AB composite (stat 60) and IP (stat 50) — used for rate decomposition
+        if stat_id in ("60", "50"):
+            # Divide both components of H/AB proportionally
+            if stat_id == "60" and "/" in val:
+                try:
+                    h_str, ab_str = val.split("/")
+                    h = int(h_str) / weeks_played
+                    ab = int(ab_str) / weeks_played
+                    new_stats[stat_id] = f"{int(h)}/{int(ab)}"
+                except (ValueError, TypeError):
+                    pass
+            elif stat_id == "50":
+                # IP: divide by weeks, preserve fractional innings notation
+                try:
+                    ip_f = _parse_ip(val)
+                    new_stats[stat_id] = f"{ip_f / weeks_played:.1f}"
+                except Exception:
+                    pass
+            continue
+        # Counting stat — divide by weeks played
+        try:
+            f_val = float(val)
+            projected = f_val / weeks_played
+            if projected == int(projected):
+                new_stats[stat_id] = str(int(projected))
+            else:
+                new_stats[stat_id] = f"{projected:.1f}"
+        except (ValueError, TypeError):
+            pass
+
+    return PlayerStats(
+        player_key=player.player_key,
+        name=player.name,
+        position=player.position,
+        team_abbr=player.team_abbr,
+        stats=new_stats,
+        draft_cost=player.draft_cost,
+        selected_position=player.selected_position,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Core: apply a trade to a team's stats
 # ---------------------------------------------------------------------------
@@ -1507,6 +1566,11 @@ def compute_compare_scenarios(
                 baseline_win_pct = s.win_pct
                 break
 
+    # Per-week projection of the added player (for the weekly H2H replay
+    # in the summary table — avoids adding season totals to each week).
+    weeks_played = max(current_week - 1, 1)
+    weekly_added_player = project_player_per_week(added_player, weeks_played)
+
     scenarios: list[CompareScenario] = []
     for drop_candidate in target_roster:
         if drop_candidate.selected_position in ("IL", "IL+", "NA"):
@@ -1559,15 +1623,15 @@ def compute_compare_scenarios(
             h2h_win_pct_before=baseline_win_pct,
         )
         if has_weekly:
-            # Weekly replay: swap this specific drop player for the added player
-            # We need a "fake" weekly roster for the added player — use season stats
+            # Weekly replay: swap this specific drop player for the added player.
+            # Use per-week projected stats for the added player so we don't add
+            # a full season's worth of counting stats to each weekly total.
             replay = replay_h2h_with_trade(
                 target_team_key, target_team_key,
-                {drop_candidate.player_key}, {added_player.player_key},
+                {drop_candidate.player_key}, {weekly_added_player.player_key},
                 week_matchups,
                 weekly_roster_target,
-                # Provide the added player in every week so it's findable by player_key
-                {w: [added_player] for w in weekly_roster_target.keys()},
+                {w: [weekly_added_player] for w in weekly_roster_target.keys()},
                 categories, current_week,
             )
             total = (replay.trade_season_w +

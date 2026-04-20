@@ -3489,6 +3489,13 @@ class ComparisonScreen(Screen):
             except Exception:
                 pass
 
+        # The add player's season stats represent full-season totals —
+        # convert to per-week projections so the weekly replay doesn't
+        # add a full season's worth of production to each single week.
+        from gkl.trade import project_player_per_week
+        weeks_played = max(self.league.current_week - 1, 1)
+        weekly_add_player = project_player_per_week(self._wl_player, weeks_played)
+
         h2h_replay = None
         h2h_hypo = None
         h2h_error = None
@@ -3499,7 +3506,7 @@ class ComparisonScreen(Screen):
                 {scenario.drop_player.player_key}, {self._wl_player.player_key},
                 cache.week_matchups,
                 weekly_roster_target,
-                {w: [self._wl_player] for w in weekly_roster_target.keys()},
+                {w: [weekly_add_player] for w in weekly_roster_target.keys()},
                 self.categories, self.league.current_week,
             )
             h2h_hypo = await asyncio.to_thread(
@@ -3508,7 +3515,7 @@ class ComparisonScreen(Screen):
                 {scenario.drop_player.player_key}, {self._wl_player.player_key},
                 cache.week_matchups,
                 weekly_roster_target,
-                {w: [self._wl_player] for w in weekly_roster_target.keys()},
+                {w: [weekly_add_player] for w in weekly_roster_target.keys()},
                 self.categories, self.league.current_week,
             )
         except Exception as e:
