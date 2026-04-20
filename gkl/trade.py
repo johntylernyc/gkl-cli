@@ -1062,10 +1062,56 @@ async def get_trade_ai_summary(
     client = anthropic.AsyncAnthropic(api_key=api_key)
     response = await client.messages.create(
         model=model,
-        max_tokens=512,
+        max_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
     )
     return response.content[0].text
+
+
+def _format_statcast_for_prompt(sc, is_batter: bool) -> str:
+    """Format statcast data into a short string for the AI prompt."""
+    if sc is None:
+        return "no Statcast data"
+    parts = []
+    if is_batter:
+        if sc.avg_exit_velo is not None:
+            parts.append(f"EV {sc.avg_exit_velo:.1f}")
+        if sc.max_exit_velo is not None:
+            parts.append(f"MaxEV {sc.max_exit_velo:.1f}")
+        if sc.barrel_pct is not None:
+            parts.append(f"Barrel% {sc.barrel_pct:.1f}")
+        if sc.hard_hit_pct is not None:
+            parts.append(f"HardHit% {sc.hard_hit_pct:.1f}")
+        if sc.xba is not None:
+            parts.append(f"xBA {sc.xba:.3f}")
+        if sc.xslg is not None:
+            parts.append(f"xSLG {sc.xslg:.3f}")
+        if sc.xwoba is not None:
+            parts.append(f"xwOBA {sc.xwoba:.3f}")
+        if sc.k_pct is not None:
+            parts.append(f"K% {sc.k_pct:.1f}")
+        if sc.bb_pct is not None:
+            parts.append(f"BB% {sc.bb_pct:.1f}")
+    else:
+        if sc.avg_exit_velo is not None:
+            parts.append(f"EV Alw {sc.avg_exit_velo:.1f}")
+        if sc.barrel_pct is not None:
+            parts.append(f"Barrel% {sc.barrel_pct:.1f}")
+        if sc.hard_hit_pct is not None:
+            parts.append(f"HardHit% {sc.hard_hit_pct:.1f}")
+        if sc.xba is not None:
+            parts.append(f"xBA {sc.xba:.3f}")
+        if sc.xslg is not None:
+            parts.append(f"xSLG {sc.xslg:.3f}")
+        if sc.xwoba is not None:
+            parts.append(f"xwOBA {sc.xwoba:.3f}")
+        if sc.xera is not None:
+            parts.append(f"xERA {sc.xera:.2f}")
+        if sc.k_pct is not None:
+            parts.append(f"K% {sc.k_pct:.1f}")
+        if sc.bb_pct is not None:
+            parts.append(f"BB% {sc.bb_pct:.1f}")
+    return ", ".join(parts) if parts else "no Statcast data"
 
 
 def build_compare_summary_prompt(
@@ -1078,6 +1124,9 @@ def build_compare_summary_prompt(
     roto_points_before: float,
     roto_points_after: float,
     h2h_replay: H2HReplay | None = None,
+    add_statcast=None,     # StatcastBatter or StatcastPitcher
+    drop_statcast=None,
+    is_batter: bool = True,
 ) -> str:
     """Build a prompt for Claude to analyze an add/drop for a single team.
 
@@ -1092,6 +1141,10 @@ def build_compare_summary_prompt(
         f"Team: **{team_name}**",
         f"Add: {add_player.name} ({add_player.position}, {add_player.team_abbr})",
         f"Drop: {drop_player.name} ({drop_player.position}, {drop_player.team_abbr})",
+        "",
+        "Statcast (season, quality-of-contact metrics):",
+        f"  {add_player.name}: {_format_statcast_for_prompt(add_statcast, is_batter)}",
+        f"  {drop_player.name}: {_format_statcast_for_prompt(drop_statcast, is_batter)}",
         "",
         "Category impact:",
     ]
@@ -1113,15 +1166,23 @@ def build_compare_summary_prompt(
             lines.append(f"Matchup flips: {len(flips)} weeks would have changed outcome")
 
     lines.append("")
-    lines.append("Provide a concise analysis under 180 words:")
-    lines.append("1. **Verdict**: One sentence — would this add/drop help the team?")
-    lines.append("2. **Pros** (2-3 bullets, referencing specific stat changes and standings impact)")
-    lines.append("3. **Cons** (2-3 bullets)")
-    lines.append("4. **Takeaway**: 1-2 sentences on whether to pursue this move")
+    lines.append("Provide your analysis in this order (under 300 words total):")
+    lines.append(
+        "1. **Narrative** (opening paragraph, 3-5 sentences): Broader context on both "
+        "players — their historical production profile, age/career stage, and what the "
+        "Statcast data suggests about their current form. Specifically comment on whether "
+        "each player's season-to-date stats look sustainable based on their quality-of-contact "
+        "metrics (xBA/xSLG/xwOBA vs actual, Barrel%, HardHit%, K%/BB%) — are they likely "
+        "to continue producing at current levels, regress, or improve?"
+    )
+    lines.append("2. **Verdict**: One sentence — would this add/drop help the team?")
+    lines.append("3. **Pros** (2-3 bullets, referencing specific stat changes and standings impact)")
+    lines.append("4. **Cons** (2-3 bullets)")
+    lines.append("5. **Takeaway**: 1-2 sentences on whether to pursue this move")
     lines.append("")
     lines.append(
-        "Do NOT include a title like 'Trade Analysis'. Do NOT discuss selling the deal "
-        "to anyone or counter-offers — this is a one-sided analysis of your own roster."
+        "Do NOT include a title like 'Trade Analysis' at the start. Do NOT discuss selling "
+        "the deal to anyone or counter-offers — this is a one-sided analysis of your own roster."
     )
 
     return "\n".join(lines)

@@ -3555,6 +3555,14 @@ class ComparisonScreen(Screen):
             Text(" ROTO STANDINGS (POST-ADD/DROP) ", style="bold"),
             classes="cmp-section",
         ))
+        roto_note = Text()
+        roto_note.append(
+            "  Note: if the added player is rostered on another team, "
+            "that team's impact is not modeled here.\n"
+            "  Press [T] to open the Trade Analyzer for the full league-wide trade view.",
+            style="dim italic",
+        )
+        await scroll.mount(Static(roto_note))
         roto_table = DataTable(classes="cmp-table")
         await scroll.mount(roto_table)
         roto_table.cursor_type = "none"
@@ -3708,6 +3716,30 @@ class ComparisonScreen(Screen):
                     (r["total"] for r in roto_after
                      if r["team_key"] == self._team_key), 0.0,
                 )
+
+                # Fetch statcast for both players
+                import asyncio
+                is_batter = self._is_batter
+                add_sc = None
+                drop_sc = None
+                try:
+                    add_mlbam, drop_mlbam = await asyncio.gather(
+                        asyncio.to_thread(lookup_mlbam_id, self._wl_player.name),
+                        asyncio.to_thread(lookup_mlbam_id, scenario.drop_player.name),
+                    )
+                    if is_batter:
+                        add_sc = (await asyncio.to_thread(get_batter_statcast, add_mlbam)
+                                  if add_mlbam else None)
+                        drop_sc = (await asyncio.to_thread(get_batter_statcast, drop_mlbam)
+                                   if drop_mlbam else None)
+                    else:
+                        add_sc = (await asyncio.to_thread(get_pitcher_statcast, add_mlbam)
+                                  if add_mlbam else None)
+                        drop_sc = (await asyncio.to_thread(get_pitcher_statcast, drop_mlbam)
+                                   if drop_mlbam else None)
+                except Exception:
+                    pass
+
                 prompt = build_compare_summary_prompt(
                     team_name=self._team_name,
                     add_player=self._wl_player,
@@ -3718,6 +3750,9 @@ class ComparisonScreen(Screen):
                     roto_points_before=before_pts,
                     roto_points_after=after_pts,
                     h2h_replay=h2h_replay,
+                    add_statcast=add_sc,
+                    drop_statcast=drop_sc,
+                    is_batter=is_batter,
                 )
                 ai_summary = await get_trade_ai_summary(prompt, api_key, DEFAULT_MODEL)
                 ai_content.update(Text(f"  {ai_summary}"))
