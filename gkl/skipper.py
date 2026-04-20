@@ -1401,6 +1401,10 @@ class Skipper:
             f"({matchups[0].week_start} to {matchups[0].week_end})"
             if matchups else "",
             "",
+            "IMPORTANT: Stats are always explicitly attributed to a team by name",
+            "(e.g., 'ERA: Mary's Little Lambs 1.25 (W) vs The Revs. 4.14 (L)').",
+            "Never swap which team owns which number.",
+            "",
         ]
 
         # Matchup results
@@ -1416,11 +1420,20 @@ class Skipper:
                     f"  [{mr['type']}] {mr['winner']} def. {mr['loser']} "
                     f"{mr['w_cats']}-{mr['l_cats']}-{mr['ties']}"
                 )
-            # Show key categories
-            decisive = [(name, av, bv, r) for name, av, bv, r in mr["cat_details"]]
-            for name, av, bv, r in decisive:
-                marker = "←" if r == "a" else ("→" if r == "b" else "=")
-                lines.append(f"    {name}: {av} {marker} {bv}")
+            # Show each category with explicit team attribution so the LLM
+            # can't mis-attribute stats (e.g., "ERA 1.25 ← 4.14" is too
+            # ambiguous — use "ERA: Mary's Little Lambs 1.25 (W) vs The Revs. 4.14").
+            for name, av, bv, r in mr["cat_details"]:
+                if r == "a":
+                    a_tag, b_tag = "(W)", "(L)"
+                elif r == "b":
+                    a_tag, b_tag = "(L)", "(W)"
+                else:
+                    a_tag = b_tag = "(T)"
+                lines.append(
+                    f"    {name}: {mr['team_a']} {av} {a_tag} vs "
+                    f"{mr['team_b']} {bv} {b_tag}"
+                )
         lines.append("")
 
         # Weekly power rankings (who was actually strongest this week)
