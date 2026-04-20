@@ -13,11 +13,28 @@ from gkl.yahoo_api import (
     YahooFantasyAPI, League, Matchup, StatCategory, PlayerStats, TeamStats,
     Transaction,
 )
-from gkl.stats import who_wins, compute_roto, simulate_h2h, compute_power_rankings
-from gkl.statcast import lookup_mlbam_id
+from gkl.stats import (
+    who_wins, compute_roto, simulate_h2h, compute_power_rankings,
+    SGPCalculator,
+)
+from gkl.statcast import (
+    lookup_mlbam_id, get_batter_statcast, get_pitcher_statcast,
+)
 from gkl.mlb_api import (
     get_player_batting_stats, get_player_pitching_stats,
     MLBBattingStats, MLBPitchingStats,
+    get_mlb_scoreboard, get_mlb_boxscore,
+)
+from gkl.trade import (
+    TradeSide,
+    apply_trade_to_team,
+    compute_trade_impact,
+    replay_h2h_with_trade,
+    compute_h2h_hypothetical,
+    find_trade_targets as trade_find_targets,
+    discover_trades,
+    compute_compare_scenarios,
+    project_player_per_week,
 )
 
 ANTHROPIC_KEY_PATH = Path.home() / ".config" / "gkl" / "anthropic.json"
@@ -197,15 +214,16 @@ TOOLS = [
     {
         "name": "find_trade_targets",
         "description": (
-            "Analyze the entire league to find the best trade partners. "
-            "Given a player the user wants to trade and a position they want "
-            "to acquire, this tool examines every team's roster to find: "
-            "(1) teams with surplus depth at the target position who can afford "
-            "to move a player, (2) teams that have a need at the offered player's "
-            "position, (3) teams whose category weaknesses align with the offered "
-            "player's strengths, and (4) specific player targets on each team. "
-            "Returns a ranked list of trade partners with analysis that you should "
-            "use to craft a persuasive sales pitch for each viable trade."
+            "Trading Block: given a player the user wants to trade away, scan "
+            "every other roster for position-eligible players and rank them by "
+            "ΔSGP (player value swap), ΔRoto (projected roto points change using "
+            "actual season stats), and ΔWin% (H2H record change using per-player "
+            "weekly replay of completed weeks). Deals where the trade partner "
+            "would lose too many roto points are filtered out as unrealistic. "
+            "Use this when the user asks 'who should I target in a trade for X' "
+            "or 'what could I get for my Y'. Returns top 20 candidates with "
+            "owner team, three independent impact metrics, and a 'Partner' "
+            "column showing whether the other team would benefit from the deal."
         ),
         "input_schema": {
             "type": "object",
@@ -218,15 +236,191 @@ TOOLS = [
                     "type": "string",
                     "description": "Name of the player the user wants to trade away.",
                 },
-                "target_position": {
+                "max_results": {
+                    "type": "integer",
+                    "description": "Max targets to return (default 20).",
+                },
+            },
+            "required": ["team_name", "offer_player_name"],
+        },
+    },
+    {
+        "name": "analyze_trade",
+        "description": (
+            "Analyze a specific two-sided trade between two teams. Given the "
+            "players each team would send, computes full impact: per-category "
+            "deltas, full league roto standings before/after (with batting and "
+            "pitching subtotals), H2H weekly replay (completed weeks re-simulated "
+            "with the trade applied, flagging matchups that would have flipped), "
+            "and H2H hypothetical (your weekly stats vs all opponents across all "
+            "completed weeks). Use this when the user proposes or describes a "
+            "specific trade. If you don't know which players are involved, ask "
+            "first — don't guess."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "team_a_name": {
+                    "type": "string",
+                    "description": "The user's team (or team A) name.",
+                },
+                "team_b_name": {
+                    "type": "string",
+                    "description": "The trade partner (team B) name.",
+                },
+                "team_a_players": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Player names Team A is sending.",
+                },
+                "team_b_players": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Player names Team B is sending.",
+                },
+            },
+            "required": [
+                "team_a_name", "team_b_name",
+                "team_a_players", "team_b_players",
+            ],
+        },
+    },
+    {
+        "name": "discover_trade_scenarios",
+        "description": (
+            "Trade Discovery: given a set of stat categories the user wants to "
+            "improve, scan all opposing rosters for players strong in those "
+            "categories and pair each target with a suggested trade offer from "
+            "the user's roster (preferring cross-position offers so both sides "
+            "benefit). Returns ranked scenarios with ΔSGP, ΔRoto, and partner "
+            "impact. Use this when the user says 'I need help with HRs' or "
+            "'how do I improve my pitching' — pick the stat categories that "
+            "match the user's need and invoke this tool."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "team_name": {
+                    "type": "string",
+                    "description": "The user's team name.",
+                },
+                "stat_categories": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Display names of categories to improve (e.g. ['HR','RBI'] "
+                        "or ['ERA','WHIP','K']). Must match category display names "
+                        "from the scoring categories list in the system prompt."
+                    ),
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Max scenarios to return (default 15).",
+                },
+            },
+            "required": ["team_name", "stat_categories"],
+        },
+    },
+    {
+        "name": "compare_add_drop",
+        "description": (
+            "Evaluate adding a player (free agent or watchlisted) and dropping "
+            "one of the user's current roster players. For each position-eligible "
+            "drop candidate, computes ΔSGP, ΔRoto, and ΔWin% for the user's team. "
+            "Also includes season Statcast metrics (xBA, xSLG, xwOBA, Barrel%, "
+            "HardHit%, K%, BB%) for both the added and dropped players to inform "
+            "regression judgments. Use this when a user asks 'should I pick up X' "
+            "or 'is Y better than what I have'. Note: this models only the user's "
+            "team — if the added player is on another team, use analyze_trade for "
+            "the full league-wide impact."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "team_name": {
+                    "type": "string",
+                    "description": "The user's team name.",
+                },
+                "add_player_name": {
+                    "type": "string",
+                    "description": "Player being added (free agent, watchlist, or other team's player).",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Max drop-candidate scenarios (default 15).",
+                },
+            },
+            "required": ["team_name", "add_player_name"],
+        },
+    },
+    {
+        "name": "get_mlb_scoreboard",
+        "description": (
+            "Get MLB game scores for a specific date. Returns all games with "
+            "status (Preview/Live/Final), score, inning, runners on base, and "
+            "inning-by-inning run data when available. Use when the user asks "
+            "about today's (or a specific date's) MLB games, scores, or how "
+            "live games are affecting fantasy rosters."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {
                     "type": "string",
                     "description": (
-                        "Position the user wants to acquire "
-                        "(e.g. SP, RP, C, 1B, 2B, 3B, SS, OF)."
+                        "Date in YYYY-MM-DD format. Omit for today."
                     ),
                 },
             },
-            "required": ["team_name", "offer_player_name", "target_position"],
+            "required": [],
+        },
+    },
+    {
+        "name": "get_mlb_boxscore",
+        "description": (
+            "Get the full box score for a specific MLB game: batter lines (AB, H, "
+            "R, HR, RBI, SB, BB, K) and pitcher lines (IP, H, R, ER, BB, K, ERA). "
+            "Use when the user asks about a specific game, a player's performance "
+            "in a game, or how a game affected fantasy standings. Requires gamePk "
+            "from get_mlb_scoreboard."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "game_pk": {
+                    "type": "string",
+                    "description": "MLB gamePk ID from get_mlb_scoreboard.",
+                },
+            },
+            "required": ["game_pk"],
+        },
+    },
+    {
+        "name": "get_statcast_profile",
+        "description": (
+            "Get season Statcast quality-of-contact metrics for a player: exit "
+            "velocity, barrel rate, hard-hit rate, expected stats (xBA, xSLG, "
+            "xwOBA), K% and BB%. For pitchers: also xERA and opposing-batter "
+            "metrics. Use this to assess whether a player's surface stats are "
+            "sustainable (actual better than expected = regression candidate; "
+            "actual worse than expected = bounceback candidate)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "player_name": {
+                    "type": "string",
+                    "description": "Player name.",
+                },
+                "is_pitcher": {
+                    "type": "boolean",
+                    "description": (
+                        "True for pitcher Statcast, false for batter. Omit "
+                        "to auto-detect based on typical positions."
+                    ),
+                },
+            },
+            "required": ["player_name"],
         },
     },
     {
@@ -365,12 +559,49 @@ class Skipper:
             "- The user is a fantasy baseball manager in this league.\n"
             "- When tools return prior-year stats alongside current stats, always "
             "factor in the prior-year context per the season phase guidance above.\n"
-            "- When suggesting trades, it's fine to trade a player at the same "
-            "position the user wants to improve — but only if the return is a clear "
-            "upgrade. Don't suggest trading away a team's best player at a position "
-            "of need unless the incoming player is genuinely better (factoring in "
-            "prior-year track record, not just a small current-year sample). "
-            "Prefer trading from positions of surplus when possible.\n"
+            "\n"
+            "## Using the Trade Analyzer Suite\n"
+            "Prefer the trade-analyzer tools over ad-hoc reasoning for any trade "
+            "question. These tools use the same SGP-based engine that powers the "
+            "in-app Trade Analyzer and produce consistent, honest numbers:\n"
+            "- `find_trade_targets`: user has a specific player to trade and wants "
+            "targets. Returns ΔSGP, ΔRoto, ΔWin% per candidate plus a partner-"
+            "benefit column. Realistic deals only (partner wouldn't lose heavily).\n"
+            "- `analyze_trade`: two specific teams and named players on each side. "
+            "Returns full roto, H2H, and category impact plus a weekly replay of "
+            "which actual matchups would have flipped. Ask for specifics before "
+            "running this — don't guess.\n"
+            "- `discover_trade_scenarios`: user wants to improve specific stat "
+            "categories (e.g. 'I need more HRs'). Scans all rosters and returns "
+            "ranked target + suggested offer pairs.\n"
+            "- `compare_add_drop`: user is considering a free agent or other "
+            "team's player as an add. Returns ranked drop-candidates with roto "
+            "and H2H impact. If the add player is rostered on another team, "
+            "mention that `analyze_trade` gives the full league-wide view.\n"
+            "\n"
+            "## Statcast Regression Signals\n"
+            "`get_statcast_profile` and the Statcast line inside `compare_add_drop` "
+            "surface expected-stats metrics. Use them like this:\n"
+            "- Actual AVG/SLG > xBA/xSLG → regression candidate (overperforming)\n"
+            "- Actual AVG/SLG < xBA/xSLG → bounceback candidate (underperforming)\n"
+            "- Low Barrel% and HardHit% despite strong surface stats → unsustainable\n"
+            "- High K%, low BB% → volatile floor even with good current production\n"
+            "- For pitchers: ERA vs xERA, opposing xwOBA, and K%/BB% tell the same "
+            "story.\n"
+            "\n"
+            "## MLB Game Data\n"
+            "Use `get_mlb_scoreboard` for game-day questions ('how are my players "
+            "doing today?', 'who's playing tonight?'). Use `get_mlb_boxscore` with "
+            "a gamePk from the scoreboard when the user asks about a specific "
+            "game or player performance in a game.\n"
+            "\n"
+            "## General Trade Heuristics\n"
+            "- Prefer trading from surplus; avoid leaving holes.\n"
+            "- Don't trade a team's best player at a position of need unless the "
+            "return is a clear upgrade (factoring in track record, not just a "
+            "small-sample current year).\n"
+            "- Cross-position trades (batter for pitcher) often make both sides "
+            "happy because they fill different needs.\n"
         )
 
     async def _ensure_teams(self) -> None:
@@ -467,7 +698,39 @@ class Skipper:
                     return await self._tool_trade_targets(
                         tool_input["team_name"],
                         tool_input["offer_player_name"],
-                        tool_input["target_position"],
+                        tool_input.get("max_results", 20),
+                    )
+                case "analyze_trade":
+                    return await self._tool_analyze_trade(
+                        tool_input["team_a_name"],
+                        tool_input["team_b_name"],
+                        tool_input["team_a_players"],
+                        tool_input["team_b_players"],
+                    )
+                case "discover_trade_scenarios":
+                    return await self._tool_discover_trades(
+                        tool_input["team_name"],
+                        tool_input["stat_categories"],
+                        tool_input.get("max_results", 15),
+                    )
+                case "compare_add_drop":
+                    return await self._tool_compare_add_drop(
+                        tool_input["team_name"],
+                        tool_input["add_player_name"],
+                        tool_input.get("max_results", 15),
+                    )
+                case "get_mlb_scoreboard":
+                    return await self._tool_mlb_scoreboard(
+                        tool_input.get("date"),
+                    )
+                case "get_mlb_boxscore":
+                    return await self._tool_mlb_boxscore(
+                        tool_input["game_pk"],
+                    )
+                case "get_statcast_profile":
+                    return await self._tool_statcast_profile(
+                        tool_input["player_name"],
+                        tool_input.get("is_pitcher"),
                     )
                 case "get_free_agents":
                     return await self._tool_free_agents(
@@ -1343,242 +1606,645 @@ class Skipper:
         lines.extend(fmt_group("Bench/IL", other, bat_cats + pit_cats))
         return "\n".join(lines)
 
+    # -- Helpers for trade/compare tools --
+
+    def _find_player_on_any_roster(
+        self,
+        player_name: str,
+        all_rosters: dict[str, list[PlayerStats]],
+    ) -> tuple[str | None, PlayerStats | None]:
+        """Find a player by name across any roster. Returns (team_key, player)."""
+        name_lower = player_name.lower()
+        for team_key, roster in all_rosters.items():
+            for p in roster:
+                if p.name.lower() == name_lower:
+                    return team_key, p
+        for team_key, roster in all_rosters.items():
+            for p in roster:
+                if name_lower in p.name.lower():
+                    return team_key, p
+        return None, None
+
+    async def _load_league_rosters(self) -> dict[str, list[PlayerStats]]:
+        """Fetch season rosters for every team, parallelized."""
+        await self._ensure_teams()
+        week = self.league.current_week
+        tasks = [
+            asyncio.to_thread(
+                self.api.get_roster_stats_season, t.team_key, week)
+            for t in self._teams
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        rosters: dict[str, list[PlayerStats]] = {}
+        for t, r in zip(self._teams, results):
+            if not isinstance(r, Exception):
+                rosters[t.team_key] = r
+        return rosters
+
+    async def _load_weekly_rosters(
+        self, team_keys: list[str], weeks: list[int],
+    ) -> dict[str, dict[int, list[PlayerStats]]]:
+        """Fetch per-week rosters for the given teams and weeks."""
+        out: dict[str, dict[int, list[PlayerStats]]] = {tk: {} for tk in team_keys}
+        for w in weeks:
+            tasks = [
+                asyncio.to_thread(self.api.get_roster_stats, tk, w)
+                for tk in team_keys
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for tk, r in zip(team_keys, results):
+                if not isinstance(r, Exception):
+                    out[tk][w] = r
+        return out
+
+    async def _load_week_matchups(self, weeks: list[int]) -> dict[int, list[Matchup]]:
+        """Fetch matchup data for the given weeks."""
+        out: dict[int, list[Matchup]] = {}
+        tasks = [
+            asyncio.to_thread(
+                self.api.get_scoreboard, self.league.league_key, w)
+            for w in weeks
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for w, r in zip(weeks, results):
+            if not isinstance(r, Exception):
+                out[w] = r
+        return out
+
+    async def _build_sgp_calc(
+        self, all_rosters: dict[str, list[PlayerStats]],
+    ) -> SGPCalculator | None:
+        """Build an SGPCalculator using current season team stats."""
+        await self._ensure_teams()
+        if not self._teams:
+            return None
+        positions = ("C", "1B", "2B", "3B", "SS", "OF", "SP", "RP")
+        replacement_by_pos: dict[str, list[PlayerStats]] = {}
+        for pos in positions:
+            try:
+                players, _ = await asyncio.to_thread(
+                    self.api.get_free_agents,
+                    self.league.league_key,
+                    position=pos, count=25,
+                )
+                replacement_by_pos[pos] = players
+            except Exception:
+                replacement_by_pos[pos] = []
+        try:
+            return SGPCalculator(
+                all_teams=self._teams,
+                categories=self.categories,
+                replacement_by_pos=replacement_by_pos,
+            )
+        except Exception:
+            return None
+
+    async def _get_statcast_description(self, player: PlayerStats) -> str:
+        """Compact Statcast description for a player."""
+        mlbam_id = await asyncio.to_thread(lookup_mlbam_id, player.name)
+        if mlbam_id is None:
+            return "no Statcast data available"
+
+        is_pitcher = any(p in ("SP", "RP", "P") for p in player.position.split(","))
+        parts: list[str] = []
+        if is_pitcher:
+            sc = await asyncio.to_thread(get_pitcher_statcast, mlbam_id)
+            if sc is None:
+                return "no Statcast data available"
+            if sc.avg_exit_velo is not None:
+                parts.append(f"EV allowed {sc.avg_exit_velo:.1f}")
+            if sc.barrel_pct is not None:
+                parts.append(f"Barrel% {sc.barrel_pct:.1f}")
+            if sc.hard_hit_pct is not None:
+                parts.append(f"HardHit% {sc.hard_hit_pct:.1f}")
+            if sc.xba is not None:
+                parts.append(f"xBA {sc.xba:.3f}")
+            if sc.xslg is not None:
+                parts.append(f"xSLG {sc.xslg:.3f}")
+            if sc.xwoba is not None:
+                parts.append(f"xwOBA {sc.xwoba:.3f}")
+            if sc.xera is not None:
+                parts.append(f"xERA {sc.xera:.2f}")
+            if sc.k_pct is not None:
+                parts.append(f"K% {sc.k_pct:.1f}")
+            if sc.bb_pct is not None:
+                parts.append(f"BB% {sc.bb_pct:.1f}")
+        else:
+            sc = await asyncio.to_thread(get_batter_statcast, mlbam_id)
+            if sc is None:
+                return "no Statcast data available"
+            if sc.avg_exit_velo is not None:
+                parts.append(f"EV {sc.avg_exit_velo:.1f}")
+            if sc.max_exit_velo is not None:
+                parts.append(f"MaxEV {sc.max_exit_velo:.1f}")
+            if sc.barrel_pct is not None:
+                parts.append(f"Barrel% {sc.barrel_pct:.1f}")
+            if sc.hard_hit_pct is not None:
+                parts.append(f"HardHit% {sc.hard_hit_pct:.1f}")
+            if sc.xba is not None:
+                parts.append(f"xBA {sc.xba:.3f}")
+            if sc.xslg is not None:
+                parts.append(f"xSLG {sc.xslg:.3f}")
+            if sc.xwoba is not None:
+                parts.append(f"xwOBA {sc.xwoba:.3f}")
+            if sc.k_pct is not None:
+                parts.append(f"K% {sc.k_pct:.1f}")
+            if sc.bb_pct is not None:
+                parts.append(f"BB% {sc.bb_pct:.1f}")
+        return ", ".join(parts) if parts else "no Statcast data available"
+
+    # -- Tool handlers: Trade Analyzer suite --
+
     async def _tool_trade_targets(
         self,
         team_name: str,
         offer_player_name: str,
-        target_position: str,
+        max_results: int = 20,
     ) -> str:
-        """Analyze the league to find optimal trade partners."""
+        """Find best trade targets using the SGP-based engine from trade.py."""
         await self._ensure_teams()
         user_team_key = self._resolve_team_key(team_name)
         if not user_team_key:
             return f"Could not find team matching '{team_name}'."
 
-        week = self.league.current_week
-        scored = [c for c in self.categories if not c.is_only_display]
-        bat_cats = [c for c in scored if c.position_type == "B"]
-        pit_cats = [c for c in scored if c.position_type == "P"]
-        target_pos_upper = target_position.upper()
-        is_target_pitcher = target_pos_upper in ("SP", "RP", "P")
-
-        # Fetch user's roster to find the offered player
-        user_roster: list[PlayerStats] = await asyncio.to_thread(
-            self.api.get_roster_stats_season, user_team_key, week
+        all_rosters = await self._load_league_rosters()
+        my_roster = all_rosters.get(user_team_key, [])
+        offer_player = next(
+            (p for p in my_roster
+             if offer_player_name.lower() in p.name.lower()),
+            None,
         )
-        offer_player = None
-        for p in user_roster:
-            if offer_player_name.lower() in p.name.lower():
-                offer_player = p
-                break
-        if not offer_player:
-            return f"Could not find '{offer_player_name}' on your roster."
+        if offer_player is None:
+            return (
+                f"Could not find player '{offer_player_name}' on {team_name}'s "
+                f"roster. Check spelling or use get_team_roster first."
+            )
 
-        # Fetch draft costs for keeper value context
-        draft_costs = await asyncio.to_thread(
-            self.api.get_draft_results, self.league.league_key
-        )
+        sgp_calc = await self._build_sgp_calc(all_rosters)
 
-        # Determine offered player's position type for need assessment
-        offer_is_pitcher = offer_player.position in ("SP", "RP", "P")
-        offer_positions = {pos.strip() for pos in offer_player.position.split(",")}
+        weeks = list(range(1, self.league.current_week + 1))
+        week_matchups = await self._load_week_matchups(weeks)
+        team_keys = list(all_rosters.keys())
+        weekly_rosters = await self._load_weekly_rosters(team_keys, weeks)
 
-        # Get roto standings for category strength/weakness analysis
-        roto = compute_roto(self._teams, self.categories)
-        roto_by_key = {r["team_key"]: r for r in roto}
-
-        # Fetch all other teams' rosters concurrently
-        other_teams = [t for t in self._teams if t.team_key != user_team_key]
-        roster_tasks = [
-            asyncio.to_thread(self.api.get_roster_stats_season, t.team_key, week)
-            for t in other_teams
-        ]
-        all_rosters = await asyncio.gather(*roster_tasks)
-
-        # Collect all players we want prior-year stats for:
-        # the offered player + all target-position players across the league
-        prior_year = int(self.league.season) - 1
-        players_for_prior: list[PlayerStats] = [offer_player]
-        for roster in all_rosters:
-            for p in roster:
-                if p.selected_position in ("IL", "IL+", "NA"):
-                    continue
-                player_positions = {pos.strip() for pos in p.position.split(",")}
-                if target_pos_upper in player_positions:
-                    players_for_prior.append(p)
-        prior_stats = await self._fetch_prior_year_lines(
-            players_for_prior, prior_year
+        team_names_map = {t.team_key: t.name for t in self._teams}
+        targets = await asyncio.to_thread(
+            trade_find_targets,
+            offer_player,
+            user_team_key,
+            all_rosters,
+            self._teams,
+            team_names_map,
+            self.categories,
+            sgp_calc,
+            week_matchups,
+            weekly_rosters,
+            self.league.current_week,
+            max_results,
         )
 
-        # Analyze each team as a potential trade partner
-        candidates: list[dict] = []
-        for team_stats, roster in zip(other_teams, all_rosters):
-            tk = team_stats.team_key
-            roto_data = roto_by_key.get(tk, {})
-
-            # Count active players at target position (depth analysis)
-            target_players = []
-            for p in roster:
-                if p.selected_position in ("IL", "IL+", "NA"):
-                    continue
-                player_positions = {pos.strip() for pos in p.position.split(",")}
-                if target_pos_upper in player_positions:
-                    target_players.append(p)
-
-            depth_at_target = len(target_players)
-
-            # Count active players at offered player's position (need analysis)
-            need_players = []
-            for p in roster:
-                if p.selected_position in ("IL", "IL+", "NA"):
-                    continue
-                player_positions = {pos.strip() for pos in p.position.split(",")}
-                if offer_positions & player_positions:
-                    need_players.append(p)
-
-            depth_at_offer_pos = len(need_players)
-
-            # Category weakness analysis: where does this team rank poorly
-            # in categories where the offered player excels?
-            cat_fit_score = 0
-            offer_cats = pit_cats if offer_is_pitcher else bat_cats
-            weakness_cats = []
-            for c in offer_cats:
-                rank = roto_data.get(c.stat_id, 0)
-                num_teams = len(self._teams)
-                # Bottom half = weakness (rank closer to 1 is worse in roto)
-                if isinstance(rank, (int, float)) and rank <= num_teams / 2:
-                    # Check if the offered player is good in this category
-                    try:
-                        val = float(offer_player.stats.get(c.stat_id, "0"))
-                        if val > 0 or (c.sort_order == "0" and val >= 0):
-                            cat_fit_score += 1
-                            weakness_cats.append(c.display_name)
-                    except (ValueError, TypeError):
-                        pass
-
-            # Composite trade fit score:
-            # - More depth at target = more willing to deal
-            # - Less depth at offered position = more need
-            # - More category weaknesses addressed = better fit
-            surplus_score = max(0, depth_at_target - 2)  # >2 means surplus
-            need_score = max(0, 4 - depth_at_offer_pos)  # <4 means need
-            fit_score = surplus_score + need_score + cat_fit_score
-
-            # Format target position players with stats + prior year
-            relevant_cats = pit_cats if is_target_pitcher else bat_cats
-            target_details = []
-            for p in sorted(
-                target_players,
-                key=lambda p: sum(
-                    float(p.stats.get(c.stat_id, "0"))
-                    for c in relevant_cats
-                    if c.sort_order == "1"
-                ),
-                reverse=True,
-            ):
-                vals = [
-                    f"{c.display_name}={p.stats.get(c.stat_id, '-')}"
-                    for c in relevant_cats
-                ]
-                slot = p.selected_position or p.position
-                cost = draft_costs.get(p.player_key, "undrafted")
-                cost_str = f"${cost}" if cost != "undrafted" else "undrafted"
-                line = (
-                    f"    {p.name} ({slot}, {p.team_abbr}) "
-                    f"[drafted: {cost_str}]: "
-                    + ", ".join(vals)
-                )
-                py = prior_stats.get(p.name)
-                if py:
-                    line += f"\n      Prior year: {py}"
-                target_details.append(line)
-
-            candidates.append({
-                "team_name": team_stats.name,
-                "manager": team_stats.manager,
-                "fit_score": fit_score,
-                "depth_at_target": depth_at_target,
-                "depth_at_offer_pos": depth_at_offer_pos,
-                "surplus_score": surplus_score,
-                "need_score": need_score,
-                "cat_fit_score": cat_fit_score,
-                "weakness_cats": weakness_cats,
-                "target_players": target_details,
-            })
-
-        # Sort by fit score descending
-        candidates.sort(key=lambda c: c["fit_score"], reverse=True)
-
-        # Format offered player stats
-        offer_cats = pit_cats if offer_is_pitcher else bat_cats
-        offer_vals = [
-            f"{c.display_name}={offer_player.stats.get(c.stat_id, '-')}"
-            for c in offer_cats
-        ]
-
-        # Find user team name
-        user_team_name = team_name
-        for t in self._teams:
-            if t.team_key == user_team_key:
-                user_team_name = t.name
-                break
-
-        offer_prior = prior_stats.get(offer_player.name, "")
-        offer_cost = draft_costs.get(offer_player.player_key, "undrafted")
-        offer_cost_str = f"${offer_cost}" if offer_cost != "undrafted" else "undrafted"
+        if not targets:
+            return f"No position-eligible trade targets found for {offer_player.name}."
 
         lines = [
-            f"TRADE TARGET ANALYSIS",
-            f"Your team: {user_team_name}",
-            f"Offering: {offer_player.name} ({offer_player.position}, "
-            f"{offer_player.team_abbr}) [drafted: {offer_cost_str}]",
-            f"  {self.league.season} stats: {', '.join(offer_vals)}",
+            f"Trade Targets for {offer_player.name} ({offer_player.position}) "
+            f"— {team_name}:",
+            "",
+            "(ΔSGP = player value swap; ΔRoto = your roto points change; "
+            "ΔWin% = actual H2H record change from weekly replay; "
+            "Partner = trade partner's roto change — positive means they benefit.)",
+            "",
         ]
-        if offer_prior:
-            lines.append(f"  Prior year: {offer_prior}")
-        lines.extend([
-            f"Looking for: {target_pos_upper}",
-            f"Season phase: week {self.league.current_week} "
-            f"(weight prior-year stats accordingly)",
-            "",
-            "(Draft costs shown are what was paid in this league's auction draft. "
-            "In keeper leagues, next year's cost is typically draft cost + $10. "
-            "Undrafted players acquired via free agency are typically $10 next year. "
-            "Factor keeper value into trade recommendations — a great player on a "
-            "cheap keeper contract is more valuable than the same player at a high cost.)",
-            "",
-        ])
+        for t in targets:
+            sgp = f"{t.sgp:+.1f}" if t.sgp is not None else "N/A"
+            win_pct = (f"{t.h2h_win_pct_delta:+.1%}"
+                       if abs(t.h2h_win_pct_delta) > 0.001 else "—")
+            lines.append(
+                f"  {t.player.name} ({t.player.position}, {t.team_name}) — "
+                f"SGP {sgp}, ΔSGP {t.net_sgp:+.1f}, ΔRoto {t.roto_delta:+.1f}, "
+                f"ΔWin% {win_pct}, Partner {t.partner_roto_delta:+.1f}"
+            )
+        return "\n".join(lines)
 
-        for i, c in enumerate(candidates):
-            lines.append(f"--- #{i+1} {c['team_name']} ({c['manager']}) "
-                         f"--- Fit Score: {c['fit_score']}")
-            lines.append(f"  {target_pos_upper} depth: {c['depth_at_target']} players "
-                         f"(surplus: {'YES' if c['surplus_score'] > 0 else 'no'})")
-            lines.append(f"  Need at {offer_player.position}: "
-                         f"{c['depth_at_offer_pos']} players "
-                         f"({'NEED' if c['need_score'] > 0 else 'adequate'})")
-            if c["weakness_cats"]:
-                lines.append(f"  Weak in categories {offer_player.name} helps: "
-                             f"{', '.join(c['weakness_cats'])}")
-            lines.append(f"  Their {target_pos_upper} options:")
-            for detail in c["target_players"]:
-                lines.append(detail)
-            lines.append("")
+    async def _tool_analyze_trade(
+        self,
+        team_a_name: str,
+        team_b_name: str,
+        team_a_players: list[str],
+        team_b_players: list[str],
+    ) -> str:
+        """Full impact analysis for a two-sided trade."""
+        await self._ensure_teams()
+        team_a_key = self._resolve_team_key(team_a_name)
+        team_b_key = self._resolve_team_key(team_b_name)
+        if not team_a_key:
+            return f"Could not find team matching '{team_a_name}'."
+        if not team_b_key:
+            return f"Could not find team matching '{team_b_name}'."
 
-        lines.append(
-            "INSTRUCTIONS FOR RESPONSE: Using this analysis, recommend the top "
-            "2-3 trade targets. For each, suggest a specific player-for-player "
-            "swap and write a persuasive sales pitch the user can send to that "
-            "manager. The pitch should: (1) highlight how the offered player "
-            "fills their specific category weaknesses, (2) explain why they can "
-            "afford to move the target player given their depth, (3) frame "
-            "the trade as mutually beneficial, and (4) factor in keeper value — "
-            "mention draft costs and what each player will cost next year if "
-            "it strengthens the case. A player on a cheap keeper deal is a major "
-            "selling point. Keep pitches conversational and natural, not robotic."
+        all_rosters = await self._load_league_rosters()
+        roster_a = all_rosters.get(team_a_key, [])
+        roster_b = all_rosters.get(team_b_key, [])
+
+        a_players: list[PlayerStats] = []
+        for name in team_a_players:
+            p = next((p for p in roster_a if name.lower() in p.name.lower()), None)
+            if p is None:
+                return f"Could not find '{name}' on {team_a_name}'s roster."
+            a_players.append(p)
+        b_players: list[PlayerStats] = []
+        for name in team_b_players:
+            p = next((p for p in roster_b if name.lower() in p.name.lower()), None)
+            if p is None:
+                return f"Could not find '{name}' on {team_b_name}'s roster."
+            b_players.append(p)
+
+        team_a_name_resolved = next(
+            (t.name for t in self._teams if t.team_key == team_a_key), team_a_name)
+        team_b_name_resolved = next(
+            (t.name for t in self._teams if t.team_key == team_b_key), team_b_name)
+
+        side_a = TradeSide(team_a_key, team_a_name_resolved, a_players)
+        side_b = TradeSide(team_b_key, team_b_name_resolved, b_players)
+
+        impact = await asyncio.to_thread(
+            compute_trade_impact,
+            self._teams, roster_a, roster_b, side_a, side_b, self.categories,
         )
 
+        weeks = list(range(1, self.league.current_week + 1))
+        week_matchups = await self._load_week_matchups(weeks)
+        weekly_rosters = await self._load_weekly_rosters(
+            [team_a_key, team_b_key], weeks)
+        replay = None
+        try:
+            replay = await asyncio.to_thread(
+                replay_h2h_with_trade,
+                team_a_key, team_b_key,
+                {p.player_key for p in a_players},
+                {p.player_key for p in b_players},
+                week_matchups,
+                weekly_rosters.get(team_a_key, {}),
+                weekly_rosters.get(team_b_key, {}),
+                self.categories, self.league.current_week,
+            )
+        except Exception:
+            pass
+
+        a_names = ", ".join(p.name for p in a_players)
+        b_names = ", ".join(p.name for p in b_players)
+        lines = [
+            f"Trade Analysis — {team_a_name_resolved} sends: {a_names}",
+            f"                 {team_b_name_resolved} sends: {b_names}",
+            "",
+            f"{team_a_name_resolved} impact:",
+            f"  Roto: #{impact.roto_rank_before_a} → #{impact.roto_rank_after_a} "
+            f"({impact.roto_points_before_a:.1f} → {impact.roto_points_after_a:.1f} pts)",
+            f"  H2H power ranking: "
+            f"{impact.h2h_before_a.record_str} → {impact.h2h_after_a.record_str}",
+            "",
+            f"{team_b_name_resolved} impact:",
+            f"  Roto: #{impact.roto_rank_before_b} → #{impact.roto_rank_after_b} "
+            f"({impact.roto_points_before_b:.1f} → {impact.roto_points_after_b:.1f} pts)",
+            f"  H2H power ranking: "
+            f"{impact.h2h_before_b.record_str} → {impact.h2h_after_b.record_str}",
+            "",
+            f"Category impact for {team_a_name_resolved}:",
+        ]
+        for ci in impact.cat_impacts:
+            direction = "✓" if ci.favorable else ("✗" if ci.delta != 0 else "—")
+            lines.append(
+                f"  {ci.display_name}: {ci.before} → {ci.after}  ({direction})"
+            )
+
+        if replay and replay.weeks:
+            lines.append("")
+            lines.append(
+                f"H2H weekly replay — {team_a_name_resolved}:"
+            )
+            lines.append(
+                f"  Actual season record: "
+                f"{replay.actual_season_w}-{replay.actual_season_l}-{replay.actual_season_t}"
+            )
+            lines.append(
+                f"  With trade:           "
+                f"{replay.trade_season_w}-{replay.trade_season_l}-{replay.trade_season_t}"
+            )
+            flips = [w for w in replay.weeks if w.changed]
+            if flips:
+                lines.append(f"  Matchups that would have flipped: {len(flips)}")
+                for w in flips:
+                    lines.append(
+                        f"    Week {w.week} vs {w.opponent_name}: "
+                        f"{w.actual_result} → {w.trade_result}"
+                    )
+        return "\n".join(lines)
+
+    async def _tool_discover_trades(
+        self,
+        team_name: str,
+        stat_categories: list[str],
+        max_results: int = 15,
+    ) -> str:
+        """Find trade scenarios to improve specific stat categories."""
+        await self._ensure_teams()
+        user_team_key = self._resolve_team_key(team_name)
+        if not user_team_key:
+            return f"Could not find team matching '{team_name}'."
+
+        scored = [c for c in self.categories if not c.is_only_display]
+        target_stat_ids: list[str] = []
+        unmatched: list[str] = []
+        for cat_name in stat_categories:
+            match = next(
+                (c for c in scored
+                 if c.display_name.lower() == cat_name.lower()),
+                None,
+            )
+            if match:
+                target_stat_ids.append(match.stat_id)
+            else:
+                unmatched.append(cat_name)
+        if not target_stat_ids:
+            avail = ", ".join(c.display_name for c in scored)
+            return (
+                f"None of the categories matched. Unmatched: {unmatched}. "
+                f"Available: {avail}"
+            )
+
+        all_rosters = await self._load_league_rosters()
+        sgp_calc = await self._build_sgp_calc(all_rosters)
+        team_names_map = {t.team_key: t.name for t in self._teams}
+
+        scenarios = await asyncio.to_thread(
+            discover_trades,
+            user_team_key,
+            target_stat_ids,
+            all_rosters,
+            self._teams,
+            team_names_map,
+            self.categories,
+            sgp_calc,
+            max_results,
+        )
+
+        if not scenarios:
+            return f"No viable trade scenarios for improving {stat_categories}."
+
+        cat_display = ", ".join([c.display_name for c in scored
+                                 if c.stat_id in target_stat_ids])
+        lines = [
+            f"Trade Discovery — {team_name} seeking to improve: {cat_display}",
+            "",
+            "(Net SGP = value swap; ΔRoto = your roto points change; "
+            "Partner = partner's roto impact — filtered if partner loses heavily.)",
+            "",
+        ]
+        for s in scenarios:
+            target_sgp = f"{s.target_sgp:+.1f}" if s.target_sgp is not None else "N/A"
+            offer_sgp = f"{s.offer_sgp:+.1f}" if s.offer_sgp is not None else "N/A"
+            lines.append(
+                f"  You get {s.target.name} ({s.target.position}) from "
+                f"{s.target_team_name}  ↔  You send {s.offer.name} "
+                f"({s.offer.position})"
+            )
+            lines.append(
+                f"    Target SGP {target_sgp}, Offer SGP {offer_sgp}, "
+                f"Net SGP {s.net_sgp:+.1f}, ΔRoto {s.roto_delta:+.1f}, "
+                f"Partner {s.partner_roto_delta:+.1f}"
+            )
+        return "\n".join(lines)
+
+    async def _tool_compare_add_drop(
+        self,
+        team_name: str,
+        add_player_name: str,
+        max_results: int = 15,
+    ) -> str:
+        """Evaluate adding a player and dropping candidates."""
+        await self._ensure_teams()
+        user_team_key = self._resolve_team_key(team_name)
+        if not user_team_key:
+            return f"Could not find team matching '{team_name}'."
+
+        all_rosters = await self._load_league_rosters()
+
+        owner_team_key, add_player = self._find_player_on_any_roster(
+            add_player_name, all_rosters)
+        if add_player is None:
+            try:
+                fas, _ = await asyncio.to_thread(
+                    self.api.get_free_agents,
+                    self.league.league_key,
+                    status=None,
+                    search=add_player_name,
+                    count=5,
+                )
+                add_player = next(
+                    (p for p in fas
+                     if add_player_name.lower() in p.name.lower()),
+                    None,
+                )
+            except Exception:
+                pass
+        if add_player is None:
+            return f"Could not find player '{add_player_name}'."
+
+        my_roster = all_rosters.get(user_team_key, [])
+        sgp_calc = await self._build_sgp_calc(all_rosters)
+
+        weeks = list(range(1, self.league.current_week + 1))
+        week_matchups = await self._load_week_matchups(weeks)
+        weekly_rosters_target = await self._load_weekly_rosters(
+            [user_team_key], weeks)
+        weekly_target = weekly_rosters_target.get(user_team_key, {})
+
+        scenarios = await asyncio.to_thread(
+            compute_compare_scenarios,
+            add_player,
+            user_team_key,
+            my_roster,
+            self._teams,
+            self.categories,
+            sgp_calc,
+            week_matchups,
+            weekly_target,
+            self.league.current_week,
+        )
+        scenarios = scenarios[:max_results]
+
+        add_sc_desc = await self._get_statcast_description(add_player)
+
+        rostered_note = ""
+        if owner_team_key and owner_team_key != user_team_key:
+            owner_name = next(
+                (t.name for t in self._teams if t.team_key == owner_team_key),
+                "another team",
+            )
+            rostered_note = (
+                f"Note: {add_player.name} is currently rostered on "
+                f"{owner_name}. This analysis models only {team_name}'s side; "
+                f"use analyze_trade for the full view."
+            )
+
+        if not scenarios:
+            base = (
+                f"No position-eligible drop candidates for {add_player.name} "
+                f"on {team_name}."
+            )
+            return base + ("\n" + rostered_note if rostered_note else "")
+
+        lines = [
+            f"Add/Drop Analysis — considering adding {add_player.name} "
+            f"({add_player.position}, {add_player.team_abbr}) to {team_name}:",
+        ]
+        if rostered_note:
+            lines.append(rostered_note)
+        lines.append("")
+        lines.append(f"Statcast for {add_player.name}: {add_sc_desc}")
+        lines.append("")
+        lines.append("Drop candidates ranked by ΔRoto:")
+        lines.append("")
+        for s in scenarios:
+            drop = s.drop_player
+            drop_sgp = f"{s.drop_sgp:+.1f}" if s.drop_sgp is not None else "N/A"
+            win_pct = (f"{s.h2h_win_pct_delta:+.1%}"
+                       if abs(s.h2h_win_pct_delta) > 0.001 else "—")
+            lines.append(
+                f"  Drop {drop.name} ({drop.position}, {drop.team_abbr}) — "
+                f"SGP {drop_sgp}, ΔSGP {s.net_sgp:+.1f}, "
+                f"ΔRoto {s.roto_delta:+.1f}, ΔWin% {win_pct}"
+            )
+        return "\n".join(lines)
+
+    # -- Tool handlers: MLB game data --
+
+    async def _tool_mlb_scoreboard(self, date_str: str | None) -> str:
+        """Get MLB games for a specific date with scores and status."""
+        from datetime import date as _date, datetime
+
+        if date_str:
+            try:
+                game_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                return f"Invalid date format '{date_str}'. Use YYYY-MM-DD."
+        else:
+            game_date = _date.today()
+
+        games = await asyncio.to_thread(get_mlb_scoreboard, game_date)
+        if not games:
+            return f"No MLB games found for {game_date.isoformat()}."
+
+        lines = [f"MLB Scoreboard for {game_date.isoformat()}:"]
+        for g in games:
+            status_label = g.detail_status or g.status
+            if g.status != "Preview":
+                score_str = f"  {g.away_abbr} {g.away_score} @ {g.home_abbr} {g.home_score}"
+            else:
+                score_str = f"  {g.away_abbr} @ {g.home_abbr}"
+            inning_str = ""
+            if g.status == "Live":
+                inning_str = f"  {g.inning_half} {g.inning_ordinal}, {g.outs} out"
+            lines.append(
+                f"  [{status_label}] gamePk={g.gamePk}{score_str}{inning_str}"
+            )
+            if g.status != "Preview":
+                lines.append(
+                    f"    Hits: {g.away_abbr} {g.away_hits}, "
+                    f"{g.home_abbr} {g.home_hits}  "
+                    f"Errors: {g.away_abbr} {g.away_errors}, "
+                    f"{g.home_abbr} {g.home_errors}"
+                )
+        return "\n".join(lines)
+
+    async def _tool_mlb_boxscore(self, game_pk: str) -> str:
+        """Get the full box score for a specific MLB game."""
+        try:
+            box = await asyncio.to_thread(get_mlb_boxscore, game_pk)
+        except Exception as e:
+            return f"Could not fetch box score for game {game_pk}: {e}"
+        if box is None:
+            return f"No box score data for game {game_pk}."
+
+        lines = [f"Box Score — gamePk={game_pk}:"]
+        for team_label, team in [("Away", box.away), ("Home", box.home)]:
+            lines.append("")
+            lines.append(f"{team_label}: {team.name} ({team.abbr})")
+            if team.batters:
+                lines.append("  Batters:")
+                for b in team.batters:
+                    lines.append(
+                        f"    {b.name} ({b.position}): "
+                        f"AB {b.ab}, H {b.h}, R {b.r}, HR {b.hr}, "
+                        f"RBI {b.rbi}, SB {b.sb}, BB {b.bb}, K {b.so}"
+                    )
+            if team.pitchers:
+                lines.append("  Pitchers:")
+                for p in team.pitchers:
+                    dec = f" ({p.decision})" if p.decision else ""
+                    lines.append(
+                        f"    {p.name}{dec}: IP {p.ip}, H {p.h}, R {p.r}, "
+                        f"ER {p.er}, BB {p.bb}, K {p.so}, ERA {p.era}"
+                    )
+        return "\n".join(lines)
+
+    # -- Tool handler: Statcast profile --
+
+    async def _tool_statcast_profile(
+        self,
+        player_name: str,
+        is_pitcher: bool | None = None,
+    ) -> str:
+        """Get season Statcast metrics for a player."""
+        mlbam_id = await asyncio.to_thread(lookup_mlbam_id, player_name)
+        if mlbam_id is None:
+            return f"Could not find MLB data for '{player_name}'."
+
+        if is_pitcher is None:
+            sc_b = await asyncio.to_thread(get_batter_statcast, mlbam_id)
+            sc_p = await asyncio.to_thread(get_pitcher_statcast, mlbam_id)
+            if sc_b and not sc_p:
+                is_pitcher = False
+            elif sc_p and not sc_b:
+                is_pitcher = True
+            elif sc_b and sc_p:
+                is_pitcher = False
+            else:
+                return f"No Statcast data available for {player_name}."
+
+        lines = [f"Statcast profile for {player_name}:"]
+        if is_pitcher:
+            sc = await asyncio.to_thread(get_pitcher_statcast, mlbam_id)
+            if sc is None:
+                return f"No pitcher Statcast data for {player_name}."
+            lines.append(
+                f"  Quality of contact allowed: EV {sc.avg_exit_velo}, "
+                f"Barrel% {sc.barrel_pct}, HardHit% {sc.hard_hit_pct}"
+            )
+            lines.append(
+                f"  Expected: xBA {sc.xba}, xSLG {sc.xslg}, xwOBA {sc.xwoba}, "
+                f"xERA {sc.xera}"
+            )
+            lines.append(
+                f"  Plate discipline: K% {sc.k_pct}, BB% {sc.bb_pct}, "
+                f"Whiff% {sc.whiff_pct}"
+            )
+        else:
+            sc = await asyncio.to_thread(get_batter_statcast, mlbam_id)
+            if sc is None:
+                return f"No batter Statcast data for {player_name}."
+            lines.append(
+                f"  Quality of contact: EV {sc.avg_exit_velo}, "
+                f"MaxEV {sc.max_exit_velo}, LA {sc.avg_launch_angle}, "
+                f"Barrel% {sc.barrel_pct}, HardHit% {sc.hard_hit_pct}"
+            )
+            lines.append(
+                f"  Expected: xBA {sc.xba}, xSLG {sc.xslg}, xwOBA {sc.xwoba}"
+            )
+            lines.append(
+                f"  Plate discipline: K% {sc.k_pct}, BB% {sc.bb_pct}, "
+                f"Whiff% {sc.whiff_pct}"
+            )
         return "\n".join(lines)
 
     async def _tool_free_agents(
