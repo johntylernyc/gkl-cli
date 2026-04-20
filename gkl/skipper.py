@@ -193,14 +193,17 @@ TOOLS = [
         "name": "get_team_roster",
         "description": (
             "Get a team's full roster with player stats. "
-            "Use team_name to identify the team (partial match supported)."
+            "Use team_name to identify the team (partial match supported). "
+            "OMIT team_name to use the user's default team."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "team_name": {
                     "type": "string",
-                    "description": "Team name (or partial match).",
+                    "description": (
+                        "Team name (partial match). OMIT to use the user's team."
+                    ),
                 },
                 "stat_type": {
                     "type": "string",
@@ -208,40 +211,54 @@ TOOLS = [
                     "description": "Which stat window to return. Defaults to 'week'.",
                 },
             },
-            "required": ["team_name"],
+            "required": [],
         },
     },
     {
         "name": "find_trade_targets",
         "description": (
             "Trading Block: given a player the user wants to trade away, scan "
-            "every other roster for position-eligible players and rank them by "
+            "every other roster for realistic trade candidates and rank them by "
             "ΔSGP (player value swap), ΔRoto (projected roto points change using "
             "actual season stats), and ΔWin% (H2H record change using per-player "
             "weekly replay of completed weeks). Deals where the trade partner "
             "would lose too many roto points are filtered out as unrealistic. "
-            "Use this when the user asks 'who should I target in a trade for X' "
-            "or 'what could I get for my Y'. Returns top 20 candidates with "
-            "owner team, three independent impact metrics, and a 'Partner' "
-            "column showing whether the other team would benefit from the deal."
+            "\n\n"
+            "Use target_position to filter candidates to a specific position the "
+            "user wants to acquire. This is the common case — the user is trading "
+            "FROM a position of surplus TO a position of need (e.g., trading an OF "
+            "bat for an SP). Without target_position, the tool defaults to the "
+            "offered player's own positions, which is usually NOT what the user "
+            "wants."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "team_name": {
                     "type": "string",
-                    "description": "The user's team name (partial match supported).",
+                    "description": (
+                        "The user's team name. OMIT this field if the user has a "
+                        "default team set — the tool will use it automatically."
+                    ),
                 },
                 "offer_player_name": {
                     "type": "string",
                     "description": "Name of the player the user wants to trade away.",
+                },
+                "target_position": {
+                    "type": "string",
+                    "description": (
+                        "Filter candidates to this position (e.g. 'SP', 'RP', "
+                        "'C', '1B', '2B', '3B', 'SS', 'OF'). Pass this whenever "
+                        "the user explicitly names a position they want to acquire."
+                    ),
                 },
                 "max_results": {
                     "type": "integer",
                     "description": "Max targets to return (default 20).",
                 },
             },
-            "required": ["team_name", "offer_player_name"],
+            "required": ["offer_player_name"],
         },
     },
     {
@@ -302,7 +319,7 @@ TOOLS = [
             "properties": {
                 "team_name": {
                     "type": "string",
-                    "description": "The user's team name.",
+                    "description": "Team name. OMIT to use the user's default team.",
                 },
                 "stat_categories": {
                     "type": "array",
@@ -318,7 +335,7 @@ TOOLS = [
                     "description": "Max scenarios to return (default 15).",
                 },
             },
-            "required": ["team_name", "stat_categories"],
+            "required": ["stat_categories"],
         },
     },
     {
@@ -339,7 +356,7 @@ TOOLS = [
             "properties": {
                 "team_name": {
                     "type": "string",
-                    "description": "The user's team name.",
+                    "description": "Team name. OMIT to use the user's default team.",
                 },
                 "add_player_name": {
                     "type": "string",
@@ -350,7 +367,7 @@ TOOLS = [
                     "description": "Max drop-candidate scenarios (default 15).",
                 },
             },
-            "required": ["team_name", "add_player_name"],
+            "required": ["add_player_name"],
         },
     },
     {
@@ -471,11 +488,15 @@ class Skipper:
         league: League,
         categories: list[StatCategory],
         model: str = DEFAULT_MODEL,
+        user_team_key: str | None = None,
+        user_team_name: str | None = None,
     ) -> None:
         self.api = api
         self.league = league
         self.categories = categories
         self.model = model
+        self.user_team_key = user_team_key
+        self.user_team_name = user_team_name
         self._teams: list[TeamStats] | None = None
         self.history: list[dict] = []
         api_key = load_anthropic_key()
@@ -536,6 +557,17 @@ class Skipper:
                 "than prior years, though career track record still provides context."
             )
 
+        user_context = ""
+        if self.user_team_name:
+            user_context = (
+                f"\n## The User's Team\n"
+                f"- User is managing: **{self.user_team_name}**\n"
+                f"- Always default to this team when the user asks 'who should I…', "
+                f"'should I pick up…', 'my roster', etc. Do NOT ask for their team name.\n"
+                f"- Only ask for a team name when the user is clearly referring to "
+                f"another team (a trade partner, an opponent, etc.).\n"
+            )
+
         return (
             "You are Skipper, a sharp fantasy baseball analyst assistant inside the "
             "GKL Fantasy Baseball Command Center. You help the user understand their "
@@ -545,7 +577,8 @@ class Skipper:
             f"- Season: {self.league.season}\n"
             f"- Current week: {week}\n"
             f"- Season phase: {phase}\n"
-            f"- Teams: {self.league.num_teams}\n\n"
+            f"- Teams: {self.league.num_teams}\n"
+            f"{user_context}\n"
             f"## Season Phase Guidance\n{phase_guidance}\n\n"
             "## Scoring Categories\n"
             + "\n".join(cat_lines) + "\n\n"
@@ -554,11 +587,19 @@ class Skipper:
             "## Instructions\n"
             "- Use the provided tools to fetch live data before answering. "
             "Do not guess stats — always look them up.\n"
-            "- Be concise and direct. Format stats in clean, readable text.\n"
+            "- Be concise and direct.\n"
             "- When comparing players or teams, highlight the key differences.\n"
-            "- The user is a fantasy baseball manager in this league.\n"
             "- When tools return prior-year stats alongside current stats, always "
             "factor in the prior-year context per the season phase guidance above.\n"
+            "\n"
+            "## Formatting (important — terminal renders plain text)\n"
+            "- **Do NOT use markdown tables.** They render as raw pipe characters "
+            "in the terminal and are unreadable. Use bulleted or numbered lists "
+            "instead.\n"
+            "- Bold (`**text**`) and inline italic are fine.\n"
+            "- Use short headers with `##` or `###` sparingly — one per major "
+            "section, not every paragraph.\n"
+            "- Prefer short paragraphs and bullets over walls of text.\n"
             "\n"
             "## Using the Trade Analyzer Suite\n"
             "Prefer the trade-analyzer tools over ad-hoc reasoning for any trade "
@@ -596,12 +637,20 @@ class Skipper:
             "game or player performance in a game.\n"
             "\n"
             "## General Trade Heuristics\n"
-            "- Prefer trading from surplus; avoid leaving holes.\n"
+            "- **Trade surplus to fill needs.** If the user offers an OF to target "
+            "an SP, the realistic deal pairs their OF surplus with the partner's "
+            "SP surplus — NOT an OF-for-OF swap. Always think about what position "
+            "the user wants to acquire and filter `find_trade_targets` results to "
+            "players at that position. Pass `target_position` when the user names "
+            "one (e.g. 'trading Teoscar for an SP' → target_position='SP').\n"
             "- Don't trade a team's best player at a position of need unless the "
-            "return is a clear upgrade (factoring in track record, not just a "
-            "small-sample current year).\n"
-            "- Cross-position trades (batter for pitcher) often make both sides "
-            "happy because they fill different needs.\n"
+            "return is a clear upgrade (factoring in track record).\n"
+            "- Cross-position trades (batter for pitcher) are the norm, not the "
+            "exception. Most managers prefer filling a different need.\n"
+            "- If `find_trade_targets` returns only same-position candidates when "
+            "the user asked for a specific position, you should call it again with "
+            "the explicit `target_position` filter (or rerun `discover_trade_scenarios` "
+            "using categories that represent the target position).\n"
         )
 
     async def _ensure_teams(self) -> None:
@@ -611,8 +660,13 @@ class Skipper:
                 self.api.get_team_season_stats, self.league.league_key
             )
 
-    def _resolve_team_key(self, name: str) -> str | None:
-        """Fuzzy-match a team name to a team_key."""
+    def _resolve_team_key(self, name: str | None) -> str | None:
+        """Fuzzy-match a team name to a team_key.
+
+        If name is None/empty, falls back to the user's configured default team.
+        """
+        if not name:
+            return self.user_team_key
         if not self._teams:
             return None
         name_lower = name.lower()
@@ -624,6 +678,14 @@ class Skipper:
             if name_lower in t.team_key.lower():
                 return t.team_key
         return None
+
+    def _team_display_name(self, team_key: str) -> str:
+        """Get the display name for a team key, falling back to the key itself."""
+        if self._teams:
+            for t in self._teams:
+                if t.team_key == team_key:
+                    return t.name
+        return team_key
 
     async def _fetch_prior_year_lines(
         self, players: list[PlayerStats], prior_year: int,
@@ -691,13 +753,14 @@ class Skipper:
                     return await self._tool_weekly_recap(tool_input.get("week"))
                 case "get_team_roster":
                     return await self._tool_roster(
-                        tool_input["team_name"],
+                        tool_input.get("team_name"),
                         tool_input.get("stat_type", "week"),
                     )
                 case "find_trade_targets":
                     return await self._tool_trade_targets(
-                        tool_input["team_name"],
+                        tool_input.get("team_name"),
                         tool_input["offer_player_name"],
+                        tool_input.get("target_position"),
                         tool_input.get("max_results", 20),
                     )
                 case "analyze_trade":
@@ -709,13 +772,13 @@ class Skipper:
                     )
                 case "discover_trade_scenarios":
                     return await self._tool_discover_trades(
-                        tool_input["team_name"],
+                        tool_input.get("team_name"),
                         tool_input["stat_categories"],
                         tool_input.get("max_results", 15),
                     )
                 case "compare_add_drop":
                     return await self._tool_compare_add_drop(
-                        tool_input["team_name"],
+                        tool_input.get("team_name"),
                         tool_input["add_player_name"],
                         tool_input.get("max_results", 15),
                     )
@@ -1539,12 +1602,14 @@ class Skipper:
 
         return "\n".join(lines)
 
-    async def _tool_roster(self, team_name: str, stat_type: str) -> str:
+    async def _tool_roster(self, team_name: str | None, stat_type: str) -> str:
         """Fetch and format a team's roster with prior-year context."""
         await self._ensure_teams()
         team_key = self._resolve_team_key(team_name)
         if not team_key:
-            return f"Could not find team matching '{team_name}'."
+            label = team_name or "(no default team configured)"
+            return f"Could not find team matching '{label}'."
+        team_name = self._team_display_name(team_key)
 
         week = self.league.current_week
         fetch = {
@@ -1757,16 +1822,22 @@ class Skipper:
 
     async def _tool_trade_targets(
         self,
-        team_name: str,
+        team_name: str | None,
         offer_player_name: str,
+        target_position: str | None = None,
         max_results: int = 20,
     ) -> str:
         """Find best trade targets using the SGP-based engine from trade.py."""
         await self._ensure_teams()
         user_team_key = self._resolve_team_key(team_name)
         if not user_team_key:
-            return f"Could not find team matching '{team_name}'."
+            label = team_name or "(no default team configured)"
+            return (
+                f"Could not resolve a team for '{label}'. Set a default team in "
+                f"Settings or pass team_name explicitly."
+            )
 
+        resolved_team_name = self._team_display_name(user_team_key)
         all_rosters = await self._load_league_rosters()
         my_roster = all_rosters.get(user_team_key, [])
         offer_player = next(
@@ -1776,8 +1847,9 @@ class Skipper:
         )
         if offer_player is None:
             return (
-                f"Could not find player '{offer_player_name}' on {team_name}'s "
-                f"roster. Check spelling or use get_team_roster first."
+                f"Could not find player '{offer_player_name}' on "
+                f"{resolved_team_name}'s roster. Check spelling or use "
+                f"get_team_roster first."
             )
 
         sgp_calc = await self._build_sgp_calc(all_rosters)
@@ -1786,6 +1858,13 @@ class Skipper:
         week_matchups = await self._load_week_matchups(weeks)
         team_keys = list(all_rosters.keys())
         weekly_rosters = await self._load_weekly_rosters(team_keys, weeks)
+
+        target_positions: set[str] | None = None
+        if target_position:
+            target_positions = {target_position.upper()}
+            # 'OF' is a meta-position for LF/CF/RF — expand
+            if target_position.upper() == "OF":
+                target_positions = {"LF", "CF", "RF", "OF"}
 
         team_names_map = {t.team_key: t.name for t in self._teams}
         targets = await asyncio.to_thread(
@@ -1801,14 +1880,24 @@ class Skipper:
             weekly_rosters,
             self.league.current_week,
             max_results,
+            target_positions,
         )
 
         if not targets:
-            return f"No position-eligible trade targets found for {offer_player.name}."
+            pos_clause = f" at position {target_position}" if target_position else ""
+            return (
+                f"No viable trade targets found for {offer_player.name}{pos_clause}. "
+                f"(Tool filters out deals where the partner would lose heavy roto "
+                f"points — the partner may not have the surplus to make a deal work.)"
+            )
+
+        header = f"Trade Targets for {offer_player.name} ({offer_player.position})"
+        if target_position:
+            header += f" — seeking {target_position}"
+        header += f" — {resolved_team_name}:"
 
         lines = [
-            f"Trade Targets for {offer_player.name} ({offer_player.position}) "
-            f"— {team_name}:",
+            header,
             "",
             "(ΔSGP = player value swap; ΔRoto = your roto points change; "
             "ΔWin% = actual H2H record change from weekly replay; "
@@ -1942,7 +2031,7 @@ class Skipper:
 
     async def _tool_discover_trades(
         self,
-        team_name: str,
+        team_name: str | None,
         stat_categories: list[str],
         max_results: int = 15,
     ) -> str:
@@ -1950,7 +2039,9 @@ class Skipper:
         await self._ensure_teams()
         user_team_key = self._resolve_team_key(team_name)
         if not user_team_key:
-            return f"Could not find team matching '{team_name}'."
+            label = team_name or "(no default team configured)"
+            return f"Could not find team matching '{label}'."
+        team_name = self._team_display_name(user_team_key)
 
         scored = [c for c in self.categories if not c.is_only_display]
         target_stat_ids: list[str] = []
@@ -2017,7 +2108,7 @@ class Skipper:
 
     async def _tool_compare_add_drop(
         self,
-        team_name: str,
+        team_name: str | None,
         add_player_name: str,
         max_results: int = 15,
     ) -> str:
@@ -2025,7 +2116,9 @@ class Skipper:
         await self._ensure_teams()
         user_team_key = self._resolve_team_key(team_name)
         if not user_team_key:
-            return f"Could not find team matching '{team_name}'."
+            label = team_name or "(no default team configured)"
+            return f"Could not find team matching '{label}'."
+        team_name = self._team_display_name(user_team_key)
 
         all_rosters = await self._load_league_rosters()
 

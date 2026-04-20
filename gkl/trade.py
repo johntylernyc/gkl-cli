@@ -921,21 +921,27 @@ def find_trade_targets(
     all_weekly_rosters: dict[str, dict[int, list[PlayerStats]]] | None = None,
     current_week: int = 1,
     max_results: int = 25,
+    target_positions: set[str] | None = None,
 ) -> list[TradeTarget]:
     """Find the best trade targets for a player you want to trade away.
 
-    Scans all opposing rosters for position-eligible players. For each
-    candidate, computes:
+    Scans all opposing rosters for eligible players. If `target_positions`
+    is provided, candidates must play at least one of those positions.
+    Otherwise falls back to sharing a position with the outgoing player.
+
+    For each candidate, computes:
     - Net SGP (target SGP − outgoing SGP)
     - Roto points delta (how the trade changes your roto total)
-    - H2H win % delta (per-week hypothetical vs all opponents when
-      weekly data is available, otherwise season-aggregate)
+    - H2H win % delta (per-week replay when weekly data available)
 
     Returns a ranked list sorted by roto points delta.
     """
     from gkl.yahoo_api import Matchup
 
-    outgoing_positions = {pos.strip() for pos in outgoing_player.position.split(",")}
+    if target_positions:
+        match_positions = target_positions
+    else:
+        match_positions = {pos.strip() for pos in outgoing_player.position.split(",")}
     outgoing_sgp = sgp_calc.player_sgp(outgoing_player) if sgp_calc else None
 
     scored = [c for c in categories if not c.is_only_display]
@@ -983,7 +989,7 @@ def find_trade_targets(
                 continue
 
             player_positions = {pos.strip() for pos in player.position.split(",")}
-            if not (outgoing_positions & player_positions):
+            if not (match_positions & player_positions):
                 continue
 
             player_sgp = sgp_calc.player_sgp(player) if sgp_calc else None
