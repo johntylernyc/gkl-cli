@@ -6832,7 +6832,14 @@ class AskSkipperScreen(Screen):
 
     def _init_skipper(self, key: str) -> None:
         try:
-            self.skipper = Skipper(self.api, self.league, self.categories, model=self._model_id)
+            user_team_key = self.app.store.get_pref("my_team_key") or None
+            user_team_name = self.app.store.get_pref("my_team_name") or None
+            self.skipper = Skipper(
+                self.api, self.league, self.categories,
+                model=self._model_id,
+                user_team_key=user_team_key,
+                user_team_name=user_team_name,
+            )
             messages = self.query_one("#skipper-messages", VerticalScroll)
             messages.mount(
                 Static(
