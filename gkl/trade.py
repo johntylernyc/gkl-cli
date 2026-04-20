@@ -1286,3 +1286,173 @@ def discover_trades(
     # Sort by roto delta
     scenarios.sort(key=lambda s: s.roto_delta, reverse=True)
     return scenarios[:max_results]
+
+
+# ---------------------------------------------------------------------------
+# Compare Screen scenarios — "what if I added this player and dropped X?"
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CompareScenario:
+    """A single add/drop scenario on a target roster.
+
+    Unlike TradeTarget (which represents a trade with another team),
+    CompareScenario represents adding one player to a team and dropping
+    one of its existing players. Used by the Compare tool.
+    """
+    drop_player: PlayerStats   # the roster player being dropped
+    drop_sgp: float | None     # dropped player's SGP
+    add_sgp: float | None      # added player's SGP (same for every scenario)
+    net_sgp: float             # add - drop (positive = upgrade)
+    roto_delta: float = 0.0    # change in team roto points
+    h2h_win_pct_before: float = 0.0
+    h2h_win_pct_after: float = 0.0
+    h2h_win_pct_delta: float = 0.0
+
+
+def compute_compare_scenarios(
+    added_player: PlayerStats,
+    target_team_key: str,
+    target_roster: list[PlayerStats],
+    all_teams: list[TeamStats],
+    categories: list[StatCategory],
+    sgp_calc: SGPCalculator | None,
+    week_matchups: dict[int, list] | None = None,
+    weekly_roster_target: dict[int, list[PlayerStats]] | None = None,
+    current_week: int = 1,
+) -> list[CompareScenario]:
+    """Compute drop-candidate scenarios for adding a player to a team.
+
+    For each position-eligible player on the target team's roster, simulates
+    replacing them with `added_player` and reports ΔSGP, ΔRoto, and ΔWin%.
+
+    Args:
+        added_player: The player being added to the target team.
+        target_team_key: The team receiving the player.
+        target_roster: Current season roster for the target team.
+        all_teams: League-wide season team stats.
+        categories: Scoring categories.
+        sgp_calc: SGP calculator (optional).
+        week_matchups: Per-week matchup data (for actual H2H replay).
+        weekly_roster_target: Per-week rosters for the target team.
+        current_week: Current week of the season.
+    """
+    scored = [c for c in categories if not c.is_only_display]
+    target_team = next((t for t in all_teams if t.team_key == target_team_key), None)
+    if target_team is None:
+        return []
+
+    added_positions = {pos.strip() for pos in added_player.position.split(",")}
+    add_sgp = sgp_calc.player_sgp(added_player) if sgp_calc else None
+
+    # Baseline roto
+    baseline_roto = compute_roto(all_teams, scored)
+    baseline_pts = 0.0
+    for r in baseline_roto:
+        if r["team_key"] == target_team_key:
+            baseline_pts = r["total"]
+            break
+
+    # Baseline H2H win % (per-week replay if data available)
+    has_weekly = bool(week_matchups and weekly_roster_target)
+    baseline_win_pct = 0.0
+    if has_weekly:
+        baseline_replay = replay_h2h_with_trade(
+            target_team_key, target_team_key,
+            set(), set(),
+            week_matchups, weekly_roster_target, {},
+            categories, current_week,
+        )
+        total = (baseline_replay.actual_season_w +
+                 baseline_replay.actual_season_l +
+                 baseline_replay.actual_season_t)
+        baseline_win_pct = baseline_replay.actual_season_w / total if total else 0.0
+    else:
+        baseline_h2h = simulate_h2h(all_teams, scored)
+        baseline_pr = compute_power_rankings(baseline_h2h, all_teams)
+        for s in baseline_pr:
+            if s.team_key == target_team_key:
+                baseline_win_pct = s.win_pct
+                break
+
+    scenarios: list[CompareScenario] = []
+    for drop_candidate in target_roster:
+        if drop_candidate.selected_position in ("IL", "IL+", "NA"):
+            continue
+        # Position eligibility: shared position with the added player
+        drop_positions = {pos.strip() for pos in drop_candidate.position.split(",")}
+        if not (added_positions & drop_positions):
+            continue
+        # Don't compare the player against themselves
+        if drop_candidate.player_key == added_player.player_key:
+            continue
+
+        drop_sgp = sgp_calc.player_sgp(drop_candidate) if sgp_calc else None
+        if add_sgp is not None and drop_sgp is not None:
+            net = add_sgp - drop_sgp
+        elif add_sgp is not None:
+            net = add_sgp
+        elif drop_sgp is not None:
+            net = -drop_sgp
+        else:
+            net = 0.0
+
+        # Apply the add/drop to the target team
+        trade_team = apply_trade_to_team(
+            target_team, target_roster,
+            players_out=[drop_candidate],
+            players_in=[added_player],
+            categories=categories,
+        )
+        teams_after = [
+            trade_team if t.team_key == target_team_key else t
+            for t in all_teams
+        ]
+
+        # Roto delta
+        roto_after = compute_roto(teams_after, scored)
+        roto_delta = 0.0
+        for r in roto_after:
+            if r["team_key"] == target_team_key:
+                roto_delta = r["total"] - baseline_pts
+                break
+
+        # H2H win % delta
+        scenario = CompareScenario(
+            drop_player=drop_candidate,
+            drop_sgp=drop_sgp,
+            add_sgp=add_sgp,
+            net_sgp=net,
+            roto_delta=roto_delta,
+            h2h_win_pct_before=baseline_win_pct,
+        )
+        if has_weekly:
+            # Weekly replay: swap this specific drop player for the added player
+            # We need a "fake" weekly roster for the added player — use season stats
+            replay = replay_h2h_with_trade(
+                target_team_key, target_team_key,
+                {drop_candidate.player_key}, {added_player.player_key},
+                week_matchups,
+                weekly_roster_target,
+                # Provide the added player in every week so it's findable by player_key
+                {w: [added_player] for w in weekly_roster_target.keys()},
+                categories, current_week,
+            )
+            total = (replay.trade_season_w +
+                     replay.trade_season_l +
+                     replay.trade_season_t)
+            scenario.h2h_win_pct_after = replay.trade_season_w / total if total else 0.0
+        else:
+            h2h_after = simulate_h2h(teams_after, scored)
+            pr_after = compute_power_rankings(h2h_after, teams_after)
+            for s in pr_after:
+                if s.team_key == target_team_key:
+                    scenario.h2h_win_pct_after = s.win_pct
+                    break
+        scenario.h2h_win_pct_delta = scenario.h2h_win_pct_after - baseline_win_pct
+
+        scenarios.append(scenario)
+
+    # Sort by roto delta — best upgrades first
+    scenarios.sort(key=lambda s: s.roto_delta, reverse=True)
+    return scenarios
