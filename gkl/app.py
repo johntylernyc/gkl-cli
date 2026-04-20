@@ -3746,7 +3746,6 @@ class ComparisonScreen(Screen):
                 )
 
                 # Fetch statcast for both players
-                import asyncio
                 is_batter = self._is_batter
                 add_sc = None
                 drop_sc = None
